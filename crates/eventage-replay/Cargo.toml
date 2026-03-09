@@ -1,0 +1,24 @@
+[package]
+name = "eventage-replay"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive visual replay UI for Eventage agent runs"
+
+[lib]
+name = "eventage_replay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eventage-replay"
+path = "src/main.rs"
+
+[dependencies]
+eventage-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = "0.3"

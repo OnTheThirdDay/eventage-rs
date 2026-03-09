@@ -1,0 +1,33 @@
+[package]
+name = "eventage-provided-impl"
+version = "0.1.0"
+edition = "2021"
+description = "Official provided implementations for the Eventage agent framework"
+
+[dependencies]
+eventage-core = { workspace = true }
+eventage-agent = { workspace = true }
+eventage-llm = { workspace = true }
+eventage-mcp = { workspace = true }
+eventage-observability = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# Optional OpenTelemetry exporter
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+eventage-llm = { workspace = true }
+eventage-core = { workspace = true }
+tempfile = "3"
+serde_json = { workspace = true }
+
+[features]
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]

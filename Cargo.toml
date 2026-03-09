@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "crates/eventage-core",
+    "crates/eventage-llm",
+    "crates/eventage-agent",
+    "crates/eventage-scheduler",
+    "crates/eventage-sandbox",
+    "crates/eventage-observability",
+    "crates/eventage-replay",
+    "crates/eventage-mcp",
+    "crates/eventage-sqlite",
+    "crates/example-basic-chat",
+    "crates/example-tool-use",
+    "crates/example-multi-agent",
+    "crates/example-planner-critic",
+    "crates/example-tutorial-agent",
+    "crates/example-workflow",
+    "crates/example-clang-agent",
+    "crates/example-coding-agent",
+    "crates/eventage-provided-impl",
+    "crates/example-reactive-chat",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
+anyhow = "1"
+arc-swap = "1"
+
+eventage-core = { path = "crates/eventage-core" }
+eventage-llm = { path = "crates/eventage-llm" }
+eventage-agent = { path = "crates/eventage-agent" }
+eventage-scheduler = { path = "crates/eventage-scheduler" }
+eventage-sandbox = { path = "crates/eventage-sandbox" }
+eventage-observability = { path = "crates/eventage-observability" }
+eventage-sqlite = { path = "crates/eventage-sqlite" }
+eventage-replay = { path = "crates/eventage-replay" }
+eventage-mcp = { path = "crates/eventage-mcp" }
+eventage-provided-impl = { path = "crates/eventage-provided-impl" }
+futures-util = "0.3"

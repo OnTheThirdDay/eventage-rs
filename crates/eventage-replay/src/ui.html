@@ -1,0 +1,1099 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Eventage Replay</title>
+<style>
+  :root {
+    --bg:         #0d1117;
+    --bg2:        #161b22;
+    --bg3:        #21262d;
+    --border:     #30363d;
+    --text:       #e6edf3;
+    --text-muted: #8b949e;
+    --accent:     #58a6ff;
+    --head-h:     56px;
+    --timeline-h: 120px;
+    --lane-h:     28px;
+
+    /* event kind colours */
+    --c-user:       #58a6ff;
+    --c-assistant:  #3fb950;
+    --c-tool-prop:  #d29922;
+    --c-tool-res:   #a5d6ff;
+    --c-cycle-s:    #bc8cff;
+    --c-cycle-e:    #bc8cff;
+    --c-agent-msg:  #ff7b72;
+    --c-heartbeat:  #6e7681;
+    --c-checkpoint: #f0883e;
+    --c-other:      #8b949e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, monospace; font-size: 13px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ── header ─────────────────────────────────────────────────────────── */
+  #header {
+    height: var(--head-h); background: var(--bg2); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; padding: 0 20px; flex-shrink: 0;
+  }
+  #header h1 { font-size: 16px; font-weight: 600; color: var(--accent); letter-spacing: .5px; }
+  #stats { display: flex; gap: 20px; margin-left: auto; font-size: 12px; color: var(--text-muted); }
+  #stats span b { color: var(--text); }
+  #load-btn {
+    padding: 6px 14px; background: var(--accent); color: #0d1117; border: none;
+    border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px;
+  }
+  #load-btn:hover { background: #79c0ff; }
+  #live-badge {
+    font-size: 12px; font-weight: 600; padding: 4px 10px;
+    border-radius: 4px; border: 1px solid currentColor; letter-spacing: .4px;
+  }
+
+  /* ── transport bar ───────────────────────────────────────────────────── */
+  #transport {
+    height: 44px; background: var(--bg2); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; padding: 0 20px; flex-shrink: 0;
+  }
+  .tb-btn {
+    background: var(--bg3); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  }
+  .tb-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .tb-btn.active { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+  #speed-label { color: var(--text-muted); font-size: 12px; margin-left: 6px; }
+  #progress-text { color: var(--text-muted); font-size: 12px; margin-left: auto; }
+
+  /* ── timeline panel ─────────────────────────────────────────────────── */
+  #timeline-panel {
+    flex-shrink: 0; background: var(--bg2); border-bottom: 1px solid var(--border);
+    position: relative; user-select: none;
+  }
+  #timeline-canvas { display: block; cursor: crosshair; width: 100%; }
+
+  /* ── main area ───────────────────────────────────────────────────────── */
+  #main { flex: 1; display: flex; overflow: hidden; }
+
+  /* ── event list ─────────────────────────────────────────────────────── */
+  #event-list {
+    width: 360px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--border);
+    background: var(--bg);
+  }
+  #event-list-header {
+    position: sticky; top: 0; z-index: 1; background: var(--bg2);
+    border-bottom: 1px solid var(--border); padding: 8px 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  #event-filter { background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 4px; font-size: 12px; flex: 1; }
+  .ev-item {
+    padding: 7px 12px; border-bottom: 1px solid var(--border);
+    cursor: pointer; display: flex; align-items: flex-start; gap: 8px;
+    transition: background .1s;
+  }
+  .ev-item:hover { background: var(--bg3); }
+  .ev-item.selected { background: #1c2a3a; border-left: 3px solid var(--accent); }
+  .ev-item.future { opacity: .35; }
+  .ev-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 4px; }
+  .ev-body { flex: 1; min-width: 0; }
+  .ev-kind { font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ev-meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ev-time { font-size: 10px; color: var(--text-muted); flex-shrink: 0; text-align: right; }
+
+  /* ── right pane + tabs ───────────────────────────────────────────────── */
+  #right-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #tab-bar { display: flex; background: var(--bg2); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .tab-btn {
+    padding: 8px 20px; font-size: 12px; font-weight: 600; color: var(--text-muted);
+    cursor: pointer; border: none; border-bottom: 2px solid transparent; background: none;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.tab-active { color: var(--accent); border-bottom-color: var(--accent); }
+  #pane-inspect { flex: 1; overflow: auto; padding: 20px; flex-direction: column; gap: 16px; }
+  #pane-inspect h2 { font-size: 14px; font-weight: 600; color: var(--accent); }
+  #pane-flow { flex: 1; overflow: hidden; position: relative; }
+  #flow-canvas { display: block; cursor: grab; }
+  #flow-canvas.panning { cursor: grabbing; }
+  #flow-zoom-ctrl {
+    position: absolute; top: 8px; right: 10px; z-index: 10;
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(13,17,23,0.82); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 8px; backdrop-filter: blur(4px);
+  }
+  #flow-zoom-label { font-size: 11px; color: var(--text-muted); min-width: 34px; text-align: center; }
+
+  /* ── detail (inspect) pane ───────────────────────────────────────────── */
+  .detail-section { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .detail-section-title { padding: 8px 14px; background: var(--bg3); font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: .6px; border-bottom: 1px solid var(--border); }
+  .detail-kv { display: grid; grid-template-columns: 150px 1fr; padding: 6px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .detail-kv:last-child { border-bottom: none; }
+  .detail-kv .k { color: var(--text-muted); }
+  .detail-kv .v { color: var(--text); word-break: break-all; }
+  pre.payload {
+    background: var(--bg); padding: 14px; font-size: 11px; line-height: 1.6;
+    overflow: auto; max-height: 320px; color: var(--text-muted);
+  }
+  .empty-hint { color: var(--text-muted); font-size: 13px; margin: auto; text-align: center; padding: 40px; line-height: 1.8; }
+
+  /* ── legend ────────────────────────────────────────────────────────── */
+  #legend { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 0 20px; }
+  .leg { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-muted); }
+  .leg-dot { width: 9px; height: 9px; border-radius: 50%; }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>⬡ Eventage Replay</h1>
+  <div id="legend">
+    <div class="leg"><div class="leg-dot" style="background:var(--c-user)"></div>user.message</div>
+    <div class="leg"><div class="leg-dot" style="background:var(--c-assistant)"></div>assistant</div>
+    <div class="leg"><div class="leg-dot" style="background:var(--c-tool-prop)"></div>tool proposed</div>
+    <div class="leg"><div class="leg-dot" style="background:var(--c-tool-res)"></div>tool result</div>
+    <div class="leg"><div class="leg-dot" style="background:var(--c-agent-msg)"></div>agent.message</div>
+    <div class="leg"><div class="leg-dot" style="background:var(--c-cycle-s)"></div>cycle</div>
+    <div class="leg"><div class="leg-dot" style="background:var(--c-checkpoint)"></div>checkpoint</div>
+  </div>
+  <div id="stats">
+    <span><b id="s-total">0</b> events</span>
+    <span><b id="s-cycles">0</b> cycles</span>
+    <span><b id="s-agents">0</b> agents</span>
+    <span><b id="s-dur">0</b>ms duration</span>
+  </div>
+  <span id="live-badge" style="display:none"></span>
+  <button id="load-btn" onclick="loadFile()">Load JSONL</button>
+</div>
+
+<div id="transport">
+  <button class="tb-btn" id="btn-prev" onclick="stepBy(-1)">◀ Prev</button>
+  <button class="tb-btn" id="btn-play" onclick="togglePlay()">▶ Play</button>
+  <button class="tb-btn" id="btn-next" onclick="stepBy(1)">Next ▶</button>
+  <button class="tb-btn" onclick="seekTo(0)">|◀ Reset</button>
+  <button class="tb-btn" onclick="seekTo(allEvents.length - 1)">End ▶|</button>
+  <button class="tb-btn" id="btn-follow" onclick="toggleFollow()" title="Auto-follow latest event">Follow ↓</button>
+  <span id="speed-label">Speed:</span>
+  <button class="tb-btn" onclick="setSpeed(0.5)">0.5×</button>
+  <button class="tb-btn active" id="spd-1" onclick="setSpeed(1)">1×</button>
+  <button class="tb-btn" onclick="setSpeed(2)">2×</button>
+  <button class="tb-btn" onclick="setSpeed(5)">5×</button>
+  <span id="progress-text">No session loaded — click "Load JSONL" to begin</span>
+</div>
+
+<div id="timeline-panel">
+  <canvas id="timeline-canvas" height="120"></canvas>
+</div>
+
+<div id="main">
+  <div id="event-list">
+    <div id="event-list-header">
+      <span style="color:var(--text-muted);font-size:11px">EVENTS</span>
+      <input id="event-filter" type="text" placeholder="Filter by kind…" oninput="renderList()">
+    </div>
+    <div id="list-body">
+      <div class="empty-hint">Load a JSONL session file<br>to begin replay</div>
+    </div>
+  </div>
+
+  <div id="right-pane">
+    <div id="tab-bar">
+      <button class="tab-btn tab-active" id="tab-inspect" onclick="switchTab('inspect')">Inspect</button>
+      <button class="tab-btn" id="tab-flow" onclick="switchTab('flow')">Flow</button>
+    </div>
+    <div id="pane-inspect" style="display:flex">
+      <div class="empty-hint">
+        Select an event to inspect its payload,<br>metadata, and position in the session.
+      </div>
+    </div>
+    <div id="pane-flow" style="display:none">
+      <canvas id="flow-canvas"></canvas>
+      <div id="flow-zoom-ctrl">
+        <button class="tb-btn" onclick="flowResetZoom()" title="Reset zoom (double-click canvas)">⟲</button>
+        <span id="flow-zoom-label">100%</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="file-input" accept=".jsonl,.json" style="display:none" onchange="onFileChosen(event)">
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+let allEvents    = [];   // full parsed event array
+let seenIds      = new Set(); // dedup SSE vs snapshot
+let cursor       = -1;  // index of the "now" event (-1 = before start)
+let selected     = -1;  // index of the selected event in detail pane
+let playing      = false;
+let playSpeed    = 1;
+let playTimer    = null;
+let liveFollow   = true; // auto-advance cursor as new events arrive
+let activeTab    = 'inspect'; // 'inspect' | 'flow'
+let flowArrows   = [];   // computed by renderFlow; used by interaction handlers
+let flowScale    = 1.0;  // zoom level
+let flowOffsetX  = 0;    // pan offset x (screen px)
+let flowOffsetY  = 0;    // pan offset y (screen px)
+
+// ── Flow layout constants ─────────────────────────────────────────────────────
+const F_HDR_H  = 56;  // header row height (entity boxes)
+const F_ROW_H  = 46;  // height per arrow row
+const F_MARGIN = 28;  // left/right canvas margin
+
+// ── Colour map ────────────────────────────────────────────────────────────────
+const KIND_COLOR = {
+  'user.message':        'var(--c-user)',
+  'assistant.message':   'var(--c-assistant)',
+  'tool.call.proposed':  'var(--c-tool-prop)',
+  'tool.result':         'var(--c-tool-res)',
+  'agent.cycle.start':   'var(--c-cycle-s)',
+  'agent.cycle.end':     'var(--c-cycle-e)',
+  'agent.message':       'var(--c-agent-msg)',
+  'system.heartbeat':    'var(--c-heartbeat)',
+  'system.checkpoint':   'var(--c-checkpoint)',
+  'system.branch_sealed':'var(--c-checkpoint)',
+};
+function kindColor(kind) {
+  return KIND_COLOR[kind] || 'var(--c-other)';
+}
+
+// Literal hex colors for canvas 2D (CSS custom properties don't work there).
+const CANVAS_KIND_COLOR = {
+  'user.message':        '#58a6ff',
+  'assistant.message':   '#3fb950',
+  'tool.call.proposed':  '#d29922',
+  'tool.result':         '#a5d6ff',
+  'agent.cycle.start':   '#bc8cff',
+  'agent.cycle.end':     '#bc8cff',
+  'agent.message':       '#ff7b72',
+  'system.heartbeat':    '#6e7681',
+  'system.checkpoint':   '#f0883e',
+  'system.branch_sealed':'#f0883e',
+};
+function canvasKindColor(kind) {
+  return CANVAS_KIND_COLOR[kind] || '#8b949e';
+}
+
+// ── File loading ─────────────────────────────────────────────────────────────
+function loadFile() {
+  document.getElementById('file-input').click();
+}
+
+// Also accept drag-and-drop
+document.addEventListener('dragover', e => { e.preventDefault(); });
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (file) readFile(file);
+});
+
+function onFileChosen(e) {
+  const file = e.target.files[0];
+  if (file) readFile(file);
+}
+
+function readFile(file) {
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const lines = ev.target.result.trim().split('\n').filter(l => l.trim());
+    allEvents = [];
+    for (const line of lines) {
+      try { allEvents.push(JSON.parse(line)); } catch {}
+    }
+    // Normalise timestamps to epoch ms for comparisons.
+    allEvents.forEach(e => {
+      e._ms = new Date(e.timestamp).getTime();
+    });
+    cursor   = allEvents.length - 1; // start at the end (full replay)
+    selected = -1;
+    updateStats();
+    renderTimeline();
+    renderList();
+    if (activeTab === 'flow') renderFlow();
+    updateProgress();
+  };
+  reader.readAsText(file);
+}
+
+// ── Live SSE streaming ────────────────────────────────────────────────────────
+function setLiveBadge(state) {
+  const badge = document.getElementById('live-badge');
+  badge.style.display = '';
+  if (state === 'live') {
+    badge.textContent = '● LIVE';
+    badge.style.color = 'var(--c-assistant)';
+  } else {
+    badge.textContent = '○ OFFLINE';
+    badge.style.color = 'var(--text-muted)';
+  }
+}
+
+function appendLiveEvent(ev) {
+  if (seenIds.has(ev.id)) return;
+  seenIds.add(ev.id);
+  ev._ms = new Date(ev.timestamp).getTime();
+  allEvents.push(ev);
+  updateStats();
+  renderTimeline();
+  renderList();
+  if (activeTab === 'flow') renderFlow();
+  updateProgress();
+  if (liveFollow) seekTo(allEvents.length - 1);
+}
+
+function toggleFollow() {
+  liveFollow = !liveFollow;
+  const btn = document.getElementById('btn-follow');
+  btn.classList.toggle('active', liveFollow);
+  if (liveFollow) seekTo(allEvents.length - 1);
+}
+
+// Auto-load from server if we came from `eventage-replay` binary.
+window.addEventListener('load', () => {
+  // 1. Subscribe to SSE before fetching snapshot so we never miss an event.
+  const es = new EventSource('/events/stream');
+  es.onopen = () => setLiveBadge('live');
+  es.onmessage = e => {
+    try { appendLiveEvent(JSON.parse(e.data)); } catch {}
+  };
+  es.onerror = () => setLiveBadge('offline');
+
+  // 2. Fetch the existing snapshot (events that already happened).
+  fetch('/events')
+    .then(r => r.ok ? r.json() : null)
+    .then(data => {
+      if (!data || !Array.isArray(data) || data.length === 0) return;
+      // Load snapshot events, skipping any already received via SSE.
+      data.forEach(ev => {
+        if (seenIds.has(ev.id)) return;
+        seenIds.add(ev.id);
+        ev._ms = new Date(ev.timestamp).getTime();
+        allEvents.push(ev);
+      });
+      // Sort by timestamp in case SSE delivered some events before the snapshot.
+      allEvents.sort((a, b) => a._ms - b._ms);
+      cursor   = allEvents.length - 1;
+      selected = -1;
+      updateStats();
+      renderTimeline();
+      renderList();
+      updateProgress();
+    })
+    .catch(() => {}); // no server — file mode only
+});
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+function updateStats() {
+  document.getElementById('s-total').textContent  = allEvents.length;
+  document.getElementById('s-cycles').textContent =
+    allEvents.filter(e => e.kind === 'agent.cycle.start').length;
+  const agents = new Set(allEvents.map(e => e.metadata?.agent_id).filter(Boolean));
+  document.getElementById('s-agents').textContent = agents.size;
+  const dur = allEvents.length > 1
+    ? allEvents[allEvents.length-1]._ms - allEvents[0]._ms : 0;
+  document.getElementById('s-dur').textContent = dur;
+}
+
+// ── Timeline canvas ───────────────────────────────────────────────────────────
+const canvas = document.getElementById('timeline-canvas');
+const ctx    = canvas.getContext('2d');
+
+// Collect unique agent IDs for swim lanes.
+function agentLanes() {
+  const ids = [...new Set(allEvents.map(e => e.metadata?.agent_id).filter(Boolean))];
+  return ids.length ? ids : ['system'];
+}
+
+function renderTimeline() {
+  const W = canvas.parentElement.clientWidth;
+  const agents = agentLanes();
+  const systemLaneH = 36;   // top lane for system/untagged events
+  const laneH       = 28;
+  const H           = systemLaneH + agents.length * laneH + 24; // padding bottom
+  canvas.width  = W;
+  canvas.height = H;
+  canvas.parentElement.style.height = H + 'px';
+
+  ctx.clearRect(0, 0, W, H);
+
+  if (allEvents.length === 0) return;
+
+  const t0   = allEvents[0]._ms;
+  const tEnd = allEvents[allEvents.length - 1]._ms || (t0 + 1);
+  const span = tEnd - t0 || 1;
+
+  const PAD_L = 110;
+  const PAD_R = 20;
+  const trackW = W - PAD_L - PAD_R;
+
+  function xOf(ev) { return PAD_L + ((ev._ms - t0) / span) * trackW; }
+
+  // ── Lane backgrounds ──────────────────────────────────────────────────────
+  // System lane
+  ctx.fillStyle = '#161b22';
+  ctx.fillRect(0, 0, W, systemLaneH);
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('system', PAD_L - 8, systemLaneH / 2 + 4);
+
+  agents.forEach((id, i) => {
+    const y = systemLaneH + i * laneH;
+    ctx.fillStyle = i % 2 === 0 ? '#161b22' : '#0d1117';
+    ctx.fillRect(0, y, W, laneH);
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText(id, PAD_L - 8, y + laneH / 2 + 4);
+  });
+
+  // ── Cycle range bars ─────────────────────────────────────────────────────
+  const cycleStarts = allEvents
+    .map((e, i) => ({ e, i }))
+    .filter(({ e }) => e.kind === 'agent.cycle.start');
+
+  for (const { e: startEv, i: si } of cycleStarts) {
+    // Find matching cycle.end by same trace_id.
+    const traceId = startEv.metadata?.trace_id;
+    const endEv   = allEvents.find(
+      (e, j) => j > si && e.kind === 'agent.cycle.end' &&
+                e.metadata?.trace_id === traceId
+    );
+    if (!endEv) continue;
+    const agentId = startEv.metadata?.agent_id;
+    const agIdx   = agentLanes().indexOf(agentId);
+    const laneY   = agIdx >= 0
+      ? systemLaneH + agIdx * laneH
+      : 0;
+    const lH      = agIdx >= 0 ? laneH : systemLaneH;
+    const x1 = xOf(startEv);
+    const x2 = xOf(endEv);
+
+    ctx.fillStyle = 'rgba(188, 140, 255, 0.08)';
+    ctx.fillRect(x1, laneY, x2 - x1, lH);
+    ctx.strokeStyle = 'rgba(188, 140, 255, 0.3)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x1, laneY, x2 - x1, lH);
+  }
+
+  // ── Time-axis tick marks ─────────────────────────────────────────────────
+  const totalH = systemLaneH + agents.length * laneH;
+  ctx.strokeStyle = '#30363d';
+  ctx.lineWidth   = 1;
+  const numTicks  = Math.min(20, Math.floor(trackW / 60));
+  for (let i = 0; i <= numTicks; i++) {
+    const x = PAD_L + (i / numTicks) * trackW;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, totalH);
+    ctx.stroke();
+    if (i % 4 === 0) {
+      const ms = (i / numTicks) * span;
+      ctx.fillStyle = '#6e7681';
+      ctx.font = '9px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText((ms < 1000 ? ms.toFixed(0) + 'ms' : (ms/1000).toFixed(1) + 's'), x, totalH + 14);
+    }
+  }
+
+  // ── Event dots ────────────────────────────────────────────────────────────
+  allEvents.forEach((ev, i) => {
+    const agentId = ev.metadata?.agent_id;
+    const agIdx   = agentLanes().indexOf(agentId);
+    const laneY   = agIdx >= 0
+      ? systemLaneH + agIdx * laneH
+      : 0;
+    const centerY = laneY + (agIdx >= 0 ? laneH : systemLaneH) / 2;
+
+    const x = xOf(ev);
+    const r = ev.kind === 'user.message' ? 6 : 4;
+
+    ctx.beginPath();
+    ctx.arc(x, centerY, r, 0, Math.PI * 2);
+    if (i <= cursor) {
+      ctx.fillStyle = kindColor(ev.kind);
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    }
+    ctx.fill();
+
+    if (i === selected) {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  });
+
+  // ── Playhead ──────────────────────────────────────────────────────────────
+  if (cursor >= 0 && cursor < allEvents.length) {
+    const x = xOf(allEvents[cursor]);
+    ctx.strokeStyle = '#ff7b72';
+    ctx.lineWidth   = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, totalH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Playhead label.
+    ctx.fillStyle = '#ff7b72';
+    ctx.font      = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(cursor + 1, x, totalH + 12);
+  }
+}
+
+// ── Canvas interaction ────────────────────────────────────────────────────────
+let dragging = false;
+
+canvas.addEventListener('mousedown', e => { dragging = true; seekByMouse(e); });
+canvas.addEventListener('mousemove', e => { if (dragging) seekByMouse(e); });
+canvas.addEventListener('mouseup',   () => { dragging = false; });
+canvas.addEventListener('mouseleave',() => { dragging = false; });
+
+canvas.addEventListener('click', e => { seekByMouse(e); });
+
+function seekByMouse(e) {
+  if (allEvents.length === 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const xRel = e.clientX - rect.left;
+
+  const agents = agentLanes();
+  const PAD_L  = 110;
+  const PAD_R  = 20;
+  const trackW = canvas.width - PAD_L - PAD_R;
+
+  const t0   = allEvents[0]._ms;
+  const tEnd = allEvents[allEvents.length-1]._ms || (t0+1);
+  const span = tEnd - t0 || 1;
+
+  const frac = Math.max(0, Math.min(1, (xRel - PAD_L) / trackW));
+  const tTarget = t0 + frac * span;
+
+  // Find the event closest to this time.
+  let closest = 0;
+  let bestDiff = Infinity;
+  allEvents.forEach((ev, i) => {
+    const d = Math.abs(ev._ms - tTarget);
+    if (d < bestDiff) { bestDiff = d; closest = i; }
+  });
+
+  seekTo(closest);
+}
+
+window.addEventListener('resize', () => {
+  if (allEvents.length > 0) renderTimeline();
+});
+
+// ── List rendering ────────────────────────────────────────────────────────────
+function renderList() {
+  const filter = document.getElementById('event-filter').value.toLowerCase();
+  const body   = document.getElementById('list-body');
+  body.innerHTML = '';
+
+  if (allEvents.length === 0) {
+    body.innerHTML = '<div class="empty-hint">No session loaded</div>';
+    return;
+  }
+
+  let count = 0;
+  allEvents.forEach((ev, i) => {
+    if (filter && !ev.kind.toLowerCase().includes(filter)) return;
+    count++;
+
+    const item = document.createElement('div');
+    item.className = 'ev-item' + (i > cursor ? ' future' : '') + (i === selected ? ' selected' : '');
+    item.dataset.idx = i;
+    item.onclick = () => selectEvent(i);
+
+    // Relative time offset from session start.
+    const relMs = allEvents.length > 0 ? ev._ms - allEvents[0]._ms : 0;
+    const relStr = relMs < 1000 ? relMs + 'ms' : (relMs/1000).toFixed(2) + 's';
+
+    // Summary text.
+    let summary = '';
+    if (ev.kind === 'user.message') summary = ev.payload?.text || '';
+    else if (ev.kind === 'assistant.message') summary = ev.payload?.content || (ev.payload?.tool_calls?.length ? `→ ${ev.payload.tool_calls.length} tool call(s)` : '');
+    else if (ev.kind === 'tool.result') summary = ev.payload?.name + (ev.payload?.error ? ' ✗' : ' ✓');
+    else if (ev.kind === 'tool.call.proposed') summary = ev.payload?.name;
+    else if (ev.kind === 'agent.message') {
+      const to = ev.metadata?.to_agent_id;
+      summary = to ? `→ ${to}` : 'broadcast';
+    }
+    else if (ev.kind === 'agent.cycle.end') {
+      const ms = ev.metadata?.elapsed_ms;
+      if (ms !== undefined) summary = `${ms}ms`;
+    }
+
+    const agentId = ev.metadata?.agent_id || '';
+
+    item.innerHTML = `
+      <div class="ev-dot" style="background:${kindColor(ev.kind)}"></div>
+      <div class="ev-body">
+        <div class="ev-kind" style="color:${kindColor(ev.kind)}">${ev.kind}</div>
+        <div class="ev-meta">${agentId ? agentId + '  ' : ''}${summary ? escHtml(summary.slice(0,60)) : ''}</div>
+      </div>
+      <div class="ev-time">#${i+1}<br>${relStr}</div>`;
+    body.appendChild(item);
+  });
+
+  if (count === 0) {
+    body.innerHTML = `<div class="empty-hint">No events match filter</div>`;
+  }
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Detail pane ──────────────────────────────────────────────────────────────
+function selectEvent(i) {
+  selected = i;
+  renderList();
+  renderTimeline();
+  if (activeTab === 'flow') renderFlow();
+  showDetail(i);
+
+  // Scroll into view.
+  const items = document.querySelectorAll('.ev-item');
+  items.forEach(el => {
+    if (parseInt(el.dataset.idx) === i) el.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+function showDetail(i) {
+  if (i < 0 || i >= allEvents.length) return;
+  const ev  = allEvents[i];
+  const dp  = document.getElementById('pane-inspect');
+  const rel = i > 0 ? ev._ms - allEvents[0]._ms : 0;
+
+  const metaRows = Object.entries(ev.metadata || {})
+    .map(([k,v]) => `<div class="detail-kv"><span class="k">${escHtml(k)}</span><span class="v">${escHtml(JSON.stringify(v))}</span></div>`)
+    .join('');
+
+  dp.innerHTML = `
+    <h2 style="color:${kindColor(ev.kind)}">${ev.kind}</h2>
+
+    <div class="detail-section">
+      <div class="detail-section-title">Event</div>
+      <div class="detail-kv"><span class="k">id</span><span class="v">${ev.id}</span></div>
+      <div class="detail-kv"><span class="k">index</span><span class="v">#${i+1} of ${allEvents.length}</span></div>
+      <div class="detail-kv"><span class="k">timestamp</span><span class="v">${ev.timestamp}</span></div>
+      <div class="detail-kv"><span class="k">relative time</span><span class="v">${rel}ms</span></div>
+      ${ev.parent_event_id ? `<div class="detail-kv"><span class="k">parent_event_id</span><span class="v">${ev.parent_event_id}</span></div>` : ''}
+    </div>
+
+    ${metaRows ? `<div class="detail-section">
+      <div class="detail-section-title">Metadata</div>
+      ${metaRows}
+    </div>` : ''}
+
+    <div class="detail-section">
+      <div class="detail-section-title">Payload</div>
+      <pre class="payload">${escHtml(JSON.stringify(ev.payload, null, 2))}</pre>
+    </div>`;
+}
+
+// ── Playback ──────────────────────────────────────────────────────────────────
+function seekTo(i) {
+  if (allEvents.length === 0) return;
+  cursor = Math.max(-1, Math.min(allEvents.length - 1, i));
+  selected = cursor >= 0 ? cursor : selected;
+  renderTimeline();
+  renderList();
+  if (activeTab === 'flow') renderFlow();
+  updateProgress();
+  if (selected >= 0) showDetail(selected);
+  // Auto-scroll list to cursor.
+  const items = document.querySelectorAll('.ev-item');
+  items.forEach(el => {
+    if (parseInt(el.dataset.idx) === cursor) el.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+function stepBy(delta) {
+  seekTo(cursor + delta);
+}
+
+function togglePlay() {
+  playing = !playing;
+  document.getElementById('btn-play').textContent = playing ? '⏸ Pause' : '▶ Play';
+  document.getElementById('btn-play').classList.toggle('active', playing);
+  if (playing) advancePlay();
+}
+
+function advancePlay() {
+  if (!playing) return;
+  if (cursor >= allEvents.length - 1) {
+    playing = false;
+    document.getElementById('btn-play').textContent = '▶ Play';
+    document.getElementById('btn-play').classList.remove('active');
+    return;
+  }
+  const next = cursor + 1;
+  // Compute delay: real interval between this event and next, scaled by speed.
+  let delay = 300;
+  if (next < allEvents.length) {
+    const dt = allEvents[next]._ms - (allEvents[cursor] || allEvents[next])._ms;
+    delay = Math.min(2000, Math.max(50, dt / playSpeed));
+  }
+  seekTo(next);
+  playTimer = setTimeout(advancePlay, delay);
+}
+
+function setSpeed(s) {
+  playSpeed = s;
+  document.querySelectorAll('.tb-btn').forEach(b => {
+    if (b.textContent === s + '×') b.classList.add('active');
+    else if (['0.5×','1×','2×','5×'].some(l => b.textContent === l)) b.classList.remove('active');
+  });
+}
+
+function updateProgress() {
+  const txt = allEvents.length === 0
+    ? 'No session loaded — click "Load JSONL" to begin'
+    : `Event ${cursor + 1} / ${allEvents.length}`;
+  document.getElementById('progress-text').textContent = txt;
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'ArrowRight') stepBy(1);
+  else if (e.key === 'ArrowLeft') stepBy(-1);
+  else if (e.key === ' ') { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'Home') seekTo(0);
+  else if (e.key === 'End') seekTo(allEvents.length - 1);
+});
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById('tab-inspect').classList.toggle('tab-active', tab === 'inspect');
+  document.getElementById('tab-flow').classList.toggle('tab-active', tab === 'flow');
+  document.getElementById('pane-inspect').style.display = tab === 'inspect' ? 'flex' : 'none';
+  document.getElementById('pane-flow').style.display   = tab === 'flow'    ? 'block' : 'none';
+  if (tab === 'flow') renderFlow();
+}
+
+// ── Flow / Sequence Diagram ───────────────────────────────────────────────────
+
+function stripThinkStr(s) {
+  const i = s.indexOf('</think>');
+  return i >= 0 ? s.slice(i + 8).trimStart() : s;
+}
+
+// Infer column entities from events: User → Agents → Tools
+function inferEntities(events) {
+  const agents = [], tools = [], seenA = new Set(), seenT = new Set();
+  for (const ev of events) {
+    const a = ev.metadata?.agent_id;
+    if (a && !seenA.has(a)) { seenA.add(a); agents.push(a); }
+    const ta = ev.metadata?.to_agent_id;
+    if (ta && !seenA.has(ta)) { seenA.add(ta); agents.push(ta); }
+    if (ev.kind === 'tool.call.proposed' || ev.kind === 'tool.result') {
+      const t = ev.payload?.name;
+      if (t && !seenT.has(t)) { seenT.add(t); tools.push(t); }
+    }
+  }
+  return ['User', ...agents, ...tools];
+}
+
+// Convert an event to an arrow descriptor, or null if not a flow event.
+function getArrow(ev, entities) {
+  const agent = ev.metadata?.agent_id;
+  const firstAgent = entities.find(e => e !== 'User');
+  switch (ev.kind) {
+    case 'user.message':
+      return { src: 'User', dst: firstAgent || 'User', label: 'user.message',
+               short: (ev.payload?.text || '').slice(0, 35) };
+    case 'assistant.message': {
+      const raw = stripThinkStr(ev.payload?.content || '').trim();
+      const calls = ev.payload?.tool_calls;
+      // Skip intermediate tool-dispatching turns (no readable text)
+      if (!raw && calls?.length) return null;
+      const short = raw ? raw.slice(0, 35) : (calls?.length ? `→ ${calls.length} tool call(s)` : '');
+      return { src: agent, dst: 'User', label: 'assistant.message', short };
+    }
+    case 'tool.call.proposed': {
+      const name = ev.payload?.name;
+      if (!name || !entities.includes(name)) return null;
+      const args = ev.payload?.arguments || '';
+      return { src: agent, dst: name, label: name,
+               short: (typeof args === 'string' ? args : JSON.stringify(args)).slice(0, 35) };
+    }
+    case 'tool.result': {
+      const name = ev.payload?.name;
+      if (!name || !entities.includes(name)) return null;
+      const ok = !ev.payload?.error;
+      return { src: name, dst: agent, label: ok ? '✓ ' + name : '✗ ' + name, short: '' };
+    }
+    case 'agent.message': {
+      const dst = ev.metadata?.to_agent_id;
+      if (!dst || !entities.includes(dst)) return null;
+      return { src: agent, dst, label: 'agent.message',
+               short: (ev.payload?.content || '').slice(0, 35) };
+    }
+    default: return null;
+  }
+}
+
+// ── Canvas helpers ────────────────────────────────────────────────────────────
+function rrect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y,     x + w, y + r,     r);
+  ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h); ctx.arcTo(x,     y + h, x,     y + h - r, r);
+  ctx.lineTo(x, y + r);     ctx.arcTo(x,     y,     x + r, y,         r);
+  ctx.closePath();
+}
+
+function arrowHead(ctx, x1, y1, x2, y2, color) {
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+  const s = 8;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - s * Math.cos(angle - 0.38), y2 - s * Math.sin(angle - 0.38));
+  ctx.lineTo(x2 - s * Math.cos(angle + 0.38), y2 - s * Math.sin(angle + 0.38));
+  ctx.closePath();
+  ctx.fill();
+}
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// ── renderFlow ────────────────────────────────────────────────────────────────
+function renderFlow() {
+  const canvas = document.getElementById('flow-canvas');
+  if (!canvas || activeTab !== 'flow') return;
+
+  const container = canvas.parentElement;
+  const VW = container.clientWidth  || 800;  // viewport size (fixed)
+  const VH = container.clientHeight || 600;
+
+  canvas.width  = VW;
+  canvas.height = VH;
+
+  const entities = inferEntities(allEvents);
+
+  // Build arrow list from ALL events; track which are past/future/selected.
+  flowArrows = [];
+  for (let i = 0; i < allEvents.length; i++) {
+    const ev = allEvents[i];
+    const a  = getArrow(ev, entities);
+    if (!a || !entities.includes(a.src) || !entities.includes(a.dst)) continue;
+    flowArrows.push({ ...a, ev, evIdx: i,
+                      isFuture:   i > cursor,
+                      isSelected: i === selected });
+  }
+
+  // Logical dimensions (at zoom 1.0 these fill the viewport width).
+  const W    = VW;
+  const colW = Math.max(110, Math.floor((W - F_MARGIN * 2) / Math.max(1, entities.length)));
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, VW, VH);  // clear full viewport in screen space
+
+  // Apply pan + zoom — all drawing below is in logical space.
+  ctx.save();
+  ctx.setTransform(flowScale, 0, 0, flowScale, flowOffsetX, flowOffsetY);
+
+  // Column centre x for each entity.
+  const colX = {};
+  entities.forEach((e, i) => { colX[e] = F_MARGIN + i * colW + colW / 2; });
+
+  // ── Entity header boxes ───────────────────────────────────────────────────
+  entities.forEach(ent => {
+    const x = colX[ent];
+    const bw = colW - 14;
+    const isUser = ent === 'User';
+    const isTool = allEvents.some(ev =>
+      (ev.kind === 'tool.call.proposed' || ev.kind === 'tool.result') && ev.payload?.name === ent);
+    const fill   = isUser ? 'rgba(88,166,255,0.14)' : isTool ? 'rgba(210,153,34,0.14)' : 'rgba(63,185,80,0.12)';
+    const stroke = isUser ? 'rgba(88,166,255,0.55)'  : isTool ? 'rgba(210,153,34,0.55)'  : 'rgba(63,185,80,0.45)';
+    const tcolor = isUser ? '#58a6ff' : isTool ? '#d29922' : '#3fb950';
+
+    ctx.fillStyle = fill; ctx.strokeStyle = stroke; ctx.lineWidth = 1;
+    rrect(ctx, x - bw / 2, 6, bw, 34, 5); ctx.fill(); ctx.stroke();
+
+    ctx.fillStyle = tcolor;
+    ctx.font = 'bold 11px system-ui, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(ent.length > 14 ? ent.slice(0, 13) + '…' : ent, x, 23);
+
+    // Entity type label
+    ctx.fillStyle = '#6e7681'; ctx.font = '9px monospace';
+    ctx.fillText(isUser ? 'user' : isTool ? 'tool' : 'agent', x, 36);
+  });
+
+  // Logical canvas height (content may extend beyond viewport; zoom/pan to navigate).
+  const logicalH = F_HDR_H + flowArrows.length * F_ROW_H + 32;
+
+  // ── Lifelines ─────────────────────────────────────────────────────────────
+  ctx.lineWidth = 1; ctx.setLineDash([5, 5]);
+  entities.forEach(ent => {
+    ctx.strokeStyle = '#30363d';
+    ctx.beginPath();
+    ctx.moveTo(colX[ent], F_HDR_H);
+    ctx.lineTo(colX[ent], logicalH - 16);
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // ── Cycle activation boxes on agent lifelines ─────────────────────────────
+  // Map trace_id → { agent, rows[] } using arrow rows for y-positioning.
+  const cycleMap = {};
+  flowArrows.forEach((a, row) => {
+    const traceId = a.ev.metadata?.trace_id;
+    const agent   = a.ev.metadata?.agent_id;
+    if (!traceId || !agent || !colX[agent]) return;
+    if (!cycleMap[traceId]) cycleMap[traceId] = { agent, rows: [] };
+    cycleMap[traceId].rows.push(row);
+  });
+  Object.values(cycleMap).forEach(({ agent, rows }) => {
+    if (!rows.length) return;
+    const x   = colX[agent];
+    const y1  = F_HDR_H + Math.min(...rows) * F_ROW_H - 6;
+    const y2  = F_HDR_H + Math.max(...rows) * F_ROW_H + F_ROW_H - 6;
+    const bw  = 16;
+    ctx.fillStyle = 'rgba(188,140,255,0.08)'; ctx.strokeStyle = 'rgba(188,140,255,0.28)'; ctx.lineWidth = 1;
+    rrect(ctx, x - bw / 2, y1, bw, y2 - y1, 3); ctx.fill(); ctx.stroke();
+  });
+
+  // ── Arrows ────────────────────────────────────────────────────────────────
+  flowArrows.forEach(({ src, dst, label, short, ev, evIdx, isFuture, isSelected }, row) => {
+    const y      = F_HDR_H + row * F_ROW_H + F_ROW_H / 2;
+    const srcX   = colX[src];
+    const dstX   = colX[dst];
+    const color  = canvasKindColor(ev.kind);
+    const alpha  = isFuture ? 0.18 : 1.0;
+    ctx.globalAlpha = alpha;
+
+    // Selected row highlight
+    if (isSelected) {
+      ctx.fillStyle = 'rgba(88,166,255,0.10)';
+      ctx.fillRect(0, y - F_ROW_H / 2, W, F_ROW_H);
+    }
+
+    // Event index (far left, faint)
+    ctx.fillStyle = '#6e7681'; ctx.font = '9px monospace';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText('#' + (evIdx + 1), 4, y);
+
+    // Arrow line
+    if (isFuture) ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(srcX, y); ctx.lineTo(dstX, y); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Arrowhead and source dot
+    arrowHead(ctx, srcX, y, dstX, y, color);
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(srcX, y, 3, 0, Math.PI * 2); ctx.fill();
+
+    // Label above the arrow line, centred between src and dst
+    const midX = (srcX + dstX) / 2;
+    ctx.fillStyle = isFuture ? '#6e7681' : color;
+    ctx.font = 'bold 10px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText(label, midX, y - 2);
+
+    // Short preview below the line
+    if (short && !isFuture) {
+      ctx.fillStyle = '#8b949e'; ctx.font = '9px monospace'; ctx.textBaseline = 'top';
+      ctx.fillText(short.length > 40 ? short.slice(0, 39) + '…' : short, midX, y + 3);
+    }
+
+    ctx.globalAlpha = 1.0;
+  });
+
+  ctx.restore(); // end of zoom/pan transform
+
+  // ── Empty state (screen space, always centred in viewport) ────────────────
+  if (flowArrows.length === 0) {
+    ctx.fillStyle = '#6e7681'; ctx.font = '13px system-ui';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('No interactions yet — waiting for events…', VW / 2, VH / 2);
+  }
+}
+
+// ── Flow pan, zoom, and click interactions ────────────────────────────────────
+(function () {
+  const fc = document.getElementById('flow-canvas');
+  let panning = false, dragged = false;
+  let panStart = { x: 0, y: 0, ox: 0, oy: 0 };
+
+  fc.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    panning = true; dragged = false;
+    panStart = { x: e.clientX, y: e.clientY, ox: flowOffsetX, oy: flowOffsetY };
+    fc.classList.add('panning');
+  });
+
+  fc.addEventListener('mousemove', e => {
+    if (!panning) return;
+    const dx = e.clientX - panStart.x, dy = e.clientY - panStart.y;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragged = true;
+    flowOffsetX = panStart.ox + dx;
+    flowOffsetY = panStart.oy + dy;
+    renderFlow();
+  });
+
+  fc.addEventListener('mouseup', e => {
+    const wasDrag = dragged;
+    panning = false; dragged = false;
+    fc.classList.remove('panning');
+    if (!wasDrag && flowArrows.length) {
+      const rect = fc.getBoundingClientRect();
+      const logY = (e.clientY - rect.top - flowOffsetY) / flowScale;
+      const row  = Math.floor((logY - F_HDR_H) / F_ROW_H);
+      if (row >= 0 && row < flowArrows.length) selectEvent(flowArrows[row].evIdx);
+    }
+  });
+
+  fc.addEventListener('mouseleave', () => { panning = false; fc.classList.remove('panning'); });
+
+  // Wheel → zoom toward cursor
+  fc.addEventListener('wheel', e => {
+    e.preventDefault();
+    const rect   = fc.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const factor   = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    const newScale = Math.max(0.15, Math.min(6.0, flowScale * factor));
+    flowOffsetX = mx - (mx - flowOffsetX) * (newScale / flowScale);
+    flowOffsetY = my - (my - flowOffsetY) * (newScale / flowScale);
+    flowScale   = newScale;
+    updateFlowZoomLabel();
+    renderFlow();
+  }, { passive: false });
+
+  // Double-click → reset zoom
+  fc.addEventListener('dblclick', () => flowResetZoom());
+}());
+
+function flowResetZoom() {
+  flowScale = 1.0; flowOffsetX = 0; flowOffsetY = 0;
+  updateFlowZoomLabel();
+  renderFlow();
+}
+
+function updateFlowZoomLabel() {
+  const el = document.getElementById('flow-zoom-label');
+  if (el) el.textContent = Math.round(flowScale * 100) + '%';
+}
+
+// Re-render flow on resize when flow tab is active
+window.addEventListener('resize', () => {
+  if (activeTab === 'flow') renderFlow();
+});
+
+// Initialize follow button as active (liveFollow defaults to true)
+window.addEventListener('load', () => {
+  document.getElementById('btn-follow').classList.add('active');
+});
+</script>
+</body>
+</html>

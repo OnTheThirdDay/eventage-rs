@@ -1,0 +1,23 @@
+[package]
+name = "example-tutorial-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Eventage tutorial: production research pipeline using all framework features"
+
+[[bin]]
+name = "tutorial-agent"
+path = "src/main.rs"
+
+[dependencies]
+eventage-provided-impl = { workspace = true }
+eventage-core = { workspace = true }
+eventage-llm = { workspace = true }
+eventage-sandbox = { workspace = true }
+eventage-scheduler = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }

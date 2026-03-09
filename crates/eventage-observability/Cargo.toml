@@ -1,0 +1,16 @@
+[package]
+name = "eventage-observability"
+version = "0.1.0"
+edition = "2021"
+description = "Core observability abstractions for the Eventage agent framework"
+
+[dependencies]
+eventage-core = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

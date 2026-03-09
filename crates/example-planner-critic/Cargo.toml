@@ -1,0 +1,20 @@
+[package]
+name = "example-planner-critic"
+version = "0.1.0"
+edition = "2021"
+description = "Eventage example: planner-critic refinement loop (non-ReAct pattern)"
+
+[[bin]]
+name = "planner-critic"
+path = "src/main.rs"
+
+[dependencies]
+eventage-provided-impl = { workspace = true }
+eventage-core = { workspace = true }
+eventage-llm = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,48 @@
+[package]
+name = "example-coding-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Enterprise-grade AI coding agent built on Eventage: streaming LLM output, ratatui TUI, security-gate hooks, context compaction, and turn-level diff tracking."
+
+[[bin]]
+name = "coding-agent"
+path = "src/main.rs"
+
+[dependencies]
+eventage-core          = { workspace = true }
+eventage-llm           = { workspace = true }
+eventage-provided-impl = { workspace = true }
+eventage-sandbox       = { workspace = true }
+eventage-sqlite        = { workspace = true }
+
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+async-trait        = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid               = { workspace = true }
+chrono             = { workspace = true }
+thiserror          = { workspace = true }
+anyhow             = { workspace = true }
+
+reqwest = { workspace = true }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+
+# TUI
+ratatui   = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Streaming SSE
+futures-util = "0.3"
+
+# Diff / patch tracking
+similar = { version = "2.6", features = ["text"] }
+diffy   = "0.3"
+
+# File hashing for diff worker
+sha2 = "0.10"
+hex  = "0.4"
