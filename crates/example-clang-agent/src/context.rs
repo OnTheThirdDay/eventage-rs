@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use eventage_agent::{context::events_to_messages, AssemblyContext, ContextAssembler};
-use eventage_llm::types::ChatMessage;
+use eventage::agent::{context::events_to_messages, AssemblyContext, ContextAssembler};
+use eventage::llm::types::ChatMessage;
 use std::sync::Arc;
 
 use crate::workspace::Workspace;

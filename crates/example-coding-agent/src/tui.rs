@@ -46,7 +46,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use eventage_core::{kinds as core_kinds, Event, EventBus};
+use eventage::{kinds as core_kinds, Event, EventBus};
 use futures_util::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
@@ -486,7 +486,7 @@ async fn handle_key(
                 if !msg.is_empty() {
                     state.input.clear();
                     let _ = bus
-                        .publish(eventage_core::Event::new(
+                        .publish(eventage::Event::new(
                             core_kinds::USER_MESSAGE,
                             json!({ "text": msg }),
                         ))

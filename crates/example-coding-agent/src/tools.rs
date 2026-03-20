@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use eventage_llm::types::ToolDefinition;
-use eventage_provided_impl::{AgentError, Tool};
-use eventage_sandbox::{SandboxExecutor, SandboxRequest};
+use eventage::sandbox::{SandboxExecutor, SandboxRequest};
+use eventage::ToolDefinition;
+use eventage::{AgentError, Tool};
 use serde_json::{json, Value};
 use tracing::instrument;
 

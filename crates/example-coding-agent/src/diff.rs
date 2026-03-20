@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use eventage_core::{kinds as core_kinds, Event, EventBus};
-use eventage_provided_impl::worker::{EventWorker, WorkerError};
+use eventage::agent::{EventWorker, WorkerError};
+use eventage::{kinds as core_kinds, Event, EventBus};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};

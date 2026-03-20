@@ -22,11 +22,11 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use eventage_core::{Event, EventBus};
-use eventage_llm::{
+use eventage::llm::{
     types::{ChatMessage, FunctionCall, LlmResponse, ToolCall, ToolDefinition},
     LlmError, LlmProvider,
 };
+use eventage::{Event, EventBus};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use eventage_agent::AgentError;
+use eventage::agent::AgentError;
 
 // ── PermissionGate trait ──────────────────────────────────────────────────────
 

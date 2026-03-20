@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use eventage_core::{Event, EventBus};
+use eventage::{Event, EventBus};
 use serde::{Deserialize, Serialize};
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};

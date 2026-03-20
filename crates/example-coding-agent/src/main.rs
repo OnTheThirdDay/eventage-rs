@@ -43,11 +43,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use eventage_core::{BusConfig, EventBus};
-use eventage_provided_impl::BusObserver;
-use eventage_provided_impl::{worker::WorkerSet, AgentBuilder, ReactStrategy};
-use eventage_sandbox::{DockerExecutor, SandboxExecutor, UnsandboxedExecutor};
-use eventage_sqlite::{SqliteEventStore, SqliteExporter};
+use eventage::sandbox::{DockerExecutor, SandboxExecutor, UnsandboxedExecutor};
+use eventage::sqlite::{SqliteEventStore, SqliteExporter};
+use eventage::BusObserver;
+use eventage::{agent::WorkerSet, AgentBuilder, ReactStrategy};
+use eventage::{BusConfig, EventBus};
 use tracing::info;
 
 use diff::TurnDiffWorker;
@@ -344,7 +344,7 @@ async fn build_executor(args: &Args) -> Result<Arc<dyn SandboxExecutor>> {
 
         #[cfg(target_os = "linux")]
         "landlock" => {
-            use eventage_sandbox::LandlockExecutor;
+            use eventage::sandbox::LandlockExecutor;
             Ok(Arc::new(LandlockExecutor::new()) as Arc<dyn SandboxExecutor>)
         }
 

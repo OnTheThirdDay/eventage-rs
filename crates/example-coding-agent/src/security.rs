@@ -11,8 +11,8 @@
 //! channels outside the bus are needed.
 
 use async_trait::async_trait;
-use eventage_core::{Event, EventBus};
-use eventage_provided_impl::hook::{CycleHook, HookAction, HookContext};
+use eventage::agent::{CycleHook, HookAction, HookContext};
+use eventage::{Event, EventBus};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::warn;

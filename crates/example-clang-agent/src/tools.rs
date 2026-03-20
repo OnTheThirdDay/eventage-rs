@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use eventage_agent::{AgentError, Tool};
-use eventage_llm::types::ToolDefinition;
-use eventage_sandbox::{SandboxExecutor, SandboxRequest};
+use eventage::agent::{AgentError, Tool};
+use eventage::llm::types::ToolDefinition;
+use eventage::sandbox::{SandboxExecutor, SandboxRequest};
 use serde_json::{json, Value};
 use tracing::{debug, instrument};
 

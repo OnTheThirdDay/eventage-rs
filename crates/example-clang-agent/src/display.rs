@@ -1,7 +1,7 @@
 /// Terminal display utilities for the C agent REPL.
 ///
 /// Uses ANSI escape codes.  Respects the `NO_COLOR` environment variable.
-use eventage_core::{kinds, Event};
+use eventage::{kinds, Event};
 use std::io::Write;
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────

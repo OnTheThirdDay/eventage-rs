@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use eventage_agent::AgentBuilder;
-use eventage_core::{kinds, Event, EventBus};
-use eventage_llm::OpenAiProvider;
-use eventage_sandbox::{DockerExecutor, SandboxExecutor, UnsandboxedExecutor};
+use eventage::agent::AgentBuilder;
+use eventage::{kinds, Event, EventBus};
+use eventage::llm::OpenAiProvider;
+use eventage::sandbox::{DockerExecutor, SandboxExecutor, UnsandboxedExecutor};
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tracing::debug;
@@ -407,7 +407,7 @@ async fn build_executor(args: &Args) -> Result<Arc<dyn SandboxExecutor>> {
 
         #[cfg(target_os = "linux")]
         "landlock" => {
-            use eventage_sandbox::LandlockExecutor;
+            use eventage::sandbox::LandlockExecutor;
             Ok(Arc::new(LandlockExecutor::new()) as Arc<dyn SandboxExecutor>)
         }
 

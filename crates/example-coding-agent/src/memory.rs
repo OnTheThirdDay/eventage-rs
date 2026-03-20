@@ -13,9 +13,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use eventage_core::{Event, EventBus};
-use eventage_llm::{types::ChatMessage, LlmProvider};
-use eventage_provided_impl::{context::events_to_messages, AssemblyContext, ContextAssembler};
+use eventage::llm::{types::ChatMessage, LlmProvider};
+use eventage::{agent::context::events_to_messages, AssemblyContext, ContextAssembler};
+use eventage::{Event, EventBus};
 use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::info;

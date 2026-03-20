@@ -2,6 +2,7 @@
 name = "example-coding-agent"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "Enterprise-grade AI coding agent built on Eventage: streaming LLM output, ratatui TUI, security-gate hooks, context compaction, and turn-level diff tracking."
 
 [[bin]]
@@ -9,24 +10,20 @@ name = "coding-agent"
 path = "src/main.rs"
 
 [dependencies]
-eventage-core          = { workspace = true }
-eventage-llm           = { workspace = true }
-eventage-provided-impl = { workspace = true }
-eventage-sandbox       = { workspace = true }
-eventage-sqlite        = { workspace = true }
+eventage = { path = "../..", features = ["sandbox", "sqlite"] }
 
-tokio              = { workspace = true }
-serde              = { workspace = true }
-serde_json         = { workspace = true }
-async-trait        = { workspace = true }
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
-uuid               = { workspace = true }
-chrono             = { workspace = true }
-thiserror          = { workspace = true }
-anyhow             = { workspace = true }
+tokio              = { version = "1", features = ["full"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+async-trait        = "0.1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid               = { version = "1", features = ["v4"] }
+chrono             = { version = "0.4", features = ["serde"] }
+thiserror          = "1"
+anyhow             = "1"
 
-reqwest = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

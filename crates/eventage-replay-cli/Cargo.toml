@@ -1,0 +1,17 @@
+[package]
+name = "eventage-replay-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "eventage-replay"
+path = "src/main.rs"
+
+[dependencies]
+eventage = { path = "../..", features = ["replay"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

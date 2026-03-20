@@ -1,51 +1,102 @@
 [workspace]
 members = [
-    "crates/eventage-core",
-    "crates/eventage-llm",
-    "crates/eventage-agent",
-    "crates/eventage-scheduler",
-    "crates/eventage-sandbox",
-    "crates/eventage-observability",
-    "crates/eventage-replay",
-    "crates/eventage-mcp",
-    "crates/eventage-sqlite",
-    "crates/example-basic-chat",
-    "crates/example-tool-use",
-    "crates/example-multi-agent",
-    "crates/example-planner-critic",
-    "crates/example-tutorial-agent",
-    "crates/example-workflow",
-    "crates/example-clang-agent",
+    ".",
+    "crates/eventage-replay-cli",
     "crates/example-coding-agent",
-    "crates/eventage-provided-impl",
-    "crates/example-reactive-chat",
+    "crates/example-clang-agent",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
-axum = "0.7"
-tower-http = { version = "0.6", features = ["cors"] }
-anyhow = "1"
-arc-swap = "1"
+eventage = { path = "." }
 
-eventage-core = { path = "crates/eventage-core" }
-eventage-llm = { path = "crates/eventage-llm" }
-eventage-agent = { path = "crates/eventage-agent" }
-eventage-scheduler = { path = "crates/eventage-scheduler" }
-eventage-sandbox = { path = "crates/eventage-sandbox" }
-eventage-observability = { path = "crates/eventage-observability" }
-eventage-sqlite = { path = "crates/eventage-sqlite" }
-eventage-replay = { path = "crates/eventage-replay" }
-eventage-mcp = { path = "crates/eventage-mcp" }
-eventage-provided-impl = { path = "crates/eventage-provided-impl" }
-futures-util = "0.3"
+[package]
+name = "eventage"
+version = "0.2.0"
+edition = "2021"
+description = "Event-driven AI agent and harness framework"
+license = "MIT"
+repository = "https://github.com/dwzhangdavid/eventage-rs"
+readme = "README.md"
+keywords = ["agent", "llm", "harness", "ai"]
+categories = ["asynchronous", "network-programming"]
+
+[features]
+default = []
+
+observability = []
+scheduler = []
+sqlite         = ["observability", "dep:rusqlite"]
+sqlite-bundled = ["sqlite", "rusqlite/bundled"]
+replay         = ["dep:axum", "dep:tower-http", "dep:futures-util"]
+mcp            = []
+sandbox        = []
+sandbox-wasm   = ["sandbox", "dep:wasmtime", "dep:wasmtime-wasi"]
+opentelemetry  = [
+    "observability",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+]
+full = [
+    "observability",
+    "scheduler",
+    "sqlite",
+    "replay",
+    "mcp",
+    "sandbox",
+    "opentelemetry",
+]
+
+# ── Always-on dependencies ────────────────────────────────────────────────────
+
+[dependencies]
+tokio        = { version = "1", features = ["full"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+uuid         = { version = "1", features = ["v4", "serde"] }
+chrono       = { version = "0.4", features = ["serde"] }
+async-trait  = "0.1"
+thiserror    = "2"
+tracing      = "0.1"
+arc-swap     = "1"
+reqwest      = { version = "0.12", features = ["json", "stream"] }
+
+# ── Feature-gated optional dependencies ──────────────────────────────────────
+
+axum         = { version = "0.7", optional = true }
+tower-http   = { version = "0.6", features = ["cors"], optional = true }
+futures-util = { version = "0.3", optional = true }
+rusqlite     = { version = "0.32", optional = true }
+
+wasmtime      = { version = "28", optional = true }
+wasmtime-wasi = { version = "28", optional = true }
+
+opentelemetry       = { version = "0.27", optional = true }
+opentelemetry_sdk   = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp  = { version = "0.27", features = ["tonic"], optional = true }
+
+# ── Linux-only optional sandbox dependencies ──────────────────────────────────
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+nix      = { version = "0.29", features = ["process", "signal", "user"] }
+
+# ── Development dependencies ──────────────────────────────────────────────────
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile           = "3"
+anyhow             = "1"
+
+[[example]]
+name = "basic_chat"
+required-features = ["observability", "replay"]
+
+[[example]]
+name = "reactive_chat"
+required-features = ["observability", "replay"]
+
+[[example]]
+name = "tutorial_agent"
+required-features = ["observability", "scheduler", "sandbox"]
