@@ -79,4 +79,4 @@ pub use eviction::{EpitaphStore, EpitaphStrategy};
 #[cfg(feature = "observability")]
 pub use observability::{BusObserver, JsonlExporter};
 
-pub use llm::{ChatMessage, LlmError, LlmProvider, LlmResponse, ToolCall, ToolDefinition};
+pub use llm::{ChatMessage, LlmError, LlmProvider, LlmResponse, RateLimitedProvider, ToolCall, ToolDefinition};

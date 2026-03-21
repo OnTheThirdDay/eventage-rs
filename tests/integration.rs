@@ -90,6 +90,7 @@ async fn tool_call_executes_and_loops() {
                 name: "echo".to_string(),
                 arguments: r#"{"text":"ping"}"#.to_string(),
             },
+            extra_content: None,
         }],
         finish_reason: "tool_calls".to_string(),
     };
@@ -519,6 +520,7 @@ async fn dynamic_tool_add_visible_in_cycle() {
                         name: "late_tool".into(),
                         arguments: "{}".into(),
                     },
+                    extra_content: None,
                 }],
                 finish_reason: "tool_calls".into(),
             },
@@ -629,6 +631,7 @@ async fn keyword_tool_selector_filters_definitions() {
                         name: "search_web".into(),
                         arguments: "{}".into(),
                     },
+                    extra_content: None,
                 }],
                 finish_reason: "tool_calls".into(),
             },

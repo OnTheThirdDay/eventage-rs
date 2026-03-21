@@ -126,6 +126,7 @@ pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
                                             .as_str()?
                                             .to_string(),
                                     },
+                                    extra_content: tc.get("extra_content").cloned(),
                                 })
                             })
                             .collect()

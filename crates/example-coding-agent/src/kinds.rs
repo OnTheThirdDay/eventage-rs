@@ -15,5 +15,15 @@ pub const CODING_APPROVAL_DENIED: &str = "coding.approval.denied";
 /// Published by `TurnDiffWorker` with unified diffs of all changed files.
 pub const CODING_TURN_DIFF: &str = "coding.turn.diff";
 
-/// Published by `CompactingContextAssembler` when the context is summarised.
+/// Published by `SummarizingAssembler` when the context is summarised.
+#[allow(dead_code)]
 pub const CODING_CONTEXT_COMPACTED: &str = "coding.context.compacted";
+
+/// Published by `LaunchAsyncTaskTool` to request a background sub-agent.
+pub const SUBAGENT_TASK_LAUNCH: &str = "subagent.task.launch";
+
+/// Published by `SubAgentWorker` when a background sub-agent completes.
+pub const SUBAGENT_TASK_COMPLETE: &str = "subagent.task.complete";
+
+/// Published by `SubAgentWorker` when a background sub-agent fails.
+pub const SUBAGENT_TASK_ERROR: &str = "subagent.task.error";

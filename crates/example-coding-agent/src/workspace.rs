@@ -13,6 +13,7 @@ pub struct FileEntry {
     /// Workspace-relative path (e.g. `"src/main.py"`).
     pub path: String,
     /// File size in bytes.
+    #[allow(dead_code)]
     pub size_bytes: u64,
 }
 
@@ -31,6 +32,7 @@ impl Workspace {
     }
 
     /// The absolute path of the workspace root.
+    #[allow(dead_code)]
     pub fn root(&self) -> &Path {
         &self.root
     }

@@ -86,6 +86,9 @@ struct RawToolCall {
     #[serde(rename = "type")]
     kind: String,
     function: RawFunctionCall,
+    /// Preserved verbatim for providers that require round-tripping extra data
+    /// (e.g. Gemini's thought_signature).
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -160,6 +163,7 @@ impl LlmProvider for OpenAiProvider {
                     name: tc.function.name,
                     arguments: tc.function.arguments,
                 },
+                extra_content: tc.extra_content,
             })
             .collect();
 

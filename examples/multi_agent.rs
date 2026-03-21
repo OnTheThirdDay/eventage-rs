@@ -16,11 +16,11 @@
 //! ```
 
 use async_trait::async_trait;
-use eventage::{kinds, meta_keys, Event, EventBus};
 use eventage::llm::{
     types::{ChatMessage, FunctionCall, LlmResponse, ToolCall, ToolDefinition},
     MockLlmProvider,
 };
+use eventage::{kinds, meta_keys, Event, EventBus};
 use eventage::{
     AgentBuilder, AgentError, AgentSet, AssemblyContext, ContextAssembler, EventWorker,
     ReactStrategy, Tool, WorkerError, WorkerSet,
@@ -265,6 +265,7 @@ fn orchestrator_llm() -> MockLlmProvider {
                     name: "delegate_to_summariser".into(),
                     arguments: r#"{"text": "The Rust programming language was created by Graydon Hoare at Mozilla Research starting in 2006. It focuses on safety, speed, and concurrency. Rust uses a unique ownership model to guarantee memory safety without a garbage collector. It was first released publicly in 2010 and reached version 1.0 in May 2015."}"#.into(),
                 },
+                extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
         },

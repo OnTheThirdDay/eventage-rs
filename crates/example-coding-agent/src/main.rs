@@ -1,408 +1,481 @@
-//! example-coding-agent — enterprise-grade AI coding agent.
-//!
-//! Demonstrates the full Eventage feature set in a single cohesive example:
-//!
-//! - **Streaming LLM** — tokens published as events, live TUI typing effect
-//! - **ratatui TUI** — modes: Idle / Working / AwaitingApproval
-//! - **SecurityGateHook** — intercepts dangerous tools, event-driven approval
-//! - **CompactingContextAssembler** — auto-summarises long conversations
-//! - **TurnDiffWorker** — per-turn file-change diffs published as events
-//! - **SQLite persistence** — full event log saved and resumable across runs
-//! - **Sandbox integration** — shell execution with Landlock / Docker / none
+//! coding-agent — agentic capabilities with streaming TUI, security gate, and diff tracking.
 //!
 //! # Quick start
 //!
 //! ```sh
-//! # With Ollama running locally:
+//! # With Ollama running locally (TUI mode):
 //! cargo run -p example-coding-agent -- --model qwen3:4b
 //!
 //! # With OpenAI:
 //! cargo run -p example-coding-agent -- \
-//!   --url https://api.openai.com/v1 \
-//!   --api-key sk-... \
-//!   --model gpt-4o
+//!   --url https://api.openai.com/v1 --api-key sk-... --model gpt-4o
+//!
+//! # REPL fallback (no TUI):
+//! cargo run -p example-coding-agent -- --no-tui --model qwen3:4b
 //!
 //! # Resume a previous session:
-//! cargo run -p example-coding-agent -- --resume <SESSION_ID>
-//!
-//! # List saved sessions:
-//! cargo run -p example-coding-agent -- --list-sessions
+//! cargo run -p example-coding-agent -- --session-file session.jsonl
 //! ```
 
-mod diff;
+mod agent;
+mod assembler;
+mod error;
+mod hooks;
 mod kinds;
-mod memory;
-mod security;
+mod prompt;
 mod streaming;
 mod tools;
 mod tui;
+mod workers;
 mod workspace;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
+use agent::CodingAgentBuilder;
 use clap::Parser;
-use eventage::sandbox::{DockerExecutor, SandboxExecutor, UnsandboxedExecutor};
-use eventage::sqlite::{SqliteEventStore, SqliteExporter};
-use eventage::BusObserver;
-use eventage::{agent::WorkerSet, AgentBuilder, ReactStrategy};
-use eventage::{BusConfig, EventBus};
-use tracing::info;
+use eventage::event::kinds as core_kinds;
+use eventage::observability::{BusObserver, JsonlExporter};
+use eventage::replay::LiveReplayServer;
+use std::io::{self, BufRead};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
 
-use diff::TurnDiffWorker;
-use memory::CompactingContextAssembler;
-use security::SecurityGateHook;
-use streaming::StreamingOpenAiProvider;
-use tools::{ApplyPatch, ExecuteShell, ListDir, ReadFile, WriteFile};
-use workspace::Workspace;
-
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "coding-agent",
-    about = "Enterprise-grade AI coding agent powered by Eventage",
-    long_about = "An event-driven coding agent with streaming LLM output, \
-                 a ratatui TUI, security-gate approval, context compaction, \
-                 and turn-level diff tracking. Sessions are persisted to SQLite."
+    about = "Coding Agent — agentic capabilities with streaming TUI, security gate, and diff tracking",
+    long_about = None
 )]
 struct Args {
-    /// LLM model name.
-    #[arg(short, long, default_value = "qwen3:4b")]
-    model: String,
-
-    /// LLM provider base URL (OpenAI-compatible).
-    #[arg(short = 'u', long, default_value = "http://localhost:11434/v1")]
+    /// LLM base URL (OpenAI-compatible)
+    #[arg(long, default_value = "http://localhost:11434/v1")]
     url: String,
 
-    /// API key (`ollama` for local Ollama, or your OpenAI key).
-    #[arg(short = 'k', long, default_value = "ollama")]
+    /// API key
+    #[arg(long, default_value = "ollama")]
     api_key: String,
 
-    /// Resume a previous session by its ID.
-    #[arg(long, value_name = "SESSION_ID")]
-    resume: Option<String>,
+    /// Model name
+    #[arg(long, short, default_value = "qwen3:4b")]
+    model: String,
 
-    /// List saved sessions and exit.
+    /// Custom system prompt prefix
     #[arg(long)]
-    list_sessions: bool,
+    system_prompt: Option<String>,
 
-    /// Context token budget (approx). Compaction triggers at 85% of this.
-    #[arg(long, default_value = "120000")]
-    max_tokens: usize,
-
-    /// Number of recent conversation messages to keep after compaction.
-    #[arg(long, default_value = "20")]
-    recent_window: usize,
-
-    /// Shell execution timeout in milliseconds.
-    #[arg(long, default_value = "15000")]
-    exec_timeout: u64,
-
-    /// Sandbox mode: none | landlock (Linux) | docker.
-    #[arg(long, default_value = "none")]
-    sandbox: String,
-
-    /// Docker image for --sandbox docker.
-    #[arg(long, default_value = "python:3.12-slim")]
-    docker_image: String,
-
-    /// Max ReAct loop steps per conversation turn.
-    #[arg(long, default_value = "30")]
+    /// Max ReAct steps per cycle
+    #[arg(long, default_value_t = 30)]
     max_steps: usize,
 
-    /// Tracing log level (written to ~/.coding-agent/logs/).
-    #[arg(long, default_value = "info")]
-    log_level: String,
-}
+    /// Approximate token budget for conversation summarization (0 = disabled)
+    #[arg(long, default_value_t = 120_000)]
+    max_tokens: usize,
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+    /// Path(s) to AGENTS.md memory files
+    #[arg(long = "memory")]
+    memory: Vec<PathBuf>,
+
+    /// Directory(ies) containing SKILL.md skill files
+    #[arg(long = "skills")]
+    skills: Vec<PathBuf>,
+
+    /// Working directory for filesystem tools (default: current directory)
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+
+    /// Tool names that require human approval (REPL mode only)
+    #[arg(long = "approve")]
+    human_approval: Vec<String>,
+
+    /// Require human approval before executing ANY tool call
+    #[arg(long = "require-approve-all", default_value_t = false)]
+    require_approve_all: bool,
+
+    /// Disable async sub-agent worker
+    #[arg(long, default_value_t = false)]
+    no_async_subagents: bool,
+
+    /// Max LLM requests per minute (0 = unlimited)
+    #[arg(long, default_value_t = 0)]
+    rpm: u32,
+
+    /// Write all bus events to a JSONL file for replay/inspection
+    #[arg(long)]
+    log: Option<PathBuf>,
+
+    /// Save/restore conversation history (JSONL format)
+    #[arg(long)]
+    session_file: Option<PathBuf>,
+
+    /// Start a live replay UI server
+    #[arg(long, default_value_t = false)]
+    replay: bool,
+
+    /// Port for the live replay UI server
+    #[arg(long, default_value_t = 4567)]
+    replay_port: u16,
+
+    /// Use REPL mode instead of the TUI (no streaming, stdin/stdout interaction)
+    #[arg(long, default_value_t = false)]
+    no_tui: bool,
+}
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Initialise tracing to a file so TUI output is not polluted.
-    if let Ok(log_dir) = agent_data_dir().map(|d| d.join("logs")) {
-        let _ = std::fs::create_dir_all(&log_dir);
-        // Best-effort: if we can't open the file, just use stderr.
-        let log_file = log_dir.join("coding-agent.log");
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-        {
-            tracing_subscriber::fmt()
-                .with_env_filter(&args.log_level)
-                .with_writer(move || file.try_clone().expect("log file clone"))
-                .init();
-        } else {
-            tracing_subscriber::fmt()
-                .with_env_filter(&args.log_level)
-                .with_writer(std::io::stderr)
-                .init();
-        }
+    let tui_mode = !args.no_tui;
+
+    if tui_mode {
+        // In TUI mode, log to file to keep the terminal clean.
+        setup_file_tracing();
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(&args.log_level)
-            .with_writer(std::io::stderr)
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+            )
+            .with_target(false)
             .init();
+
+        eprintln!(
+            "Coding Agent starting (model: {}, url: {})",
+            args.model, args.url
+        );
+        if args.require_approve_all {
+            eprintln!("Approval required for: all tools (--require-approve-all)");
+        } else if !args.human_approval.is_empty() {
+            eprintln!("Approval required for: {}", args.human_approval.join(", "));
+        }
     }
 
-    if let Err(e) = run(args).await {
-        eprintln!("\nerror: {e:#}");
-        std::process::exit(1);
-    }
-}
-
-async fn run(args: Args) -> Result<()> {
-    let data_dir = agent_data_dir()?;
-    let sessions_dir = data_dir.join("sessions");
-    std::fs::create_dir_all(&sessions_dir)?;
-
-    // ── --list-sessions ───────────────────────────────────────────────────────
-    if args.list_sessions {
-        list_sessions(&sessions_dir)?;
-        return Ok(());
-    }
-
-    // ── Session (SQLite) ──────────────────────────────────────────────────────
-    let session_id = args
-        .resume
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    let db_path = sessions_dir.join(format!("{session_id}.db"));
-    // ── Event bus ─────────────────────────────────────────────────────────────
-    let bus = EventBus::with_config(BusConfig {
-        // Observability subscribers (SQLite, TUI) get a bounded queue so
-        // they never cause unbounded memory growth.
-        subscriber_capacity: 2048,
-        max_retained_branches: 10,
-        ..BusConfig::default()
-    });
-
-    // Restore previous session events if resuming.
-    if args.resume.is_some() {
-        let store = SqliteEventStore::new(&db_path)
-            .await
-            .with_context(|| format!("could not open session database at {db_path:?}"))?;
-        let events = store.load_all().await?;
-        let count = events.len();
-        bus.restore_from(events).await;
-        info!(count, session_id, "restored session events");
-    }
-
-    // ── Workspace ─────────────────────────────────────────────────────────────
-    let workspace_dir = sessions_dir.join(&session_id).join("workspace");
-    let workspace = Arc::new(Workspace::open(&workspace_dir)?);
-
-    // ── Sandbox executor ──────────────────────────────────────────────────────
-    let executor: Arc<dyn SandboxExecutor> = build_executor(&args).await?;
-
-    // ── Streaming LLM provider ────────────────────────────────────────────────
-    let llm = StreamingOpenAiProvider::new(&args.url, &args.api_key, &args.model, bus.clone());
-    let cancelled = llm.cancelled.clone();
-    let llm = Arc::new(llm);
-
-    // ── Context assembler (compacting) ────────────────────────────────────────
-    let assembler = CompactingContextAssembler::new(
-        system_prompt(),
-        args.max_tokens,
-        llm.clone(),
-        bus.clone(),
-        workspace.clone(),
-    )
-    .with_recent_window(args.recent_window);
-
-    // ── Security gate hook ────────────────────────────────────────────────────
-    let security_hook = SecurityGateHook::new(bus.clone());
-
-    // ── Agent ─────────────────────────────────────────────────────────────────
-    let agent = AgentBuilder::new()
-        .bus(bus.clone())
-        .llm_arc(llm)
-        .context(assembler)
-        .hook(security_hook)
-        .strategy(ReactStrategy {
-            max_steps: args.max_steps,
-            max_concurrent_tools: 4,
-        })
-        .tool(ReadFile {
-            workspace: workspace.clone(),
-        })
-        .tool(WriteFile {
-            workspace: workspace.clone(),
-        })
-        .tool(ApplyPatch {
-            workspace: workspace.clone(),
-        })
-        .tool(ExecuteShell {
-            workspace: workspace.clone(),
-            executor: executor.clone(),
-            default_timeout_ms: args.exec_timeout,
-        })
-        .tool(ListDir {
-            workspace: workspace.clone(),
-        })
+    let agent = CodingAgentBuilder::new()
+        .model(&args.url, &args.api_key, &args.model)
+        .system_prompt_opt(args.system_prompt)
+        .max_steps(args.max_steps)
+        .max_tokens(args.max_tokens)
+        .memory(args.memory)
+        .skills(args.skills)
+        .work_dir_opt(args.work_dir)
+        .human_approval_for(args.human_approval)
+        .require_approve_all(args.require_approve_all)
+        .async_subagents(!args.no_async_subagents)
+        .requests_per_minute(args.rpm)
+        .tui_mode(tui_mode)
         .build();
 
-    info!(
-        session_id,
-        model = args.model,
-        sandbox = args.sandbox,
-        "agent ready"
-    );
+    let bus = agent.bus().clone();
+    let model = agent.model.clone();
+    let session_id = agent.session_id.clone();
+    let cancelled = agent
+        .cancelled
+        .clone()
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
-    // ── Background workers ────────────────────────────────────────────────────
-
-    // Turn diff worker — publishes file change diffs.
-    let diff_worker = TurnDiffWorker::new(workspace.clone());
-
-    // SQLite exporter — persists every event to the session database.
-    let sqlite_exporter = SqliteExporter::new(&db_path)
-        .await
-        .with_context(|| format!("could not open SQLite exporter at {db_path:?}"))?;
-
-    let workers_bus = bus.clone();
-    tokio::spawn(async move {
-        WorkerSet::new()
-            .add_worker(diff_worker)
-            .run_on(workers_bus)
-            .await
-            .ok();
-    });
-
-    // Observability: SQLite export runs alongside TUI.
-    let obs_bus = bus.clone();
-    tokio::spawn(async move {
-        BusObserver::new(obs_bus)
-            .add_exporter(sqlite_exporter)
-            .run()
-            .await;
-    });
-
-    // ── Agent event loop ──────────────────────────────────────────────────────
-    tokio::spawn(async move {
-        if let Err(e) = agent.run().await {
-            tracing::error!("agent error: {e}");
+    // Restore previous session if --session-file is set
+    if let Some(ref sf) = args.session_file {
+        if sf.exists() {
+            match load_session(&bus, sf).await {
+                Ok(n) => {
+                    if !tui_mode {
+                        eprintln!("Resumed {} events from {}", n, sf.display());
+                    }
+                }
+                Err(e) => eprintln!("Warning: could not load session: {e}"),
+            }
+        } else if !tui_mode {
+            eprintln!("New session — will save to {}", sf.display());
         }
-    });
+    }
 
-    // ── TUI ───────────────────────────────────────────────────────────────────
-    tui::run_tui(bus, args.model.clone(), session_id.clone(), cancelled).await?;
+    // Start live replay server if requested
+    if args.replay {
+        LiveReplayServer::new(bus.clone())
+            .port(args.replay_port)
+            .serve_background();
+        if !tui_mode {
+            eprintln!("Live replay UI: http://localhost:{}", args.replay_port);
+        }
+    }
 
-    println!("\nSession saved: {session_id}");
-    println!("Resume with:  coding-agent --resume {session_id}");
+    // Start observability exporter if --log was specified
+    if let Some(log_path) = args.log {
+        match JsonlExporter::new(&log_path).await {
+            Ok(exporter) => {
+                let observer = BusObserver::new(bus.clone()).add_exporter(exporter);
+                tokio::spawn(observer.run());
+                if !tui_mode {
+                    eprintln!("Logging events to {}", log_path.display());
+                }
+            }
+            Err(e) => eprintln!("Warning: could not open log file: {e}"),
+        }
+    }
+
+    if tui_mode {
+        // ── TUI mode ─────────────────────────────────────────────────────────
+        tokio::spawn(async move {
+            if let Err(e) = agent.run().await {
+                tracing::error!("agent error: {e}");
+            }
+        });
+
+        tui::run_tui(bus, model, session_id, cancelled).await?;
+    } else if !args.no_async_subagents {
+        // ── Reactive REPL ─────────────────────────────────────────────────────
+        tokio::spawn(async move {
+            if let Err(e) = agent.run().await {
+                eprintln!("agent error: {e}");
+            }
+        });
+        run_reactive_repl(bus, args.session_file).await?;
+    } else {
+        // ── Sync REPL ─────────────────────────────────────────────────────────
+        run_sync_repl(agent, args.session_file).await?;
+    }
 
     Ok(())
 }
 
-// ── Session listing ───────────────────────────────────────────────────────────
+// ── Tracing setup ─────────────────────────────────────────────────────────────
 
-fn list_sessions(dir: &std::path::Path) -> Result<()> {
-    let mut sessions: Vec<(String, std::time::SystemTime)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".db") {
-                let id = name.trim_end_matches(".db").to_string();
-                let modified = entry
-                    .metadata()?
-                    .modified()
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                sessions.push((id, modified));
+fn setup_file_tracing() {
+    let log_dir = dirs::home_dir()
+        .map(|h| h.join(".coding-agent").join("logs"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/coding-agent-logs"));
+
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file = log_dir.join("coding-agent.log");
+
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .with_writer(move || file.try_clone().expect("log file clone"))
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("warn"))
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+}
+
+// ── Session persistence ───────────────────────────────────────────────────────
+
+async fn load_session(bus: &eventage::EventBus, path: &Path) -> anyhow::Result<usize> {
+    let content = tokio::fs::read_to_string(path).await?;
+    let mut count = 0;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: eventage::Event = serde_json::from_str(line)?;
+        bus.publish(event).await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+async fn save_session(bus: &eventage::EventBus, path: &Path) {
+    let log = bus.log().await;
+    let result = async {
+        let mut content = String::new();
+        for event in &log {
+            if matches!(
+                event.kind.as_str(),
+                core_kinds::USER_MESSAGE | core_kinds::ASSISTANT_MESSAGE | core_kinds::TOOL_RESULT
+            ) {
+                content.push_str(&serde_json::to_string(event)?);
+                content.push('\n');
             }
         }
+        tokio::fs::write(path, content).await?;
+        Ok::<(), anyhow::Error>(())
     }
-    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+    .await;
 
-    if sessions.is_empty() {
-        println!("No saved sessions found.");
-    } else {
-        println!("{:<36}  LAST USED", "SESSION ID");
-        println!("{}", "─".repeat(60));
-        for (id, modified) in &sessions {
-            let dt: chrono::DateTime<chrono::Utc> = (*modified).into();
-            println!("{id:<36}  {}", dt.format("%Y-%m-%d %H:%M UTC"));
+    if let Err(e) = result {
+        eprintln!("Warning: could not save session: {e}");
+    }
+}
+
+// ── REPL variants ─────────────────────────────────────────────────────────────
+
+/// Reactive REPL: publishes USER_MESSAGE events; background agent processes them.
+async fn run_reactive_repl(
+    bus: eventage::EventBus,
+    session_file: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use eventage::event::Event;
+    use serde_json::json;
+
+    eprintln!("Ready. Type your message and press Enter. (Ctrl+C to exit)\n");
+
+    loop {
+        // Read one line using rustyline for full readline editing.
+        let line = tokio::task::spawn_blocking(|| {
+            match rustyline::DefaultEditor::new() {
+                Ok(mut rl) => rl.readline("").ok(),
+                Err(_) => {
+                    // Fallback to raw read_line
+                    let mut s = String::new();
+                    match io::stdin().lock().read_line(&mut s) {
+                        Ok(0) => None,
+                        Ok(_) => Some(s),
+                        Err(_) => None,
+                    }
+                }
+            }
+        })
+        .await?;
+
+        let Some(raw) = line else { break };
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Subscribe BEFORE publishing so we catch every event of this cycle.
+        let mut rx = bus.subscribe();
+
+        bus.publish(Event::new(
+            core_kinds::USER_MESSAGE,
+            json!({ "text": trimmed }),
+        ))
+        .await?;
+
+        drain_cycle(&mut rx).await;
+
+        if let Some(ref sf) = session_file {
+            save_session(&bus, sf).await;
         }
     }
+
     Ok(())
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+/// Synchronous REPL: calls agent.chat() directly for each message.
+async fn run_sync_repl(
+    agent: agent::CodingAgent,
+    session_file: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let bus = agent.bus().clone();
 
-fn agent_data_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home dir"))?;
-    Ok(home.join(".coding-agent"))
+    eprintln!("Ready. Type your message and press Enter. (Ctrl+C to exit)\n");
+
+    loop {
+        let line = tokio::task::spawn_blocking(|| match rustyline::DefaultEditor::new() {
+            Ok(mut rl) => rl.readline("").ok(),
+            Err(_) => {
+                let mut s = String::new();
+                match io::stdin().lock().read_line(&mut s) {
+                    Ok(0) => None,
+                    Ok(_) => Some(s),
+                    Err(_) => None,
+                }
+            }
+        })
+        .await?;
+
+        let Some(raw) = line else { break };
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Stream intermediate events while chat() runs.
+        let mut rx = bus.subscribe();
+        let display = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                print_event(&event);
+            }
+        });
+
+        match agent.chat(&trimmed).await {
+            Ok(response) => {
+                display.abort();
+                if !response.is_empty() {
+                    eprintln!("\nAssistant: {response}\n");
+                }
+            }
+            Err(e) => {
+                display.abort();
+                eprintln!("error: {e}");
+            }
+        }
+
+        if let Some(ref sf) = session_file {
+            save_session(&bus, sf).await;
+        }
+    }
+
+    Ok(())
 }
 
-async fn build_executor(args: &Args) -> Result<Arc<dyn SandboxExecutor>> {
-    match args.sandbox.as_str() {
-        "none" => Ok(Arc::new(UnsandboxedExecutor::new()) as Arc<dyn SandboxExecutor>),
+// ── Shared helpers ────────────────────────────────────────────────────────────
 
-        #[cfg(target_os = "linux")]
-        "landlock" => {
-            use eventage::sandbox::LandlockExecutor;
-            Ok(Arc::new(LandlockExecutor::new()) as Arc<dyn SandboxExecutor>)
+/// Drain bus events until the ReAct cycle fully completes.
+async fn drain_cycle(rx: &mut eventage::BusReceiver) {
+    let mut cycle_started = false;
+    while let Some(event) = rx.recv().await {
+        if event.kind == core_kinds::AGENT_CYCLE_START {
+            cycle_started = true;
+            continue;
         }
-
-        #[cfg(not(target_os = "linux"))]
-        "landlock" => anyhow::bail!("Landlock is Linux-only. Use --sandbox none or docker."),
-
-        "docker" => {
-            let exec = DockerExecutor::new(&args.docker_image);
-            exec.check().await.with_context(|| {
-                format!("Docker pre-flight failed (image: {})", args.docker_image)
-            })?;
-            Ok(Arc::new(exec) as Arc<dyn SandboxExecutor>)
+        if !cycle_started {
+            continue;
         }
-
-        other => {
-            anyhow::bail!("unknown sandbox mode '{other}'. Valid: none, landlock (Linux), docker.")
+        if print_event(&event) {
+            return;
+        }
+        if event.kind == core_kinds::AGENT_CYCLE_END {
+            return;
         }
     }
 }
 
-// ── System prompt ─────────────────────────────────────────────────────────────
-
-fn system_prompt() -> String {
-    r#"You are an expert software engineer with direct access to a real filesystem and shell.
-
-TOOLS AVAILABLE
-  read_file(path)
-    Read a file from the workspace. Always read before editing.
-
-  write_file(path, content)
-    Create or overwrite a file. Use for new files or complete rewrites.
-    Requires user approval.
-
-  apply_patch(path, patch)
-    Apply a unified diff to make targeted edits without rewriting the full file.
-    Requires user approval.
-
-  execute_shell(command, stdin?, timeout_ms?)
-    Run any shell command. Working dir is the workspace root.
-    Requires user approval.
-
-  list_dir()
-    List all workspace files and their sizes.
-
-WORKFLOW
-  1. Understand the task — read relevant files first.
-  2. Plan — outline what you'll do before writing code.
-  3. Implement — write or patch files.
-  4. Test — run the code and observe actual output.
-  5. Iterate — fix any errors until tests pass.
-  6. Report — summarise what was done and show key outputs.
-
-STANDARDS
-  - Write production-quality code with error handling.
-  - Use the language's idiomatic patterns and standard library.
-  - Prefer apply_patch for small targeted changes, write_file for new files.
-  - Always run and test code — never assume it works.
-  - Report the actual stdout/stderr from execute_shell in your final response.
-"#
-    .to_string()
+/// Print a single bus event to the terminal. Returns true when the cycle is done.
+fn print_event(event: &eventage::Event) -> bool {
+    if event.kind == core_kinds::TOOL_CALL_PROPOSED {
+        let name = event.payload["name"].as_str().unwrap_or("?");
+        let args = &event.payload["arguments"];
+        let args_str = args.to_string();
+        let args_display = if args_str.len() > 120 {
+            format!("{}…", &args_str[..120])
+        } else {
+            args_str
+        };
+        eprintln!("[→ {name}] {args_display}");
+    } else if event.kind == core_kinds::TOOL_RESULT {
+        let name = event.payload["name"].as_str().unwrap_or("?");
+        if let Some(err) = event.payload.get("error") {
+            eprintln!("[← {name} ERR] {err}");
+        } else if let Some(result) = event.payload.get("result") {
+            let s = result.to_string();
+            let preview = if s.len() > 200 {
+                format!("{}…", &s[..200])
+            } else {
+                s
+            };
+            eprintln!("[← {name}] {preview}");
+        }
+    } else if event.kind == core_kinds::ASSISTANT_MESSAGE {
+        let content = event.payload["content"].as_str().unwrap_or("");
+        if !content.is_empty() {
+            eprintln!("\nAssistant: {content}\n");
+        }
+        let has_tool_calls = event.payload["tool_calls"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if !has_tool_calls {
+            return true;
+        }
+    }
+    false
 }

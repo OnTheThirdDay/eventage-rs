@@ -300,6 +300,7 @@ impl LlmProvider for StreamingOpenAiProvider {
                         name: acc.name,
                         arguments: acc.arguments,
                     },
+                    extra_content: None,
                 })
             })
             .collect();

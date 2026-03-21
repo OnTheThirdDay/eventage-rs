@@ -12,6 +12,24 @@ use crate::bus::EventBus;
 use crate::llm::{types::ToolCall, LlmProvider};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+/// Serialize a tool call to the JSON shape stored in bus events.
+/// Preserves `extra_content` so provider-specific metadata (e.g. Gemini's
+/// thought_signature) is round-tripped correctly through the event bus.
+fn tool_call_to_json(tc: &ToolCall) -> Value {
+    let mut obj = json!({
+        "id": tc.id,
+        "type": tc.kind,
+        "function": {
+            "name": tc.function.name,
+            "arguments": tc.function.arguments
+        }
+    });
+    if let Some(ref extra) = tc.extra_content {
+        obj["extra_content"] = extra.clone();
+    }
+    obj
+}
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -318,16 +336,7 @@ impl ExecutionStrategy for ReactStrategy {
             let tool_calls_json: Vec<Value> = response
                 .tool_calls
                 .iter()
-                .map(|tc| {
-                    json!({
-                        "id": tc.id,
-                        "type": tc.kind,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    })
-                })
+                .map(tool_call_to_json)
                 .collect();
 
             ctx.bus

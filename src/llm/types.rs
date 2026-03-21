@@ -81,6 +81,12 @@ pub struct ToolCall {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: FunctionCall,
+    /// Provider-specific extra fields (e.g. Gemini's `extra_content` containing
+    /// `thought_signature`). Serialized as-is when present so providers that
+    /// require round-tripping custom metadata (like thought signatures) work
+    /// correctly without any provider-specific logic elsewhere in the stack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
