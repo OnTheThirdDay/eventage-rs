@@ -75,9 +75,9 @@ struct AppState {
     /// When true, auto-scroll to bottom on new content.
     auto_scroll: bool,
     /// When true, the next stream chunk must start on a fresh agent line
-    /// (set after a TOOL_RESULT so text doesn't concatenate onto the result).
+    /// (set after a `TOOL_RESULT` so text doesn't concatenate onto the result).
     pending_stream_newline: bool,
-    /// True between AGENT_CYCLE_START and AGENT_CYCLE_END.
+    /// True between `AGENT_CYCLE_START` and `AGENT_CYCLE_END`.
     /// Stream chunks outside a cycle are dropped (late-arriving bus events).
     in_cycle: bool,
 }
@@ -236,6 +236,7 @@ fn word_wrap_rows(text: &str, width: usize) -> usize {
 /// The wrap decision for each word is made **before** checking the cursor so
 /// that a cursor at the start of a wrapped word lands on the new row, not the
 /// old one.
+#[allow(clippy::cast_possible_truncation)]
 fn word_wrap_cursor(text: &str, cursor_char_abs: usize, width: usize) -> (u16, u16) {
     if width == 0 {
         return (0, 0);
@@ -293,51 +294,9 @@ fn word_wrap_cursor(text: &str, cursor_char_abs: usize, width: usize) -> (u16, u
     (row, col as u16)
 }
 
-#[cfg(test)]
-mod wrap_tests {
-    use super::*;
-
-    // Prefix used by the input bar.
-    const P: &str = " > ";
-
-    #[test]
-    fn empty_input_cursor_after_prefix() {
-        // " > " — cursor at position 3 (just after the prefix), width=80
-        assert_eq!(word_wrap_cursor(P, 3, 80), (0, 3));
-        assert_eq!(word_wrap_rows(P, 80), 1);
-    }
-
-    #[test]
-    fn one_char_cursor_at_end() {
-        // " > a" — cursor at 4
-        assert_eq!(word_wrap_cursor(" > a", 4, 80), (0, 4));
-        assert_eq!(word_wrap_rows(" > a", 80), 1);
-    }
-
-    #[test]
-    fn word_wraps_to_new_row() {
-        // " > hello world" at width=10: "hello" fits row 0, "world" wraps to row 1.
-        // Cursor at 9 ('w') should be (1, 0) after the wrap decision.
-        assert_eq!(word_wrap_cursor(" > hello world", 9, 10), (1, 0));
-        assert_eq!(word_wrap_rows(" > hello world", 10), 2);
-    }
-
-    #[test]
-    fn cursor_at_very_start() {
-        assert_eq!(word_wrap_cursor("hello", 0, 80), (0, 0));
-    }
-
-    #[test]
-    fn hard_wrap_long_word() {
-        // "aaaaaaaaaaa" (11 a's) at width=10: spills onto row 2
-        assert_eq!(word_wrap_rows("aaaaaaaaaaa", 10), 2);
-        // Cursor at position 10 (start of row 2)
-        assert_eq!(word_wrap_cursor("aaaaaaaaaaa", 10, 10), (1, 0));
-    }
-}
-
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
     let prefix = " > ";
@@ -354,8 +313,8 @@ fn render(frame: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),           // status bar
-            Constraint::Min(0),              // conversation
+            Constraint::Length(2),            // status bar
+            Constraint::Min(0),               // conversation
             Constraint::Length(input_height), // input bar (dynamic)
         ])
         .split(area);
@@ -421,12 +380,13 @@ fn render(frame: &mut Frame, state: &AppState) {
 
     // Scroll indicator at the bottom of the log area
     if effective_scroll > 0 {
-        let indicator_text = format!(
-            " ▼ {} more below  [↓/PgDn to scroll, G to jump to bottom] ",
-            effective_scroll
+        let indicator_text =
+            format!(" ▼ {effective_scroll} more below  [↓/PgDn to scroll, G to jump to bottom] ");
+        let indicator = Paragraph::new(indicator_text).style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
         );
-        let indicator = Paragraph::new(indicator_text)
-            .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM));
         let indicator_area = Rect {
             x: log_area.x,
             y: log_area.y + log_area.height.saturating_sub(1),
@@ -559,12 +519,18 @@ fn centred_rect_fixed(width: u16, height: u16, area: Rect) -> Rect {
     let h = height.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 // ── Bus event handling ────────────────────────────────────────────────────────
 
-fn handle_bus_event(state: &mut AppState, event: Event) {
+#[allow(clippy::too_many_lines)]
+fn handle_bus_event(state: &mut AppState, event: &Event) {
     match event.kind.as_str() {
         k if k == core_kinds::USER_MESSAGE => {
             let text = event.payload["text"].as_str().unwrap_or("").to_string();
@@ -614,7 +580,9 @@ fn handle_bus_event(state: &mut AppState, event: Event) {
                 state.push(Line::from(""));
                 state.push(Line::from(vec![Span::styled(
                     "  agent  ",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 )]));
             }
 
@@ -723,13 +691,15 @@ fn handle_bus_event(state: &mut AppState, event: Event) {
             let args_preview = event
                 .payload
                 .get("args")
-                .map(|v| v.to_string())
+                .map(ToString::to_string)
                 .unwrap_or_default();
             // Push a visible pause line so the conversation log doesn't look
             // abruptly truncated — the stream stopped here on purpose.
             state.push(Line::from(vec![Span::styled(
                 format!("  ⏸  approval required for {tool}  (Y/N)"),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
             )]));
             state.mode = Mode::AwaitingApproval { tool, args_preview };
         }
@@ -737,7 +707,11 @@ fn handle_bus_event(state: &mut AppState, event: Event) {
         k if k == CODING_APPROVAL_GRANTED || k == CODING_APPROVAL_DENIED => {
             let granted = k == CODING_APPROVAL_GRANTED;
             state.push(Line::from(vec![Span::styled(
-                if granted { "  ▶  approved" } else { "  ✗  denied" },
+                if granted {
+                    "  ▶  approved"
+                } else {
+                    "  ✗  denied"
+                },
                 Style::default()
                     .fg(if granted { Color::Green } else { Color::Red })
                     .add_modifier(Modifier::DIM),
@@ -753,7 +727,7 @@ fn handle_bus_event(state: &mut AppState, event: Event) {
             let deleted = event.payload["deleted_files"].as_u64().unwrap_or(0);
             if changed + new + deleted > 0 {
                 state.push(Line::from(vec![Span::styled(
-                    format!("  ∆ {} changed, {} new, {} deleted", changed, new, deleted),
+                    format!("  ∆ {changed} changed, {new} new, {deleted} deleted"),
                     Style::default().fg(Color::Blue),
                 )]));
             }
@@ -790,7 +764,9 @@ fn handle_bus_event(state: &mut AppState, event: Event) {
             state.push(Line::from(vec![
                 Span::styled(
                     format!("  ✓ sub-agent #{id_short}  "),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(preview, Style::default().fg(Color::Green)),
             ]));
@@ -831,7 +807,7 @@ async fn handle_key(
     // ── Global shortcuts ──────────────────────────────────────────────────────
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') | KeyCode::Char('q') => {
+            KeyCode::Char('c' | 'q') => {
                 return KeyAction::Quit;
             }
             KeyCode::Char('x') => {
@@ -900,14 +876,14 @@ async fn handle_key(
 
         // ── AwaitingApproval: y/n + scroll ────────────────────────────────────
         Mode::AwaitingApproval { .. } => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Char('y' | 'Y') => {
                 debug!("user granted tool approval");
                 let _ = bus
                     .publish(Event::new(CODING_APPROVAL_GRANTED, json!({})))
                     .await;
                 state.mode = Mode::Working;
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
+            KeyCode::Char('n' | 'N') => {
                 debug!("user denied tool approval");
                 let _ = bus
                     .publish(Event::new(CODING_APPROVAL_DENIED, json!({})))
@@ -994,7 +970,7 @@ pub async fn run_tui(
                 maybe_event = bus_rx.recv() => {
                     match maybe_event {
                         Some(event) => {
-                            handle_bus_event(&mut state, event);
+                            handle_bus_event(&mut state, &event);
                             needs_redraw = true;
                         }
                         None => break,
@@ -1031,4 +1007,47 @@ pub async fn run_tui(
     terminal.show_cursor()?;
 
     result
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    // Prefix used by the input bar.
+    const P: &str = " > ";
+
+    #[test]
+    fn empty_input_cursor_after_prefix() {
+        // " > " — cursor at position 3 (just after the prefix), width=80
+        assert_eq!(word_wrap_cursor(P, 3, 80), (0, 3));
+        assert_eq!(word_wrap_rows(P, 80), 1);
+    }
+
+    #[test]
+    fn one_char_cursor_at_end() {
+        // " > a" — cursor at 4
+        assert_eq!(word_wrap_cursor(" > a", 4, 80), (0, 4));
+        assert_eq!(word_wrap_rows(" > a", 80), 1);
+    }
+
+    #[test]
+    fn word_wraps_to_new_row() {
+        // " > hello world" at width=10: "hello" fits row 0, "world" wraps to row 1.
+        // Cursor at 9 ('w') should be (1, 0) after the wrap decision.
+        assert_eq!(word_wrap_cursor(" > hello world", 9, 10), (1, 0));
+        assert_eq!(word_wrap_rows(" > hello world", 10), 2);
+    }
+
+    #[test]
+    fn cursor_at_very_start() {
+        assert_eq!(word_wrap_cursor("hello", 0, 80), (0, 0));
+    }
+
+    #[test]
+    fn hard_wrap_long_word() {
+        // "aaaaaaaaaaa" (11 a's) at width=10: spills onto row 2
+        assert_eq!(word_wrap_rows("aaaaaaaaaaa", 10), 2);
+        // Cursor at position 10 (start of row 2)
+        assert_eq!(word_wrap_cursor("aaaaaaaaaaa", 10, 10), (1, 0));
+    }
 }
