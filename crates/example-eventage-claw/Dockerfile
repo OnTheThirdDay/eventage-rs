@@ -4,8 +4,8 @@
 # ── Stage 1: install cargo-chef + musl toolchain ─────────────────────────────
 FROM rust:1-slim AS chef
 RUN apt-get update \
- && apt-get install -y --no-install-recommends musl-tools ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends musl-tools ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN rustup target add x86_64-unknown-linux-musl
 RUN cargo install cargo-chef --locked
 WORKDIR /build
@@ -37,4 +37,4 @@ VOLUME ["/root/.claw"]
 EXPOSE 3000
 
 ENTRYPOINT ["claw"]
-CMD ["--no-tui", "--http-port", "3000"]
+CMD ["--no-tui", "--http-port", "3000", "--log", "/root/.claw/events.jsonl"]
