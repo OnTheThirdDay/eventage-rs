@@ -11,8 +11,10 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      # Persistent data: skills/, memory/, tasks.json, events.jsonl
-      - claw-data:/root/.claw
+      # Bind-mount at the SAME path on host and container so that when
+      # run_in_docker passes this path to the host Docker daemon the bind
+      # mount resolves correctly (named volumes don't work for DinD).
+      - ${CLAW_DATA_DIR:-/opt/claw/data}:${CLAW_DATA_DIR:-/opt/claw/data}
       # Docker socket — required for run_in_docker tool (docker_enabled in config)
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
@@ -22,6 +24,8 @@ services:
       - LLM_URL
       - LLM_MODEL
       - CLAW_GROUPS   # e.g. "personal,alice,bob"
+      # Must match the bind-mount path above so claw uses the correct data dir.
+      - CLAW_DATA_DIR=${CLAW_DATA_DIR:-/opt/claw/data}
 
   # ── WhatsApp bridge (Node.js, Baileys) ────────────────────────────────────
   whatsapp-bridge:
@@ -34,7 +38,7 @@ services:
       - "3001:3001"
     volumes:
       - ${BRIDGE_AUTH_DIR:-/opt/claw/bridge-auth}:/app/auth
-      - claw-data:/root/.claw   # shared with claw so bridge-downloaded media is accessible to agent
+      - ${CLAW_DATA_DIR:-/opt/claw/data}:/root/.claw   # shared with claw so bridge-downloaded media is accessible to agent
     environment:
       CLAW_HTTP_URL:  http://claw:3000
       CLAW_GROUP:     ${CLAW_GROUP:-personal}
@@ -47,5 +51,3 @@ services:
     depends_on:
       - claw
 
-volumes:
-  claw-data:   # named volume — survives container restarts, no host path needed

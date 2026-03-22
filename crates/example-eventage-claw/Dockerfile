@@ -31,8 +31,10 @@ RUN apk add --no-cache ca-certificates chromium docker-cli
 
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/claw /usr/local/bin/claw
 
-# Persistent data directory: config, skills, memory, tasks, event log.
-VOLUME ["/root/.claw"]
+# Data directory — overridden at runtime via CLAW_DATA_DIR env var.
+# The default path must match the bind-mount in docker-compose.yml.
+ENV CLAW_DATA_DIR=/opt/claw/data
+RUN mkdir -p /opt/claw/data
 
 EXPOSE 3000
 

@@ -132,6 +132,9 @@ fn default_model() -> String {
     std::env::var("LLM_MODEL").unwrap_or_else(|_| "qwen3:4b".into())
 }
 fn default_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CLAW_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claw")
