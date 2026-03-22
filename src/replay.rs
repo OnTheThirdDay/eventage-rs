@@ -33,6 +33,7 @@ use crate::bus::EventBus;
 use crate::event::Event;
 use futures_util::stream;
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
 /// Embedded UI HTML shared between the live server and CLI binary.
@@ -52,19 +53,25 @@ pub const UI_HTML: &str = include_str!("ui.html");
 ///
 /// Clients loading `/` automatically subscribe to `/events/stream` for real-time updates.
 pub struct LiveReplayServer {
-    bus: EventBus,
+    buses: Vec<EventBus>,
     port: u16,
 }
 
 #[derive(Clone)]
 struct LiveState {
-    bus: Arc<EventBus>,
+    buses: Vec<Arc<EventBus>>,
 }
 
 impl LiveReplayServer {
     /// Create a new server attached to `bus`.
     pub fn new(bus: EventBus) -> Self {
-        Self { bus, port: 4567 }
+        Self { buses: vec![bus], port: 4567 }
+    }
+
+    /// Attach additional buses so all their events appear in the replay UI.
+    pub fn with_buses(mut self, buses: impl IntoIterator<Item = EventBus>) -> Self {
+        self.buses.extend(buses);
+        self
     }
 
     /// Override the listening port (default: `4567`).
@@ -86,7 +93,7 @@ impl LiveReplayServer {
     /// Start the server, blocking the current task until it exits.
     pub async fn serve(self) {
         let state = LiveState {
-            bus: Arc::new(self.bus),
+            buses: self.buses.into_iter().map(Arc::new).collect(),
         };
 
         let app = Router::new()
@@ -120,13 +127,28 @@ async fn serve_ui() -> Html<&'static str> {
 }
 
 async fn serve_snapshot(State(state): State<LiveState>) -> Json<Vec<Event>> {
-    Json(state.bus.log().await)
+    let mut all: Vec<Event> = Vec::new();
+    for bus in &state.buses {
+        all.extend(bus.log().await);
+    }
+    all.sort_by_key(|e| e.timestamp);
+    Json(all)
 }
 
 async fn serve_live_stream(
     State(state): State<LiveState>,
 ) -> Sse<impl futures_util::stream::Stream<Item = Result<SseEvent, Infallible>>> {
-    let rx = state.bus.subscribe();
+    // Merge live events from all buses into one channel.
+    let (tx, rx) = mpsc::unbounded_channel::<Event>();
+    for bus in &state.buses {
+        let mut bus_rx = bus.subscribe();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = bus_rx.recv().await {
+                let _ = tx.send(event);
+            }
+        });
+    }
     let event_stream = stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|event| {
             let data = serde_json::to_string(&event).unwrap_or_default();

@@ -197,11 +197,29 @@ async fn main() -> anyhow::Result<()> {
     let default_group = groups_list.first().cloned().unwrap_or_default();
 
     // ── Observability ─────────────────────────────────────────────────────────
+    // Attach exporter + replay to EVERY bus (shared + all per-group) so that
+    // conversation events appear alongside heartbeats and IPC events.
+    let group_bus_list: Vec<eventage::EventBus> =
+        group_buses.values().cloned().collect();
+
     if let Some(log_path) = &args.log {
         match JsonlExporter::new(log_path).await {
             Ok(exporter) => {
-                let observer = BusObserver::new(shared_bus.clone()).add_exporter(exporter);
-                tokio::spawn(observer.run());
+                let exporter = std::sync::Arc::new(exporter);
+                // Shared bus (heartbeats, IPC, schedule events)
+                tokio::spawn(
+                    BusObserver::new(shared_bus.clone())
+                        .add_exporter_arc(exporter.clone())
+                        .run(),
+                );
+                // Per-group buses (user messages, assistant replies, tool results)
+                for bus in &group_bus_list {
+                    tokio::spawn(
+                        BusObserver::new(bus.clone())
+                            .add_exporter_arc(exporter.clone())
+                            .run(),
+                    );
+                }
                 if !tui_mode {
                     eprintln!("Logging events to {}", log_path.display());
                 }
@@ -212,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
 
     if args.replay {
         LiveReplayServer::new(shared_bus.clone())
+            .with_buses(group_bus_list.iter().cloned())
             .port(args.replay_port)
             .serve_background();
         if !tui_mode {
