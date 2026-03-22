@@ -1,9 +1,9 @@
-//! Approval hooks for the coding agent.
+//! Approval hooks for eventage-claw.
 //!
-//! Two hooks are provided:
+//! - [`SecurityGateHook`] — TUI mode: event-driven approval via the bus.
+//! - [`HumanApprovalHook`] — REPL mode: stdin-based approval.
 //!
-//! - [`SecurityGateHook`] — TUI mode: event-driven approval via the bus, zero-polling.
-//! - [`HumanApprovalHook`] — REPL mode: stdin-based approval prompt.
+//! Adapted from example-coding-agent/src/hooks.rs.
 
 use async_trait::async_trait;
 use eventage::agent::hook::{CycleHook, HookAction, HookContext};
@@ -13,31 +13,23 @@ use std::io::Write as _;
 use std::time::Duration;
 use tracing::warn;
 
-use crate::kinds::{CODING_APPROVAL_DENIED, CODING_APPROVAL_GRANTED, CODING_APPROVAL_REQUESTED};
+use crate::kinds::{CLAW_APPROVAL_DENIED, CLAW_APPROVAL_GRANTED, CLAW_APPROVAL_REQUESTED};
 
 // ── SecurityGateHook ──────────────────────────────────────────────────────────
 
-/// A [`CycleHook`] that intercepts tool calls and waits for user approval via
-/// the event bus (TUI mode).
-///
-/// Publishes [`CODING_APPROVAL_REQUESTED`] and suspends until the TUI
-/// publishes [`CODING_APPROVAL_GRANTED`] or [`CODING_APPROVAL_DENIED`].
-///
-/// On timeout (default 5 minutes), the call is auto-denied.
+/// TUI mode: publishes `CLAW_APPROVAL_REQUESTED` and waits for the TUI to
+/// respond with `CLAW_APPROVAL_GRANTED` or `CLAW_APPROVAL_DENIED`.
 pub struct SecurityGateHook {
     bus: EventBus,
     timeout: Duration,
-    /// Tools to watch. Empty = gate every tool call.
     watched: Vec<String>,
 }
 
 impl SecurityGateHook {
-    /// Gate every tool call.
     pub fn all_tools(bus: EventBus) -> Self {
         Self { bus, timeout: Duration::from_secs(300), watched: vec![] }
     }
 
-    /// Gate only the specified tools.
     pub fn watched(bus: EventBus, tools: Vec<String>) -> Self {
         Self { bus, timeout: Duration::from_secs(300), watched: tools }
     }
@@ -56,11 +48,10 @@ impl CycleHook for SecurityGateHook {
             return HookAction::Continue;
         }
 
-        // Announce that approval is needed.
         let _ = self
             .bus
             .publish(Event::new(
-                CODING_APPROVAL_REQUESTED,
+                CLAW_APPROVAL_REQUESTED,
                 json!({
                     "tool": name,
                     "args": args,
@@ -70,25 +61,20 @@ impl CycleHook for SecurityGateHook {
             ))
             .await;
 
-        // Suspend until the TUI publishes a grant or deny response.
         let bus = self.bus.clone();
         let result = tokio::time::timeout(self.timeout, async move {
             bus.wait_for(|e: &Event| {
-                e.kind == CODING_APPROVAL_GRANTED || e.kind == CODING_APPROVAL_DENIED
+                e.kind == CLAW_APPROVAL_GRANTED || e.kind == CLAW_APPROVAL_DENIED
             })
             .await
         })
         .await;
 
         match result {
-            Ok(Ok(event)) if event.kind == CODING_APPROVAL_GRANTED => HookAction::Continue,
+            Ok(Ok(event)) if event.kind == CLAW_APPROVAL_GRANTED => HookAction::Continue,
             Ok(Ok(_)) => HookAction::Skip,
             Ok(Err(_)) | Err(_) => {
-                warn!(
-                    tool = name,
-                    agent_id = ctx.agent_id,
-                    "SecurityGateHook: approval timed out — tool call vetoed"
-                );
+                warn!(tool = name, "SecurityGateHook: approval timed out — vetoed");
                 HookAction::Skip
             }
         }
@@ -97,11 +83,8 @@ impl CycleHook for SecurityGateHook {
 
 // ── HumanApprovalHook ─────────────────────────────────────────────────────────
 
-/// Intercepts specified tool calls and asks the user for approval via stdin.
-///
-/// If `tools` is empty, all tool calls require approval.
+/// REPL mode: prompts the user via stdin before executing watched tools.
 pub struct HumanApprovalHook {
-    /// Tool names that require approval. Empty = gate every tool call.
     pub tools: Vec<String>,
 }
 
@@ -123,20 +106,15 @@ impl CycleHook for HumanApprovalHook {
         name: &str,
         _args: &Value,
     ) -> HookAction {
-        // Skip if tool not in the watch list
         if !self.tools.is_empty() && !self.tools.iter().any(|t| t == name) {
             return HookAction::Continue;
         }
 
-        // Yield once so drain_cycle can process TOOL_CALL_PROPOSED and print
-        // "[→ tool] ..." before we show the approval prompt.
         tokio::task::yield_now().await;
 
-        // "[→ tool] ..." is already shown by drain_cycle — just ask for approval.
-        eprint!("Approve? [y/N]: ");
+        eprint!("Approve tool '{name}'? [y/N]: ");
         let _ = std::io::stderr().flush();
 
-        // Read stdin on a blocking thread to avoid blocking the async runtime
         let line = tokio::task::spawn_blocking(|| {
             let mut s = String::new();
             std::io::stdin().read_line(&mut s).ok();
@@ -148,7 +126,7 @@ impl CycleHook for HumanApprovalHook {
         if line.trim().eq_ignore_ascii_case("y") {
             HookAction::Continue
         } else {
-            eprintln!("[coding-agent] Tool call vetoed: {name}");
+            eprintln!("[claw] Tool call vetoed: {name}");
             HookAction::Skip
         }
     }

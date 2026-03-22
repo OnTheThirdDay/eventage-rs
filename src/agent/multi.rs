@@ -97,7 +97,8 @@ impl AgentSet {
                                 _ => false,
                             };
                             if wake {
-                                let _permit = s.acquire().await.unwrap();
+                                // `_permit` keeps the semaphore slot held while the cycle runs.
+                                let _permit = s.acquire().await.expect("concurrency semaphore closed");
                                 agent.cycle().await?;
                             }
                         }

@@ -164,7 +164,9 @@ pub async fn execute_tools(
         let args = p.args.clone();
 
         join_set.spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+            // `_permit` keeps the semaphore slot held for the duration of this task.
+            // Note: `let _permit = x` (named binding) is different from `let _ = x` (immediate drop).
+            let _permit = sem.acquire().await.expect("concurrency semaphore closed");
             let payload = match tool {
                 None => {
                     warn!("tool '{}' not found in registry", tc_name);

@@ -382,7 +382,12 @@ fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
     } else {
-        &s[..max]
+        // Walk back from `max` to a valid UTF-8 char boundary to avoid panics.
+        let mut end = max.min(s.len());
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -408,19 +413,19 @@ impl DynamicContextAssembler {
 
     /// Atomically replace the active assembler.
     pub fn swap(&self, assembler: impl ContextAssembler + 'static) {
-        *self.inner.lock().unwrap() = Arc::new(assembler);
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(assembler);
     }
 
     /// Replace with a pre-boxed assembler.
     pub fn swap_arc(&self, assembler: Arc<dyn ContextAssembler>) {
-        *self.inner.lock().unwrap() = assembler;
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = assembler;
     }
 }
 
 #[async_trait]
 impl ContextAssembler for DynamicContextAssembler {
     async fn assemble(&self, context: &AssemblyContext<'_>) -> Vec<ChatMessage> {
-        let assembler = self.inner.lock().unwrap().clone();
+        let assembler = self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assembler.assemble(context).await
     }
 }

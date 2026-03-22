@@ -279,7 +279,7 @@ impl EventBus {
             store.nodes.insert(id, event.clone());
             store.active_path.push(id);
         }
-        let mut subs = self.inner.subs.lock().unwrap();
+        let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
         Self::fan_out(&mut subs, event);
         Ok(())
     }
@@ -386,7 +386,7 @@ impl EventBus {
         };
 
         // Broadcast observability events (not appended to active log).
-        let mut subs = self.inner.subs.lock().unwrap();
+        let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
         Self::fan_out(
             &mut subs,
             Event::new(
@@ -462,16 +462,18 @@ impl EventBus {
     // ── Utility ───────────────────────────────────────────────────────────────
 
     /// Blocks until the next event matching `predicate` arrives.
-    pub async fn wait_for<F>(&self, predicate: F) -> Event
+    ///
+    /// Returns `Err(BusError::ChannelClosed)` if the bus is dropped while waiting.
+    pub async fn wait_for<F>(&self, predicate: F) -> Result<Event, BusError>
     where
         F: Fn(&Event) -> bool + Send,
     {
         let mut rx = self.subscribe();
         loop {
             match rx.recv().await {
-                Some(event) if predicate(&event) => return event,
+                Some(event) if predicate(&event) => return Ok(event),
                 Some(_) => continue,
-                None => panic!("EventBus channel unexpectedly closed"),
+                None => return Err(BusError::ChannelClosed),
             }
         }
     }
@@ -632,7 +634,7 @@ mod tests {
                 .unwrap();
         });
 
-        let event = bus.wait_for(|e| e.kind == kinds::TOOL_RESULT).await;
+        let event = bus.wait_for(|e| e.kind == kinds::TOOL_RESULT).await.unwrap();
         assert_eq!(event.kind, kinds::TOOL_RESULT);
     }
 

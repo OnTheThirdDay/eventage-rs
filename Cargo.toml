@@ -4,6 +4,7 @@ members = [
     "crates/eventage-replay-cli",
     "crates/example-coding-agent",
     "crates/example-clang-agent",
+    "crates/example-eventage-claw",
 ]
 resolver = "2"
 
@@ -60,7 +61,7 @@ async-trait  = "0.1"
 thiserror    = "2"
 tracing      = "0.1"
 arc-swap     = "1"
-reqwest      = { version = "0.12", features = ["json", "stream"] }
+reqwest      = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # ── Feature-gated optional dependencies ──────────────────────────────────────
 

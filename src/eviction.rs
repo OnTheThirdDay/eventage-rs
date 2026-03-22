@@ -24,17 +24,22 @@ pub type EpitaphStore = Arc<Mutex<HashMap<BranchId, String>>>;
 ///
 /// Processes eviction asynchronously to avoid blocking. The generated epitaph
 /// acts as a "hard negative" memory, steering the LLM away from failed approaches.
+/// Bounded queue depth for pending epitaph generation requests.
+const EPITAPH_QUEUE_DEPTH: usize = 256;
+
 pub struct EpitaphStrategy {
-    tx: mpsc::UnboundedSender<BranchData>,
+    tx: mpsc::Sender<BranchData>,
     store: EpitaphStore,
 }
 
 impl EpitaphStrategy {
     /// Creates an `EpitaphStrategy` backed by `llm`.
     ///
-    /// Spawns a background task to process evicted branches.
+    /// Spawns a background task to process evicted branches. The queue is
+    /// bounded to [`EPITAPH_QUEUE_DEPTH`] entries; excess evictions are dropped
+    /// with a warning rather than growing the queue unboundedly.
     pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<BranchData>();
+        let (tx, rx) = mpsc::channel::<BranchData>(EPITAPH_QUEUE_DEPTH);
         let store: EpitaphStore = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(epitaph_task(rx, llm, store.clone()));
         Self { tx, store }
@@ -48,8 +53,14 @@ impl EpitaphStrategy {
 
 impl BranchEvictionStrategy for EpitaphStrategy {
     /// Non-blocking forward of `branch` to the background summarisation task.
+    /// Drops the branch silently with a warning if the queue is full.
     fn on_evict(&self, branch: BranchData) {
-        let _ = self.tx.send(branch);
+        if let Err(e) = self.tx.try_send(branch) {
+            tracing::warn!(
+                branch_id = %e.into_inner().id,
+                "EpitaphStrategy: queue full ({EPITAPH_QUEUE_DEPTH} pending) — epitaph dropped"
+            );
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -60,7 +71,7 @@ impl BranchEvictionStrategy for EpitaphStrategy {
 // ── Background task ───────────────────────────────────────────────────────────
 
 async fn epitaph_task(
-    mut rx: mpsc::UnboundedReceiver<BranchData>,
+    mut rx: mpsc::Receiver<BranchData>,
     llm: Arc<dyn LlmProvider>,
     store: EpitaphStore,
 ) {
@@ -68,7 +79,10 @@ async fn epitaph_task(
         let branch_id = branch.id;
         let epitaph = generate_epitaph(llm.as_ref(), &branch).await;
         tracing::debug!(branch_id = %branch_id, "epitaph generated");
-        store.lock().unwrap().insert(branch_id, epitaph);
+        store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(branch_id, epitaph);
     }
 }
 

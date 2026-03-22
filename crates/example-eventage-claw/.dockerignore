@@ -1,0 +1,6 @@
+target/
+**/*.rs.bk
+.git/
+data/
+crates/example-eventage-claw/whatsapp-bridge/node_modules/
+crates/example-eventage-claw/whatsapp-bridge/auth/

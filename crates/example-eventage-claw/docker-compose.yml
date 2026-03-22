@@ -1,0 +1,51 @@
+services:
+
+  # ── eventage-claw (Rust AI agent, HTTP channel) ────────────────────────────
+  claw:
+    image: ${CLAW_IMAGE:-ghcr.io/onthethirdday/eventage-claw:latest}
+    build:
+      # Build context is the workspace root so cargo can see all crates.
+      context: ../..
+      dockerfile: crates/example-eventage-claw/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persistent data: skills/, memory/, tasks.json, events.jsonl
+      - claw-data:/root/.claw
+      # Docker socket — required for run_in_docker tool (docker_enabled in config)
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # All config via env vars — no config.toml needed.
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      - LLM_URL
+      - LLM_MODEL
+      - CLAW_GROUPS   # e.g. "personal,alice,bob"
+
+  # ── WhatsApp bridge (Node.js, Baileys) ────────────────────────────────────
+  whatsapp-bridge:
+    image: ${BRIDGE_IMAGE:-ghcr.io/onthethirdday/eventage-claw-bridge:latest}
+    build:
+      context: whatsapp-bridge
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - ${BRIDGE_AUTH_DIR:-/opt/claw/bridge-auth}:/app/auth
+      - claw-data:/root/.claw   # shared with claw so bridge-downloaded media is accessible to agent
+    environment:
+      CLAW_HTTP_URL:  http://claw:3000
+      CLAW_GROUP:     ${CLAW_GROUP:-personal}
+      SENDER_MAP:     ${SENDER_MAP:-}        # e.g. "61400000000:alice,61411111111:bob"
+      BRIDGE_PORT:    3001
+      AUTH_DIR:       /app/auth
+      TRIGGER_PREFIX: ${TRIGGER_PREFIX:-}
+      PAIRING_CODE:   ${PAIRING_CODE:-}
+      SELF_CHAT:      ${SELF_CHAT:-false}
+    depends_on:
+      - claw
+
+volumes:
+  claw-data:   # named volume — survives container restarts, no host path needed

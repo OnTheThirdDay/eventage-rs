@@ -359,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
                     .as_array()
                     .is_none_or(|a| a.is_empty())
         })
-        .await;
+        .await?;
 
     let answer = final_event.payload["content"]
         .as_str()

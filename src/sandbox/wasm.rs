@@ -100,7 +100,7 @@ fn run_wasm(engine: Engine, req: SandboxRequest) -> Result<SandboxOutput, Sandbo
 
     let mut store = Store::new(&engine, wasi_ctx);
 
-    let fuel_limit = (req.timeout_ms as u64).saturating_mul(1_000_000);
+    let fuel_limit = req.timeout_ms.saturating_mul(1_000_000);
     store.set_fuel(fuel_limit).ok();
 
     let mut linker: Linker<wasmtime_wasi::preview1::WasiP1Ctx> = Linker::new(&engine);

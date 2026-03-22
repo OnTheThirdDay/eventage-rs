@@ -3,7 +3,7 @@ use crate::bus::EventBus;
 use serde_json::json;
 use std::time::Duration;
 use tokio::time;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Periodically emits a `system.heartbeat` event.
 ///
@@ -27,13 +27,16 @@ impl HeartbeatScheduler {
         loop {
             ticker.tick().await;
             debug!("emitting heartbeat");
-            let _ = self
+            if let Err(e) = self
                 .bus
                 .publish(Event::new(
                     kinds::SYSTEM_HEARTBEAT,
                     json!({ "timestamp": chrono::Utc::now().to_rfc3339() }),
                 ))
-                .await;
+                .await
+            {
+                warn!("HeartbeatScheduler: failed to publish heartbeat: {e}");
+            }
         }
     }
 }

@@ -285,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
         // Block until the critic publishes its verdict.
         let verdict = bus
             .wait_for(|e| e.kind == plan_kinds::ACCEPTED || e.kind == plan_kinds::FEEDBACK)
-            .await;
+            .await?;
 
         if verdict.kind == plan_kinds::ACCEPTED {
             let score = verdict.payload["score"].as_f64().unwrap_or(0.0);

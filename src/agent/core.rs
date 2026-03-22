@@ -9,7 +9,7 @@ use crate::llm::LlmProvider;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::instrument;
+use tracing::{error, instrument};
 use uuid::Uuid;
 
 /// The orchestrator driving tool execution and LLM reasoning.
@@ -103,7 +103,36 @@ impl Agent {
 
     /// Continuously listens and reacts to incoming events.
     pub async fn run(&self) -> Result<(), AgentError> {
+        // Subscribe before inspecting the log so we cannot miss events published
+        // between the log read and the subscribe call.
         let mut rx = self.bus.subscribe();
+
+        // If wake events (user.message, heartbeat) were published to the bus
+        // before this subscription was registered — e.g. an HTTP message that
+        // arrived during startup before the agent task was scheduled — run an
+        // initial cycle so those events are not silently ignored.
+        let has_pending = self
+            .bus
+            .log()
+            .await
+            .iter()
+            .any(|e| matches!(e.kind.as_str(), kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT));
+        if has_pending {
+            if let Err(e) = self.cycle().await {
+                if matches!(e, AgentError::Bus(_)) {
+                    return Err(e);
+                }
+                error!(error = %e, "agent cycle error — recovering");
+                let _ = self
+                    .bus
+                    .publish(Event::new(
+                        kinds::ASSISTANT_MESSAGE,
+                        json!({ "content": format!("⚠️ Error: {e}. Ready for your next message.") }),
+                    ))
+                    .await;
+            }
+        }
+
         while let Some(event) = rx.recv().await {
             let wake = match event.kind.as_str() {
                 kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT => true,
@@ -115,7 +144,19 @@ impl Agent {
                 _ => false,
             };
             if wake {
-                self.cycle().await?;
+                if let Err(e) = self.cycle().await {
+                    if matches!(e, AgentError::Bus(_)) {
+                        return Err(e);
+                    }
+                    error!(error = %e, "agent cycle error — recovering");
+                    let _ = self
+                        .bus
+                        .publish(Event::new(
+                            kinds::ASSISTANT_MESSAGE,
+                            json!({ "content": format!("⚠️ Error: {e}. Ready for your next message.") }),
+                        ))
+                        .await;
+                }
             }
         }
         Ok(())

@@ -63,24 +63,24 @@ impl ToolRegistry {
 
     /// Remove a tool by name. Returns `true` if the tool existed.
     pub fn remove(&self, name: &str) -> bool {
-        self.inner.write().unwrap().remove(name).is_some()
+        self.inner.write().unwrap_or_else(|e| e.into_inner()).remove(name).is_some()
     }
 
     /// Remove all registered tools.
     pub fn clear(&self) {
-        self.inner.write().unwrap().clear();
+        self.inner.write().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     // ── Read operations ───────────────────────────────────────────────────────
 
     /// Snapshot of all registered tool names.
     pub fn names(&self) -> Vec<String> {
-        self.inner.read().unwrap().keys().cloned().collect()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
     }
 
     /// `true` if no tools are registered.
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Snapshot of all tool definitions (for passing to the LLM).
@@ -95,12 +95,12 @@ impl ToolRegistry {
 
     /// Snapshot of all tools as `Arc` handles (for passing to a [`ToolSelector`]).
     pub fn all_tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.inner.read().unwrap().values().cloned().collect()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
     }
 
     /// Look up a single tool by name. Returns `None` if not registered.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.inner.read().unwrap().get(name).cloned()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
     }
 }
 

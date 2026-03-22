@@ -22,19 +22,19 @@
 //! To use a real LLM, replace `MockLlmProvider` with `OpenAiProvider`.
 
 use async_trait::async_trait;
-use eventage::{kinds, meta_keys, Event, EventBus, EventId};
 use eventage::llm::{
     types::{ChatMessage, FunctionCall, LlmResponse, ToolCall, ToolDefinition},
     MockLlmProvider,
 };
-use eventage::{
-    AgentBuilder, AgentError, AssemblyContext, ContextAssembler, CycleHook, DynamicContextAssembler,
-    DynamicHookChain, EventWorker, HookAction, HookContext, ReactStrategy, Tool, WorkerError,
-    WorkerSet,
-};
-use eventage::{BusObserver, JsonlExporter};
 use eventage::sandbox::{SandboxExecutor, UnsandboxedExecutor};
 use eventage::scheduler::HeartbeatScheduler;
+use eventage::{kinds, meta_keys, Event, EventBus, EventId};
+use eventage::{
+    AgentBuilder, AgentError, AssemblyContext, ContextAssembler, CycleHook,
+    DynamicContextAssembler, DynamicHookChain, EventWorker, HookAction, HookContext, ReactStrategy,
+    Tool, WorkerError, WorkerSet,
+};
+use eventage::{BusObserver, JsonlExporter};
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -584,6 +584,7 @@ fn orchestrator_llm() -> MockLlmProvider {
                     name: "delegate_to_researcher".into(),
                     arguments: r#"{"topic": "Rust ecosystem crate adoption, download statistics, and corporate usage trends for 2024"}"#.into(),
                 },
+                extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
         },
@@ -597,6 +598,7 @@ fn orchestrator_llm() -> MockLlmProvider {
                     name: "delegate_to_reporter".into(),
                     arguments: r#"{"findings": "Rust ecosystem 2024: 145K+ crates, 50B+ downloads, 34% adoption growth, 82% developer satisfaction. Top crates: tokio, serde, rand. Major adopters: Amazon, Google, Microsoft, Linux kernel."}"#.into(),
                 },
+                extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
         },
@@ -633,6 +635,7 @@ fn researcher_llm() -> MockLlmProvider {
                     name: "web_search".into(),
                     arguments: r#"{"query": "rust"}"#.into(),
                 },
+                extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
         },
@@ -655,6 +658,7 @@ fn researcher_llm() -> MockLlmProvider {
                     name: "web_search".into(),
                     arguments: r#"{"query": "rust ecosystem crate adoption downloads statistics 2024"}"#.into(),
                 },
+                extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
         },
@@ -668,6 +672,7 @@ fn researcher_llm() -> MockLlmProvider {
                     name: "extract_stats".into(),
                     arguments: r#"{"raw_data": "crates.io 2024: 50B downloads, 145K crates, top: tokio serde rand"}"#.into(),
                 },
+                extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
         },
@@ -700,6 +705,7 @@ fn reporter_llm() -> MockLlmProvider {
                     name: "format_report".into(),
                     arguments: r#"{"stats": "145K crates, 50B downloads, 34% growth, 82% satisfaction, top: tokio/serde/rand, adopters: Amazon/Google/Microsoft/Linux"}"#.into(),
                 },
+                extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
         },
