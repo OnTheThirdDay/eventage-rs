@@ -37,6 +37,11 @@ pub struct ScheduledTask {
     pub schedule_kind: ScheduleKind,
     /// Target group name. None = fire in the creating group's context.
     pub target_group: Option<String>,
+    /// If set, the task fires via the relay mechanism (`CLAW_GROUP_MESSAGE`)
+    /// so the target group handles it and routes the reply back here.
+    /// Used by sub-agents so their scheduled task results reach the main agent.
+    #[serde(default)]
+    pub reply_group: Option<String>,
     pub next_fire: DateTime<Utc>,
     pub paused: bool,
     pub fired_count: u64,
@@ -173,6 +178,9 @@ pub struct ScheduleTaskTool {
     pub bus: EventBus,
     pub state: ScheduleState,
     pub default_group: String,
+    /// If set, scheduled tasks fire via relay and their result is routed back
+    /// to this group. Used for sub-agents so reminders reach the main agent.
+    pub reply_group: Option<String>,
     /// If set, the task list is saved to disk after every mutation.
     pub tasks_path: Option<PathBuf>,
 }
@@ -229,6 +237,7 @@ impl Tool for ScheduleTaskTool {
             description: description.to_string(),
             schedule_kind: kind,
             target_group: target_group.or_else(|| Some(self.default_group.clone())),
+            reply_group: self.reply_group.clone(),
             next_fire,
             paused: false,
             fired_count: 0,

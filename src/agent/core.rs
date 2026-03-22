@@ -141,7 +141,7 @@ impl Agent {
             .log()
             .await
             .iter()
-            .any(|e| matches!(e.kind.as_str(), kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT));
+            .any(|e| matches!(e.kind.as_str(), kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT | kinds::SYSTEM_MESSAGE));
         if has_pending {
             if let Err(e) = self.cycle().await {
                 if matches!(e, AgentError::Bus(_)) {
@@ -160,7 +160,7 @@ impl Agent {
 
         while let Some(event) = rx.recv().await {
             let wake = match event.kind.as_str() {
-                kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT => true,
+                kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT | kinds::SYSTEM_MESSAGE => true,
                 kinds::AGENT_MESSAGE => event
                     .metadata
                     .get(meta_keys::TO_AGENT_ID)

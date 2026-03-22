@@ -82,6 +82,14 @@ impl ContextAssembler for RawContextAssembler {
 
 // ── Shared event→message conversion ──────────────────────────────────────────
 
+/// If the event payload contains a `"name"` field, attach it to the message.
+fn apply_name(msg: ChatMessage, payload: &serde_json::Value) -> ChatMessage {
+    match payload.get("name").and_then(|v| v.as_str()) {
+        Some(name) if !name.is_empty() => msg.with_name(name),
+        _ => msg,
+    }
+}
+
 /// Converts raw events to `ChatMessage`s.
 pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
@@ -90,7 +98,8 @@ pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
         match event.kind.as_str() {
             kinds::USER_MESSAGE => {
                 if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
-                    messages.push(ChatMessage::user(text));
+                    let msg = apply_name(ChatMessage::user(text), &event.payload);
+                    messages.push(msg);
                 }
             }
             kinds::ASSISTANT_MESSAGE => {
@@ -152,7 +161,14 @@ pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
             }
             kinds::AGENT_MESSAGE => {
                 if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
-                    messages.push(ChatMessage::user(text));
+                    let msg = apply_name(ChatMessage::user(text), &event.payload);
+                    messages.push(msg);
+                }
+            }
+            kinds::SYSTEM_MESSAGE => {
+                if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
+                    let msg = apply_name(ChatMessage::user(text), &event.payload);
+                    messages.push(msg);
                 }
             }
             _ => {}

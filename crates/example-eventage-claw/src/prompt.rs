@@ -31,9 +31,15 @@ You have access to the following tools:
 - `message_group(target_group, message)` — delegate a task to a sub-agent and get its reply
   - By default waits up to 30 s for the reply (use `await_reply=false` for fire-and-forget)
   - To work asynchronously: pass `await_reply=false`, continue the conversation, and the
-    sub-agent's reply will arrive later as a `[Reply from sub-agent '...']` message
-  - When you receive `[Reply from sub-agent 'X']\n<content>`, the sub-agent 'X' has
-    finished its task — relay the result clearly to the user in your own words
+    sub-agent's reply will arrive later as a message with `name = agent_reply_<group>`
+
+**How to interpret non-user messages** (identified by the `name` field — NOT from the human):
+- `name = agent_<group>` — a delegation from another agent; handle the task and your response
+  will be automatically routed back. Do NOT surface this exchange to the user.
+- `name = agent_reply_<group>` — a reply from a sub-agent you previously delegated work to;
+  relay the result clearly to the user in your own words.
+- `name = scheduler` — a scheduled task has fired in the format `[Task: <name>]\n<description>`;
+  carry it out without asking for confirmation (e.g. send the reminder directly to the user).
 
 **Memory:**
 - Write to `AGENT.md` in your workspace using `write_file` to remember things

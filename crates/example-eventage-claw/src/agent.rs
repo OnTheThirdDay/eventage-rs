@@ -231,6 +231,13 @@ impl ClawAgentBuilder {
         let spawner_bus_hook: Arc<std::sync::Mutex<Option<BusHook>>> =
             Arc::new(std::sync::Mutex::new(None));
 
+        // The first main group is the default target for scheduled tasks created
+        // by sub-agents (they can't reach the user directly).
+        let main_group_name = main_groups.first()
+            .or_else(|| group_names.first())
+            .cloned()
+            .unwrap_or_default();
+
         // Spawner used by SpawnGroupTool — holds everything needed to build a
         // new GroupAgent at runtime and insert it into the live routing table.
         let spawner: Arc<dyn AgentSpawner> = Arc::new(ClawGroupSpawner {
@@ -242,6 +249,7 @@ impl ClawAgentBuilder {
             session_id_prefix: self.session_id_prefix.clone(),
             tui_mode: self.tui_mode,
             bus_hook: spawner_bus_hook.clone(),
+            main_group: main_group_name,
         });
 
         // Build each group agent
@@ -270,6 +278,7 @@ impl ClawAgentBuilder {
                 task_state,
                 spawner.clone(),
                 true, // configured groups are user-facing
+                None,
             );
 
             groups.insert(group_config.name.clone(), group_agent);
@@ -305,6 +314,10 @@ struct ClawGroupSpawner {
     /// Shared slot populated by `main.rs` after the exporter is created.
     /// Called with the new bus so observability workers can be attached.
     bus_hook: Arc<std::sync::Mutex<Option<BusHook>>>,
+    /// Name of the main (user-facing) group. Scheduled tasks created by
+    /// sub-agents default to firing here so the main agent can deliver
+    /// reminders to the user via its ChannelOutputWorker.
+    main_group: String,
 }
 
 #[async_trait::async_trait]
@@ -343,6 +356,7 @@ impl AgentSpawner for ClawGroupSpawner {
             task_state,
             no_spawn,
             false, // spawned sub-agents are internal; only delegation replies allowed
+            Some(self.main_group.as_str()),
         );
 
         // Atomically check for duplicates and register — single write lock prevents
@@ -417,6 +431,9 @@ fn build_group_agent(
     spawner: Arc<dyn AgentSpawner>,
     // True for user-facing configured groups; false for ephemeral sub-agents.
     with_channel_output: bool,
+    // If set, scheduled tasks created by this group fire via relay and their
+    // result routes back here. None for main/configured groups (no relay needed).
+    schedule_reply_group: Option<&str>,
 ) -> GroupAgent {
     let work_dir = config.group_work_dir(&group_config.name);
     let _ = std::fs::create_dir_all(&work_dir);
@@ -526,6 +543,7 @@ fn build_group_agent(
             bus: shared_bus.clone(),
             state: schedule_state.clone(),
             default_group: group_config.name.clone(),
+            reply_group: schedule_reply_group.map(|s| s.to_string()),
             tasks_path: tasks_path.clone(),
         })
         .tool(ListTasksTool { state: schedule_state.clone() })

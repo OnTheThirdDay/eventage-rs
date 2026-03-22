@@ -73,6 +73,16 @@ impl ChatMessage {
             name: None,
         }
     }
+
+    /// Set the `name` field to identify the message sender.
+    ///
+    /// Used for `user`-role messages to distinguish between human input,
+    /// agent delegations (`agent_<group>`), async replies (`agent_reply_<group>`),
+    /// and scheduled tasks (`scheduler`).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

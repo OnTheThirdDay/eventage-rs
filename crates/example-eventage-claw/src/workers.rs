@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use uuid::Uuid;
 use eventage::{
     agent::worker::{EventWorker, WorkerError},
     event::{kinds, Event},
@@ -26,6 +27,17 @@ pub type GroupBuses = Arc<RwLock<HashMap<String, EventBus>>>;
 
 use crate::kinds::{CLAW_GROUP_MESSAGE, CLAW_GROUP_REPLY, CLAW_SCHEDULE_FIRE};
 use crate::tools::schedule::{advance_schedule, ScheduleState};
+
+/// Produce a valid ChatMessage `name` from an arbitrary string.
+///
+/// Keeps only alphanumeric, underscore, and hyphen characters, then truncates
+/// to 64 chars — the safe subset accepted by all OpenAI-compatible providers.
+fn sanitize_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .take(64)
+        .collect()
+}
 
 // ── SchedulerWorker ───────────────────────────────────────────────────────────
 
@@ -49,7 +61,14 @@ impl EventWorker for SchedulerWorker {
         let now = Utc::now();
         let mut state = self.state.lock().await;
 
-        let mut to_fire: Vec<(String, String, String, Option<String>)> = vec![];
+        struct FiringTask {
+            id: String,
+            name: String,
+            description: String,
+            target_group: Option<String>,
+            reply_group: Option<String>,
+        }
+        let mut to_fire: Vec<FiringTask> = vec![];
         let mut completed_once_ids: Vec<String> = vec![];
 
         for task in state.iter_mut() {
@@ -57,12 +76,13 @@ impl EventWorker for SchedulerWorker {
                 continue;
             }
 
-            to_fire.push((
-                task.id.clone(),
-                task.name.clone(),
-                task.description.clone(),
-                task.target_group.clone(),
-            ));
+            to_fire.push(FiringTask {
+                id: task.id.clone(),
+                name: task.name.clone(),
+                description: task.description.clone(),
+                target_group: task.target_group.clone(),
+                reply_group: task.reply_group.clone(),
+            });
 
             // Advance next_fire
             match advance_schedule(&task.schedule_kind, task.next_fire) {
@@ -82,7 +102,8 @@ impl EventWorker for SchedulerWorker {
         state.retain(|t| !completed_once_ids.contains(&t.id));
         drop(state);
 
-        for (task_id, name, description, target_group) in to_fire {
+        for task in to_fire {
+            let FiringTask { id: task_id, name, description, target_group, reply_group } = task;
             info!(task_id = %task_id, name = %name, "SchedulerWorker: firing task");
 
             // Publish the fire event on the shared bus (observable in TUI/log)
@@ -93,12 +114,35 @@ impl EventWorker for SchedulerWorker {
                     "name": name,
                     "description": description,
                     "target_group": target_group,
+                    "reply_group": reply_group,
                 }),
             ))
             .await
             .map_err(WorkerError::Bus)?;
 
-            // Inject user.message into the target group's bus
+            let text = format!("[Task: {name}]\n{description}");
+
+            // If a reply_group is set the task was created by a sub-agent.
+            // Fire via the relay mechanism (CLAW_GROUP_MESSAGE on shared bus)
+            // so DelegationReplyWorker routes the sub-agent's response back to
+            // reply_group, which then delivers it to the user.
+            if let Some(ref src) = reply_group {
+                let _ = bus
+                    .publish(Event::new(
+                        CLAW_GROUP_MESSAGE,
+                        json!({
+                            "message_id": Uuid::new_v4().to_string(),
+                            "target_group": target_group,
+                            "source_group": src,
+                            "content": text,
+                            "caller_awaits": false,
+                        }),
+                    ))
+                    .await;
+                continue;
+            }
+
+            // No reply_group: inject user.message directly into the target bus.
             let buses = self.group_buses.read().await;
             let targets: Vec<EventBus> = if let Some(ref g) = target_group {
                 buses.get(g).cloned().into_iter().collect()
@@ -110,9 +154,10 @@ impl EventWorker for SchedulerWorker {
             for group_bus in targets {
                 let _ = group_bus
                     .publish(Event::new(
-                        kinds::USER_MESSAGE,
+                        kinds::SYSTEM_MESSAGE,
                         json!({
-                            "text": format!("[Scheduled task: {name}]\n{description}"),
+                            "text": text,
+                            "name": "scheduler",
                             "source": "scheduler",
                             "task_id": task_id,
                         }),
@@ -324,7 +369,8 @@ impl RelayWorker {
             bus.publish(Event::new(
                 kinds::AGENT_MESSAGE,
                 json!({
-                    "text": format!("[Agent '{}' says]\n{content}", source),
+                    "text": content,
+                    "name": sanitize_name(&format!("agent_{source}")),
                     "source_group": source,
                     "message_id": msg_id,
                     "via": "relay",
@@ -369,7 +415,8 @@ impl RelayWorker {
             bus.publish(Event::new(
                 kinds::AGENT_MESSAGE,
                 json!({
-                    "text": format!("[Reply from sub-agent '{source}']\n{content}"),
+                    "text": content,
+                    "name": sanitize_name(&format!("agent_reply_{source}")),
                     "source_group": source,
                     "message_id": in_reply_to,
                     "via": "async_reply",

@@ -60,6 +60,9 @@ pub mod kinds {
     pub const TOOL_CALL_PROPOSED: &str = "tool.call.proposed";
     pub const TOOL_RESULT: &str = "tool.result";
     pub const SYSTEM_HEARTBEAT: &str = "system.heartbeat";
+    /// Message originating from system infrastructure (e.g. task scheduler,
+    /// hooks, automated pipelines) — not from a human user or another agent.
+    pub const SYSTEM_MESSAGE: &str = "system.message";
     pub const AGENT_CYCLE_START: &str = "agent.cycle.start";
     pub const AGENT_CYCLE_END: &str = "agent.cycle.end";
     /// Emitted by [`EventBus::checkpoint`](crate::EventBus::checkpoint) to mark a safe rollback point.
