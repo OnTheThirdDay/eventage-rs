@@ -338,12 +338,16 @@ impl EventWorker for RelayWorker {
 pub struct DelegationReplyWorker {
     pub shared_bus: EventBus,
     pub group_name: String,
+    state: Arc<Mutex<RelayState>>,
+}
+
+struct RelayState {
     /// Relay requests waiting for the next relay-triggered cycle.
-    pending: Arc<Mutex<VecDeque<PendingReply>>>,
+    pending: VecDeque<PendingReply>,
     /// Set true when a cycle starts with a pending relay — cleared on cycle end.
-    in_relay_cycle: Arc<Mutex<bool>>,
+    in_relay_cycle: bool,
     /// Content captured from the current relay-triggered cycle's assistant message.
-    last_content: Arc<Mutex<Option<String>>>,
+    last_content: Option<String>,
 }
 
 struct PendingReply {
@@ -356,9 +360,11 @@ impl DelegationReplyWorker {
         Self {
             shared_bus,
             group_name: group_name.into(),
-            pending: Arc::new(Mutex::new(VecDeque::new())),
-            in_relay_cycle: Arc::new(Mutex::new(false)),
-            last_content: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(RelayState {
+                pending: VecDeque::new(),
+                in_relay_cycle: false,
+                last_content: None,
+            })),
         }
     }
 }
@@ -389,43 +395,51 @@ impl EventWorker for DelegationReplyWorker {
                         msg_id = %msg_id,
                         "DelegationReplyWorker: queued relay request"
                     );
-                    self.pending.lock().await.push_back(PendingReply { source_group: source, message_id: msg_id });
+                    self.state.lock().await.pending.push_back(PendingReply {
+                        source_group: source,
+                        message_id: msg_id,
+                    });
                 }
             }
 
             k if k == kinds::AGENT_CYCLE_START => {
-                // Mark this cycle as relay-triggered if a request is already pending.
-                // Cycles that started before the relay arrived are not marked, so their
-                // content is never mistakenly routed as the reply.
-                let has_pending = !self.pending.lock().await.is_empty();
-                if has_pending {
-                    *self.in_relay_cycle.lock().await = true;
-                    *self.last_content.lock().await = None;
+                // Only mark relay-triggered if a request is already pending — cycles
+                // that started before the relay arrived are never mistakenly flagged.
+                let mut state = self.state.lock().await;
+                if !state.pending.is_empty() {
+                    state.in_relay_cycle = true;
+                    state.last_content = None;
                 }
             }
 
             k if k == kinds::ASSISTANT_MESSAGE => {
-                if *self.in_relay_cycle.lock().await {
-                    if let Some(content) = event.payload.get("content").and_then(|v| v.as_str()) {
-                        if !content.trim().is_empty() {
-                            *self.last_content.lock().await = Some(content.to_string());
+                if let Some(content) = event.payload.get("content").and_then(|v| v.as_str()) {
+                    if !content.trim().is_empty() {
+                        let mut state = self.state.lock().await;
+                        if state.in_relay_cycle {
+                            state.last_content = Some(content.to_string());
                         }
                     }
                 }
             }
 
             k if k == kinds::AGENT_CYCLE_END => {
-                if !*self.in_relay_cycle.lock().await {
-                    return Ok(());
-                }
-                *self.in_relay_cycle.lock().await = false;
-
-                let reply = self.pending.lock().await.pop_front();
-                let Some(PendingReply { source_group, message_id }) = reply else {
-                    return Ok(());
+                // Extract reply data under one lock, then publish without holding it.
+                let reply_data = {
+                    let mut state = self.state.lock().await;
+                    if !state.in_relay_cycle {
+                        return Ok(());
+                    }
+                    state.in_relay_cycle = false;
+                    state
+                        .pending
+                        .pop_front()
+                        .map(|r| (r, state.last_content.take().unwrap_or_default()))
                 };
 
-                let content = self.last_content.lock().await.take().unwrap_or_default();
+                let Some((PendingReply { source_group, message_id }, content)) = reply_data else {
+                    return Ok(());
+                };
 
                 info!(
                     group = %self.group_name,

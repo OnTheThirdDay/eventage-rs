@@ -60,20 +60,22 @@ pub struct ClawAgent {
 
 #[allow(dead_code)]
 impl ClawAgent {
+    fn active_group_name(&self) -> String {
+        self.active_group.try_lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
     /// Returns a reference to the active group's bus (for TUI subscription).
     pub fn active_bus(&self) -> &EventBus {
-        let active = self.active_group.try_lock().map(|g| g.clone()).unwrap_or_default();
         self.groups
-            .get(&active)
+            .get(&self.active_group_name())
             .map(|g| &g.bus)
             .unwrap_or(&self.shared_bus)
     }
 
     /// Returns the cancelled flag for the active group (for TUI Ctrl+X).
     pub fn active_cancelled(&self) -> Arc<AtomicBool> {
-        let active = self.active_group.try_lock().map(|g| g.clone()).unwrap_or_default();
         self.groups
-            .get(&active)
+            .get(&self.active_group_name())
             .map(|g| g.cancelled.clone())
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
     }
@@ -91,15 +93,7 @@ impl ClawAgent {
             let ws = group_agent.worker_set;
             let log_name = name.clone();
             let handle = tokio::spawn(async move {
-                // Spawn group workers as a background task so they never
-                // race against or cancel the agent. An empty WorkerSet
-                // completes immediately and should not affect the agent.
-                let worker_bus = bus.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = ws.run_on(worker_bus).await {
-                        tracing::warn!(group = %name, "group worker error: {e}");
-                    }
-                });
+                spawn_group_workers(name, ws, bus);
                 agent.run().await.map_err(ClawError::Agent)
             });
             info!(group = %log_name, "ClawAgent: group agent spawned");
@@ -188,14 +182,18 @@ impl ClawAgentBuilder {
             .map(|g| g.name.clone())
             .collect();
 
-        // Shared live map: group name → per-group EventBus.
-        // Arc<RwLock<…>> so dynamically spawned groups are immediately routable.
-        let group_buses: GroupBuses = Arc::new(RwLock::new(HashMap::new()));
-        for g in &config.groups {
-            group_buses
-                .blocking_write()
-                .insert(g.name.clone(), EventBus::new());
-        }
+        // Build per-group buses into a plain map first — no lock needed during init.
+        // EventBus is Arc-backed so cloning into group_buses shares the same bus.
+        let bus_map: HashMap<String, EventBus> = config.groups
+            .iter()
+            .map(|g| (g.name.clone(), EventBus::new()))
+            .collect();
+
+        // Wrap in Arc<RwLock<>> for runtime routing (dynamically spawned groups
+        // can be inserted without restarting).
+        let group_buses: GroupBuses = Arc::new(RwLock::new(
+            bus_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ));
 
         // Build shared workers
         let shared_workers = WorkerSet::new()
@@ -225,7 +223,7 @@ impl ClawAgentBuilder {
         let active_group_name = config.groups.first().map(|g| g.name.clone()).unwrap_or_default();
 
         for group_config in &config.groups {
-            let group_bus = group_buses.blocking_read()[&group_config.name].clone();
+            let group_bus = bus_map[&group_config.name].clone();
             let session_id = format!("{}-{}", self.session_id_prefix, group_config.name);
             let task_state = new_task_state();
 
@@ -327,13 +325,7 @@ impl AgentSpawner for ClawGroupSpawner {
         let bus = group_agent.bus;
 
         tokio::spawn(async move {
-            let worker_bus = bus.clone();
-            let worker_name = group_name.clone();
-            tokio::spawn(async move {
-                if let Err(e) = ws.run_on(worker_bus).await {
-                    tracing::warn!(group = %worker_name, "spawned group worker error: {e}");
-                }
-            });
+            spawn_group_workers(group_name.clone(), ws, bus);
             if let Err(e) = agent.run().await {
                 tracing::warn!(group = %group_name, "spawned group agent exited: {e}");
             }
@@ -352,6 +344,17 @@ impl AgentSpawner for NoopSpawner {
     async fn spawn(&self, name: &str, _system_prompt: Option<&str>) -> Result<(), String> {
         Err(format!("sub-agent cannot spawn further agents (requested: '{name}')"))
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Spawns a group's `WorkerSet` as a fire-and-forget background task.
+fn spawn_group_workers(name: String, ws: WorkerSet, bus: EventBus) {
+    tokio::spawn(async move {
+        if let Err(e) = ws.run_on(bus).await {
+            tracing::warn!(group = %name, "group worker error: {e}");
+        }
+    });
 }
 
 // ── build_group_agent ─────────────────────────────────────────────────────────
