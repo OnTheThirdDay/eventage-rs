@@ -9,7 +9,7 @@ use crate::bus::EventBus;
 use crate::llm::LlmProvider;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{error, instrument, warn};
 use uuid::Uuid;
 
@@ -132,10 +132,27 @@ impl Agent {
         // between the log read and the subscribe call.
         let mut rx = self.bus.subscribe();
 
-        // If wake events (user.message, heartbeat) were published to the bus
-        // before this subscription was registered — e.g. an HTTP message that
-        // arrived during startup before the agent task was scheduled — run an
-        // initial cycle so those events are not silently ignored.
+        // Consecutive-error backoff state.  After N errors in a row we skip wake
+        // events until at least `2^(N-1)` seconds have elapsed since the last
+        // failure.  This prevents hammering a failing LLM on every heartbeat or
+        // rapid user message burst.  Caps at 32 s (2^5) so the agent can always
+        // recover within one heartbeat interval.
+        let mut consecutive_errors: u32 = 0;
+        let mut last_error_at: Option<Instant> = None;
+
+        let run_cycle = |consecutive_errors: &mut u32,
+                         last_error_at: &mut Option<Instant>|
+         -> bool {
+            if *consecutive_errors == 0 {
+                return true;
+            }
+            let wait = Duration::from_secs(2u64.pow((*consecutive_errors).min(6) - 1));
+            last_error_at.map_or(true, |t| t.elapsed() >= wait)
+        };
+
+        // If wake events were published to the bus before this subscription was
+        // registered — e.g. an HTTP message that arrived during startup before
+        // the agent task was scheduled — run an initial cycle.
         let has_pending = self
             .bus
             .log()
@@ -147,7 +164,9 @@ impl Agent {
                 if matches!(e, AgentError::Bus(_)) {
                     return Err(e);
                 }
-                error!(error = %e, "agent cycle error — recovering");
+                consecutive_errors += 1;
+                last_error_at = Some(Instant::now());
+                error!(error = %e, consecutive_errors, "agent cycle error — recovering");
                 let _ = self
                     .bus
                     .publish(Event::new(
@@ -169,11 +188,16 @@ impl Agent {
                 _ => false,
             };
             if wake {
+                if !run_cycle(&mut consecutive_errors, &mut last_error_at) {
+                    continue;
+                }
                 if let Err(e) = self.cycle().await {
                     if matches!(e, AgentError::Bus(_)) {
                         return Err(e);
                     }
-                    error!(error = %e, "agent cycle error — recovering");
+                    consecutive_errors += 1;
+                    last_error_at = Some(Instant::now());
+                    error!(error = %e, consecutive_errors, "agent cycle error — recovering");
                     let _ = self
                         .bus
                         .publish(Event::new(
@@ -181,6 +205,9 @@ impl Agent {
                             json!({ "content": format!("⚠️ Error: {e}. Ready for your next message.") }),
                         ))
                         .await;
+                } else {
+                    consecutive_errors = 0;
+                    last_error_at = None;
                 }
             }
         }

@@ -4,6 +4,7 @@ use super::types::{ChatMessage, FunctionCall, LlmResponse, ToolCall, ToolDefinit
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{debug, instrument};
 
 /// OpenAI-compatible provider (works with Ollama, Groq, Mistral, Azure, etc.).
@@ -24,8 +25,17 @@ impl OpenAiProvider {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let client = Client::builder()
+            // End-to-end timeout: covers connection + reading the full response body.
+            // LLM calls can be slow on large contexts, but if the server hangs
+            // entirely we must not block the agent loop forever.
+            .timeout(Duration::from_secs(180))
+            // Separate short timeout for the TCP handshake so a dead host fails fast.
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),

@@ -15,8 +15,47 @@ use tracing::{debug, warn};
 // ── Token estimation ──────────────────────────────────────────────────────────
 
 fn estimate_tokens(s: &str) -> usize {
-    let words = s.split_whitespace().count();
-    ((words as f64) * 1.3).ceil() as usize + 4
+    let by_words = ((s.split_whitespace().count() as f64) * 1.3).ceil() as usize + 4;
+    let by_chars = s.len() / 4 + 4;
+    by_words.max(by_chars)
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let mut end = max_chars.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn message_to_text(m: &ChatMessage) -> String {
+    match m.role {
+        Role::System => String::new(),
+        Role::User => {
+            let text = m.content.as_deref().unwrap_or("").trim();
+            if text.is_empty() { String::new() } else { format!("User: {text}\n") }
+        }
+        Role::Assistant => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(text) = m.content.as_deref() {
+                let t = text.trim();
+                if !t.is_empty() { parts.push(t.to_string()); }
+            }
+            if let Some(calls) = &m.tool_calls {
+                for tc in calls {
+                    let args = truncate_str(&tc.function.arguments, 200);
+                    parts.push(format!("[called {}({})]", tc.function.name, args));
+                }
+            }
+            if parts.is_empty() { String::new() } else { format!("Assistant: {}\n", parts.join(" ")) }
+        }
+        Role::Tool => {
+            format!("Tool result: {}\n", truncate_str(m.content.as_deref().unwrap_or("").trim(), 300))
+        }
+    }
 }
 
 fn messages_token_count(messages: &[ChatMessage]) -> usize {
@@ -64,7 +103,8 @@ pub struct SummarizingAssembler {
     llm: Arc<dyn LlmProvider>,
     pub max_tokens: usize,
     pub threshold: f64,
-    pub keep_fraction: f64,
+    /// Minimum number of recent conversation messages to keep verbatim (default 20).
+    pub keep_recent: usize,
     pub session_id: String,
     state: Mutex<Option<SummaryState>>,
 }
@@ -81,35 +121,40 @@ impl SummarizingAssembler {
             llm,
             max_tokens,
             threshold: 0.85,
-            keep_fraction: 0.10,
+            keep_recent: 20,
             session_id: session_id.into(),
             state: Mutex::new(None),
         }
     }
 
-    async fn do_summarize(&self, to_summarize: &[ChatMessage]) -> String {
-        let text: String = to_summarize
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    Role::User => "User",
-                    Role::Assistant => "Assistant",
-                    Role::Tool => "Tool",
-                    Role::System => "System",
-                };
-                let content = m.content.as_deref().unwrap_or("(tool calls)");
-                format!("{role}: {content}\n")
-            })
-            .collect();
+    async fn do_summarize(
+        &self,
+        existing_summary: Option<&str>,
+        new_messages: &[ChatMessage],
+    ) -> String {
+        let new_text: String = new_messages.iter().map(message_to_text).collect();
 
-        let prompt = format!(
-            "Summarize the following conversation history. \
-             Your summary MUST start with a \"User instructions\" bullet list that quotes, \
-             verbatim, every short instruction or correction the user gave (e.g. \"use tool \
-             call not in the chat\", \"don't use write_file\"). \
-             After the bullet list, write a concise narrative preserving all important \
-             context, decisions, and results.\n\n{text}"
-        );
+        let prompt = match existing_summary {
+            Some(prev) => format!(
+                "You have a summary of earlier conversation history:\n\n\
+                 {prev}\n\n\
+                 Extend this summary to also cover the following new messages. \
+                 Your updated summary MUST start with a \"User instructions\" bullet \
+                 list that quotes, verbatim, every short instruction or correction \
+                 the user gave (including any from the previous summary). \
+                 After the bullet list, write a concise narrative preserving all \
+                 important context, decisions, and results.\n\n{new_text}"
+            ),
+            None => format!(
+                "Summarize the following conversation history. \
+                 Your summary MUST start with a \"User instructions\" bullet list \
+                 that quotes, verbatim, every short instruction or correction the \
+                 user gave (e.g. \"use tool call not in the chat\", \
+                 \"don't use write_file\"). \
+                 After the bullet list, write a concise narrative preserving all \
+                 important context, decisions, and results.\n\n{new_text}"
+            ),
+        };
 
         match self
             .llm
@@ -119,7 +164,9 @@ impl SummarizingAssembler {
             Ok(resp) => resp.content.unwrap_or_else(|| "(empty summary)".into()),
             Err(e) => {
                 warn!("summarization failed: {e}");
-                format!("[Summary unavailable: {e}]")
+                existing_summary
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("[Summary unavailable: {e}]"))
             }
         }
     }
@@ -145,81 +192,97 @@ impl SummarizingAssembler {
                 )
             })
             .collect();
-
-        let _ = tokio::fs::write(&path, text).await;
+        use tokio::io::AsyncWriteExt;
+        if let Ok(mut file) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            let _ = file.write_all(text.as_bytes()).await;
+        }
         debug!("offloaded conversation history to {}", path.display());
+    }
+
+    fn build_candidate(
+        sys_msgs: &[ChatMessage],
+        state: Option<&SummaryState>,
+        conv_msgs: &[ChatMessage],
+    ) -> Vec<ChatMessage> {
+        let summarized = state.map(|s| s.summarized_conv_count).unwrap_or(0);
+        let mut msgs: Vec<ChatMessage> = sys_msgs.to_vec();
+        if let Some(s) = state {
+            if s.summarized_conv_count > 0 {
+                msgs.push(ChatMessage::system(format!(
+                    "<conversation_summary>\n\
+                     The following is a summary of the earlier conversation:\n\n\
+                     {}\n\
+                     </conversation_summary>",
+                    s.summary
+                )));
+            }
+        }
+        msgs.extend_from_slice(&conv_msgs[summarized..]);
+        msgs
     }
 }
 
 #[async_trait]
 impl ContextAssembler for SummarizingAssembler {
     async fn assemble(&self, context: &AssemblyContext<'_>) -> Vec<ChatMessage> {
-        let mut messages = self.inner.assemble(context).await;
+        let messages = self.inner.assemble(context).await;
         let (sys_msgs, conv_msgs) = partition_messages(&messages);
         let budget = (self.max_tokens as f64 * self.threshold) as usize;
 
-        // Apply existing summary if present
-        {
-            let state = self.state.lock().await;
-            if let Some(ref s) = *state {
-                if conv_msgs.len() > s.summarized_conv_count {
-                    let summary_msg = ChatMessage::system(format!(
-                        "<conversation_summary>\n\
-                         The following is a summary of the earlier conversation:\n\n\
-                         {}\n\
-                         </conversation_summary>",
-                        s.summary
-                    ));
-                    messages.clear();
-                    messages.extend(sys_msgs.clone());
-                    messages.push(summary_msg);
-                    messages.extend_from_slice(&conv_msgs[s.summarized_conv_count..]);
-                }
-                return messages;
+        loop {
+            let candidate = {
+                let state = self.state.lock().await;
+                Self::build_candidate(&sys_msgs, state.as_ref(), &conv_msgs)
+            };
+
+            if messages_token_count(&candidate) < budget {
+                return candidate;
+            }
+
+            let current_summarized = {
+                let state = self.state.lock().await;
+                state.as_ref().map(|s| s.summarized_conv_count).unwrap_or(0)
+            };
+
+            let new_cutoff = conv_msgs.len().saturating_sub(self.keep_recent);
+
+            if new_cutoff <= current_summarized {
+                warn!(
+                    session = %self.session_id,
+                    "context still over budget after max summarization; returning as-is"
+                );
+                return candidate;
+            }
+
+            let to_summarize = &conv_msgs[current_summarized..new_cutoff];
+            let existing_summary = {
+                let state = self.state.lock().await;
+                state.as_ref().map(|s| s.summary.clone())
+            };
+
+            self.offload_to_file(to_summarize).await;
+            let new_summary = self.do_summarize(existing_summary.as_deref(), to_summarize).await;
+
+            debug!(
+                session = %self.session_id,
+                prev_summarized = current_summarized,
+                new_summarized = new_cutoff,
+                "context summarized"
+            );
+
+            {
+                let mut state = self.state.lock().await;
+                *state = Some(SummaryState {
+                    summary: new_summary,
+                    summarized_conv_count: new_cutoff,
+                });
             }
         }
-
-        let total_tokens = messages_token_count(&messages);
-        if total_tokens < budget {
-            return messages;
-        }
-
-        // Over budget — compact
-        let keep = ((conv_msgs.len() as f64 * self.keep_fraction).ceil() as usize).max(4);
-        let cutoff = conv_msgs.len().saturating_sub(keep);
-
-        if cutoff == 0 {
-            return messages;
-        }
-
-        let to_summarize = &conv_msgs[..cutoff];
-        let to_keep = &conv_msgs[cutoff..];
-
-        // Offload and summarize (drop lock before awaiting)
-        self.offload_to_file(to_summarize).await;
-        let summary = self.do_summarize(to_summarize).await;
-
-        // Update state
-        {
-            let mut state = self.state.lock().await;
-            *state = Some(SummaryState {
-                summary: summary.clone(),
-                summarized_conv_count: cutoff,
-            });
-        }
-
-        let summary_msg = ChatMessage::system(format!(
-            "<conversation_summary>\n\
-             The following is a summary of the earlier conversation:\n\n\
-             {summary}\n\
-             </conversation_summary>"
-        ));
-
-        messages.clear();
-        messages.extend(sys_msgs);
-        messages.push(summary_msg);
-        messages.extend_from_slice(to_keep);
-        messages
     }
 }
 

@@ -202,10 +202,14 @@ pub async fn execute_tools(
     }
 
     // Collect by original index (preserves order for Phase 3).
+    // JoinErrors (task panics) are logged and skipped — Phase 3 will synthesize an error
+    // tool.result for any index missing from this map, keeping the message history valid.
     let mut exec_results: HashMap<usize, Value> = HashMap::new();
     while let Some(join_result) = join_set.join_next().await {
-        let (idx, payload) = join_result.map_err(|e| AgentError::Tool(e.to_string()))?;
-        exec_results.insert(idx, payload);
+        match join_result {
+            Ok((idx, payload)) => { exec_results.insert(idx, payload); }
+            Err(join_err) => warn!("tool task panicked: {}", join_err),
+        }
     }
 
     // ── Phase 3: after_tool hooks + publish results in original order ──────
@@ -222,7 +226,7 @@ pub async fn execute_tools(
                 json!({
                     "tool_call_id": p.id,
                     "name": p.name,
-                    "error": "execution result missing"
+                    "error": "tool execution panicked and produced no result"
                 })
             })
         };

@@ -91,7 +91,18 @@ fn apply_name(msg: ChatMessage, payload: &serde_json::Value) -> ChatMessage {
 }
 
 /// Converts raw events to `ChatMessage`s.
+///
+/// Includes a repair pass: if an `assistant` message declares `tool_calls` but
+/// some of their results are missing (e.g. due to a tool panic), synthetic
+/// `tool` messages with an error are inserted so the history stays valid for
+/// any LLM provider that enforces the "all tool_call_ids must be answered" rule.
 pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
+    let raw = events_to_messages_raw(events);
+    repair_tool_results(raw)
+}
+
+/// Raw conversion without the repair pass (used internally and in tests).
+fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
 
     for event in events {
@@ -176,6 +187,58 @@ pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
     }
 
     messages
+}
+
+/// Scan a message list and insert synthetic `tool` error messages for any
+/// `tool_call_id` that appears in an `assistant` message but has no matching
+/// `tool` result later in the list.
+///
+/// This guards against corrupt histories caused by tool panics or other
+/// unexpected interruptions that prevented a `tool.result` event from being
+/// published.  Without this repair the LLM provider returns a 400 on every
+/// subsequent call, permanently deadlocking the agent.
+fn repair_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    use std::collections::HashSet;
+
+    // Fast path: no repair needed if there are no assistant messages with tool calls.
+    let needs_repair = messages.iter().any(|m| {
+        m.role == Role::Assistant && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+    });
+    if !needs_repair {
+        return messages;
+    }
+
+    // Collect all tool_call_ids that have a tool result.
+    let answered: HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+
+    // Rebuild, injecting synthetic results immediately after any assistant message
+    // that references an unanswered tool_call_id.
+    let mut out = Vec::with_capacity(messages.len());
+    for msg in &messages {
+        if msg.role == Role::Assistant {
+            if let Some(tcs) = &msg.tool_calls {
+                out.push(msg.clone());
+                for tc in tcs {
+                    if !answered.contains(tc.id.as_str()) {
+                        out.push(ChatMessage::tool_result(
+                            &tc.id,
+                            format!(
+                                "error: tool '{}' execution was interrupted and produced no result",
+                                tc.function.name
+                            ),
+                        ));
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(msg.clone());
+    }
+    out
 }
 
 // ── DefaultContextAssembler ───────────────────────────────────────────────────

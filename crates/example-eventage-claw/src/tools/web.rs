@@ -242,15 +242,21 @@ fn strip_html_tags(html: &str) -> String {
     let mut result = String::new();
     let mut in_tag = false;
     let mut in_script = false;
-    let lower = html.to_lowercase();
     let chars: Vec<char> = html.chars().collect();
+    // Use char-indexed lowercased chars for substring comparisons so multi-byte
+    // Unicode characters never cause a byte-boundary panic.
+    let lower_chars: Vec<char> = html.to_lowercase().chars().collect();
     let mut i = 0;
 
     while i < chars.len() {
-        if !in_tag && !in_script && i + 7 < lower.len() && &lower[i..i + 7] == "<script" {
+        if !in_tag && !in_script && i + 7 <= lower_chars.len()
+            && lower_chars[i..i + 7] == ['<', 's', 'c', 'r', 'i', 'p', 't'][..]
+        {
             in_script = true;
             in_tag = true;
-        } else if in_script && i + 9 < lower.len() && &lower[i..i + 9] == "</script>" {
+        } else if in_script && i + 9 <= lower_chars.len()
+            && lower_chars[i..i + 9] == ['<', '/', 's', 'c', 'r', 'i', 'p', 't', '>'][..]
+        {
             in_script = false;
             in_tag = false;
             i += 9;

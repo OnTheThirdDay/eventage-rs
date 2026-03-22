@@ -8,6 +8,7 @@ use crate::bus::EventBus;
 use crate::event::Event;
 use crate::error::BusError;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -124,46 +125,23 @@ impl WorkerSet {
         self
     }
 
-    /// Spawn all workers and drive them until the bus closes or a fatal error occurs.
+    /// Spawn all workers and drive them until the bus closes.
+    ///
+    /// Each worker runs under supervision: if it panics or returns a non-bus
+    /// error it is automatically restarted after a 1-second delay.  Only a
+    /// bus-closed signal (all `EventBus` clones dropped) causes workers to stop
+    /// cleanly.  This prevents any single misbehaving worker from bringing down
+    /// the whole set.
     pub async fn run_on(self, bus: EventBus) -> Result<(), WorkerError> {
-        let mut set: JoinSet<Result<(), WorkerError>> = JoinSet::new();
+        let mut set: JoinSet<()> = JoinSet::new();
 
         for worker in self.workers {
             let bus = bus.clone();
-            set.spawn(async move {
-                let kinds = worker.subscribed_kinds();
-                let mut rx = bus.subscribe();
-                while let Some(event) = rx.recv().await {
-                    let interested = kinds.is_empty() || kinds.iter().any(|k| k == &event.kind);
-                    if interested {
-                        worker.handle(&event, &bus).await?;
-                    }
-                }
-                Ok(())
-            });
+            set.spawn(run_worker_supervised(worker, bus));
         }
 
-        let mut first_err: Option<WorkerError> = None;
-        while let Some(result) = set.join_next().await {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!("event worker exited with error: {e}");
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                    set.abort_all();
-                }
-                Err(join_err) => {
-                    warn!("event worker task panicked: {join_err}");
-                }
-            }
-        }
-
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        while set.join_next().await.is_some() {}
+        Ok(())
     }
 }
 
@@ -217,4 +195,29 @@ async fn run_worker(worker: Arc<dyn EventWorker>, bus: EventBus) -> Result<(), W
         }
     }
     Ok(())
+}
+
+/// Run a worker under supervision: restart it on panic or transient error.
+///
+/// Stops only when the bus closes (`rx.recv()` returns `None` → `Ok(())`) or
+/// when the worker returns a `WorkerError::Bus` (channel gone).
+async fn run_worker_supervised(worker: Arc<dyn EventWorker>, bus: EventBus) {
+    loop {
+        let result = tokio::spawn(run_worker(worker.clone(), bus.clone())).await;
+        match result {
+            // Bus closed — exit cleanly.
+            Ok(Ok(())) => break,
+            Ok(Err(WorkerError::Bus(_))) => break,
+            // Transient error — log and restart.
+            Ok(Err(e)) => {
+                warn!(error = %e, "event worker returned error — restarting in 1 s");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            // Panic in the worker task — log and restart.
+            Err(panic_err) => {
+                warn!(error = %panic_err, "event worker panicked — restarting in 1 s");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
