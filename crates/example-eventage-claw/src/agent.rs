@@ -17,7 +17,7 @@ use crate::tools::{
     ScheduleTaskTool, TaskState, UpdateTaskTool, WebFetchTool, WebSearchTool, WriteFileTool,
     load_tasks, new_group_registry, new_task_state,
 };
-use crate::workers::{ChannelOutputWorker, RelayWorker, SchedulerWorker};
+use crate::workers::{ChannelOutputWorker, DelegationReplyWorker, RelayWorker, SchedulerWorker};
 use eventage::{
     agent::{ContextAssembler, DefaultContextAssembler},
     llm::OpenAiProvider,
@@ -429,6 +429,10 @@ fn build_group_agent(
 
     // ── Per-group workers ──────────────────────────────────────────────────────
     let mut group_workers = WorkerSet::new();
+    group_workers = group_workers.add_worker(DelegationReplyWorker::new(
+        shared_bus.clone(),
+        &group_config.name,
+    ));
     if let Some(ref webhook_url) = config.webhook_url {
         group_workers = group_workers.add_worker(ChannelOutputWorker::new(
             webhook_url.clone(),

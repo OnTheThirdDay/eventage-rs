@@ -150,6 +150,11 @@ pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
                     messages.push(ChatMessage::tool_result(id, result));
                 }
             }
+            kinds::AGENT_MESSAGE => {
+                if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
+                    messages.push(ChatMessage::user(text));
+                }
+            }
             _ => {}
         }
     }

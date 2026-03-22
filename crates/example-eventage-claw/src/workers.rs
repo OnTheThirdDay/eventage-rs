@@ -12,7 +12,7 @@ use eventage::{
     EventBus,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -297,9 +297,9 @@ impl EventWorker for RelayWorker {
         if let Some(target_bus) = self.group_buses.get(target) {
             target_bus
                 .publish(Event::new(
-                    kinds::USER_MESSAGE,
+                    kinds::AGENT_MESSAGE,
                     json!({
-                        "text": format!("[Message from group '{source}']\n{content}"),
+                        "text": format!("[Agent '{}' says]\n{content}", source),
                         "source_group": source,
                         "message_id": msg_id,
                         "via": "relay",
@@ -309,6 +309,115 @@ impl EventWorker for RelayWorker {
                 .map_err(WorkerError::Bus)?;
         } else {
             debug!(target = %target, "RelayWorker: target group not found");
+        }
+
+        Ok(())
+    }
+}
+
+// ── DelegationReplyWorker ─────────────────────────────────────────────────────
+
+/// Runs on each group's **per-group bus**.
+///
+/// Closes the reply loop for `MessageGroupTool(await_reply=true)`:
+/// 1. Detects inbound relay requests (`agent.message` with `via: "relay"`)
+/// 2. Captures the agent's final response (`assistant.message` content)
+/// 3. On `agent.cycle.end`, publishes `CLAW_GROUP_MESSAGE` on the shared bus
+///    with `in_reply_to` set, unblocking the calling agent's `await_reply`.
+///
+/// A `VecDeque` queue handles back-to-back delegations arriving before the
+/// agent finishes its current cycle.
+pub struct DelegationReplyWorker {
+    pub shared_bus: EventBus,
+    pub group_name: String,
+    pending: Arc<Mutex<VecDeque<PendingReply>>>,
+    last_content: Arc<Mutex<Option<String>>>,
+}
+
+struct PendingReply {
+    source_group: String,
+    message_id: String,
+}
+
+impl DelegationReplyWorker {
+    pub fn new(shared_bus: EventBus, group_name: impl Into<String>) -> Self {
+        Self {
+            shared_bus,
+            group_name: group_name.into(),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            last_content: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait]
+impl EventWorker for DelegationReplyWorker {
+    fn subscribed_kinds(&self) -> Vec<String> {
+        vec![
+            kinds::AGENT_MESSAGE.to_string(),
+            kinds::ASSISTANT_MESSAGE.to_string(),
+            kinds::AGENT_CYCLE_END.to_string(),
+        ]
+    }
+
+    async fn handle(&self, event: &Event, _bus: &EventBus) -> Result<(), WorkerError> {
+        match event.kind.as_str() {
+            k if k == kinds::AGENT_MESSAGE => {
+                // Only track relay requests, not broadcasts from this group's own agent.
+                if event.payload.get("via").and_then(|v| v.as_str()) != Some("relay") {
+                    return Ok(());
+                }
+                let source = event.payload["source_group"].as_str().unwrap_or("").to_string();
+                let msg_id = event.payload["message_id"].as_str().unwrap_or("").to_string();
+                if !msg_id.is_empty() {
+                    debug!(
+                        group = %self.group_name,
+                        source = %source,
+                        msg_id = %msg_id,
+                        "DelegationReplyWorker: queued relay request"
+                    );
+                    self.pending.lock().await.push_back(PendingReply { source_group: source, message_id: msg_id });
+                }
+            }
+
+            k if k == kinds::ASSISTANT_MESSAGE => {
+                if let Some(content) = event.payload.get("content").and_then(|v| v.as_str()) {
+                    if !content.trim().is_empty() {
+                        *self.last_content.lock().await = Some(content.to_string());
+                    }
+                }
+            }
+
+            k if k == kinds::AGENT_CYCLE_END => {
+                let reply = self.pending.lock().await.pop_front();
+                let Some(PendingReply { source_group, message_id }) = reply else {
+                    return Ok(());
+                };
+
+                let content = self.last_content.lock().await.take().unwrap_or_default();
+
+                info!(
+                    group = %self.group_name,
+                    target = %source_group,
+                    msg_id = %message_id,
+                    "DelegationReplyWorker: routing reply back to caller"
+                );
+
+                self.shared_bus
+                    .publish(Event::new(
+                        CLAW_GROUP_MESSAGE,
+                        json!({
+                            "target_group": source_group,
+                            "source_group": self.group_name,
+                            "content": content,
+                            "in_reply_to": message_id,
+                        }),
+                    ))
+                    .await
+                    .map_err(WorkerError::Bus)?;
+            }
+
+            _ => {}
         }
 
         Ok(())
