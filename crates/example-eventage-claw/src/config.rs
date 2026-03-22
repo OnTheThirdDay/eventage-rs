@@ -117,6 +117,8 @@ pub struct ClawConfig {
     /// Webhook URL where the `ChannelOutputWorker` POSTs agent responses.
     /// Set to the WhatsApp bridge's `/send` endpoint, e.g.
     /// `"http://localhost:3001/send"`.
+    /// Also configurable via `CLAW_WEBHOOK_URL` env var.
+    #[serde(default = "default_webhook_url")]
     pub webhook_url: Option<String>,
 }
 
@@ -138,6 +140,9 @@ fn default_data_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claw")
+}
+fn default_webhook_url() -> Option<String> {
+    std::env::var("CLAW_WEBHOOK_URL").ok()
 }
 fn default_max_steps() -> usize {
     30
@@ -175,7 +180,7 @@ impl Default for ClawConfig {
             docker_image: default_docker_image(),
             docker_memory: default_docker_memory(),
             docker_network: default_docker_network(),
-            webhook_url: None,
+            webhook_url: default_webhook_url(),
         }
     }
 }
@@ -230,6 +235,12 @@ impl ClawConfig {
                 config.model = m;
             }
         }
+        if let Ok(url) = std::env::var("CLAW_WEBHOOK_URL") {
+            if !url.is_empty() {
+                config.webhook_url = Some(url);
+            }
+        }
+
         // CLAW_GROUPS=personal,alice,bob — add any groups not already in config.
         // The first listed group becomes is_main if no main group exists yet.
         if let Ok(groups_str) = std::env::var("CLAW_GROUPS") {

@@ -26,6 +26,8 @@ services:
       - CLAW_GROUPS   # e.g. "personal,alice,bob"
       # Must match the bind-mount path above so claw uses the correct data dir.
       - CLAW_DATA_DIR=${CLAW_DATA_DIR:-/opt/claw/data}
+      # Webhook for ChannelOutputWorker to forward replies to WhatsApp bridge.
+      - CLAW_WEBHOOK_URL=${CLAW_WEBHOOK_URL:-http://whatsapp-bridge:3001/send}
 
   # ── WhatsApp bridge (Node.js, Baileys) ────────────────────────────────────
   whatsapp-bridge:
