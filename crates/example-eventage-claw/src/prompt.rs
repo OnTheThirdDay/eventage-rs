@@ -27,8 +27,13 @@ You have access to the following tools:
 - `pause_task(task_id)` — temporarily pause a task
 
 **Inter-group messaging** (EventBus IPC):
-- `message_group(target_group, message)` — send a message to another group's agent
-  - This uses the eventage EventBus directly — no files, no sockets
+- `spawn_group(name, system_prompt)` — create a new sub-agent for a specialised task
+- `message_group(target_group, message)` — delegate a task to a sub-agent and get its reply
+  - By default waits up to 30 s for the reply (use `await_reply=false` for fire-and-forget)
+  - To work asynchronously: pass `await_reply=false`, continue the conversation, and the
+    sub-agent's reply will arrive later as a `[Reply from sub-agent '...']` message
+  - When you receive `[Reply from sub-agent 'X']\n<content>`, the sub-agent 'X' has
+    finished its task — relay the result clearly to the user in your own words
 
 **Memory:**
 - Write to `AGENT.md` in your workspace using `write_file` to remember things

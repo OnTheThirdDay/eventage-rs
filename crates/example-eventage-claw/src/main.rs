@@ -202,6 +202,11 @@ async fn main() -> anyhow::Result<()> {
     let group_bus_list: Vec<eventage::EventBus> =
         group_buses.values().cloned().collect();
 
+    // Aggregation bus: dynamically-spawned sub-agent buses forward their events
+    // here so the live replay UI can observe them without knowing about the buses
+    // at startup time.
+    let spawn_agg_bus = eventage::EventBus::new();
+
     if let Some(log_path) = &args.log {
         match JsonlExporter::new(log_path).await {
             Ok(exporter) => {
@@ -220,13 +225,23 @@ async fn main() -> anyhow::Result<()> {
                             .run(),
                     );
                 }
-                // Dynamically-spawned group buses: install a hook so the spawner
-                // attaches the exporter to any new bus created at runtime.
+                // Dynamically-spawned group buses: attach exporter and forward
+                // all events to spawn_agg_bus so the replay UI sees them too.
                 let exporter_for_hook = exporter.clone();
+                let agg_for_hook = spawn_agg_bus.clone();
                 *claw.spawner_bus_hook.lock().unwrap() = Some(std::sync::Arc::new(
                     move |bus: eventage::EventBus| {
                         let exp = exporter_for_hook.clone();
-                        tokio::spawn(BusObserver::new(bus).add_exporter_arc(exp).run());
+                        tokio::spawn(
+                            BusObserver::new(bus.clone()).add_exporter_arc(exp).run(),
+                        );
+                        let agg = agg_for_hook.clone();
+                        tokio::spawn(async move {
+                            let mut rx = bus.subscribe();
+                            while let Some(event) = rx.recv().await {
+                                let _ = agg.publish(event).await;
+                            }
+                        });
                     },
                 ));
                 if !tui_mode {
@@ -235,11 +250,26 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => eprintln!("Warning: could not open log file: {e}"),
         }
+    } else if args.replay {
+        // --replay without --log: still forward spawned buses to the aggregation bus.
+        let agg_for_hook = spawn_agg_bus.clone();
+        *claw.spawner_bus_hook.lock().unwrap() = Some(std::sync::Arc::new(
+            move |bus: eventage::EventBus| {
+                let agg = agg_for_hook.clone();
+                tokio::spawn(async move {
+                    let mut rx = bus.subscribe();
+                    while let Some(event) = rx.recv().await {
+                        let _ = agg.publish(event).await;
+                    }
+                });
+            },
+        ));
     }
 
     if args.replay {
         LiveReplayServer::new(shared_bus.clone())
             .with_buses(group_bus_list.iter().cloned())
+            .with_buses(std::iter::once(spawn_agg_bus))
             .port(args.replay_port)
             .serve_background();
         if !tui_mode {

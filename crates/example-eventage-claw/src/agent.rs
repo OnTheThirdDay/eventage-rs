@@ -269,6 +269,7 @@ impl ClawAgentBuilder {
                 session_id,
                 task_state,
                 spawner.clone(),
+                true, // configured groups are user-facing
             );
 
             groups.insert(group_config.name.clone(), group_agent);
@@ -341,6 +342,7 @@ impl AgentSpawner for ClawGroupSpawner {
             session_id,
             task_state,
             no_spawn,
+            false, // spawned sub-agents are internal; only delegation replies allowed
         );
 
         // Atomically check for duplicates and register — single write lock prevents
@@ -413,6 +415,8 @@ fn build_group_agent(
     session_id: String,
     task_state: TaskState,
     spawner: Arc<dyn AgentSpawner>,
+    // True for user-facing configured groups; false for ephemeral sub-agents.
+    with_channel_output: bool,
 ) -> GroupAgent {
     let work_dir = config.group_work_dir(&group_config.name);
     let _ = std::fs::create_dir_all(&work_dir);
@@ -594,11 +598,13 @@ fn build_group_agent(
         shared_bus.clone(),
         &group_config.name,
     ));
-    if let Some(ref webhook_url) = config.webhook_url {
-        group_workers = group_workers.add_worker(ChannelOutputWorker::new(
-            webhook_url.clone(),
-            &group_config.name,
-        ));
+    if with_channel_output {
+        if let Some(ref webhook_url) = config.webhook_url {
+            group_workers = group_workers.add_worker(ChannelOutputWorker::new(
+                webhook_url.clone(),
+                &group_config.name,
+            ));
+        }
     }
 
     GroupAgent {
