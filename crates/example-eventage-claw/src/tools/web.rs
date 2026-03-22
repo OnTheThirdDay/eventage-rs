@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use eventage::{AgentError, Tool, ToolDefinition};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 fn tool_err(msg: impl Into<String>) -> AgentError {
     AgentError::Tool(msg.into())
@@ -26,10 +27,53 @@ impl WebSearchTool {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                .timeout(Duration::from_secs(15))
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
         }
+    }
+
+    /// POST to html.duckduckgo.com — more reliable than GET for avoiding CAPTCHAs.
+    async fn search_html(&self, query: &str, max: usize) -> Vec<Value> {
+        let body = format!("q={}&kd=-1&kp=-2&kl=us-en", urlencoding(query));
+        let Ok(resp) = self
+            .client
+            .post("https://html.duckduckgo.com/html/")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .body(body)
+            .send()
+            .await
+        else {
+            return vec![];
+        };
+        let Ok(html) = resp.text().await else {
+            return vec![];
+        };
+        parse_ddg_results(&html, max)
+    }
+
+    /// POST to lite.duckduckgo.com — simpler HTML, less bot-detection.
+    async fn search_lite(&self, query: &str, max: usize) -> Vec<Value> {
+        let body = format!("q={}", urlencoding(query));
+        let Ok(resp) = self
+            .client
+            .post("https://lite.duckduckgo.com/lite/")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "text/html")
+            .body(body)
+            .send()
+            .await
+        else {
+            return vec![];
+        };
+        let Ok(html) = resp.text().await else {
+            return vec![];
+        };
+        parse_ddg_lite_results(&html, max)
     }
 }
 
@@ -62,29 +106,16 @@ impl Tool for WebSearchTool {
             .ok_or_else(|| tool_err("missing 'query'"))?;
         let max_results = args["max_results"].as_u64().unwrap_or(5) as usize;
 
-        let url = format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            urlencoding(query)
-        );
-
-        let resp = self
-            .client
-            .get(&url)
-            .header("Accept", "text/html")
-            .send()
-            .await
-            .map_err(|e| tool_err(format!("web_search request failed: {e}")))?;
-
-        let html = resp
-            .text()
-            .await
-            .map_err(|e| tool_err(format!("web_search read failed: {e}")))?;
-
-        let results = parse_ddg_results(&html, max_results);
+        // Try the full HTML endpoint first; fall back to the lite endpoint if it
+        // returns nothing (CAPTCHA, structure change, rate-limit, etc.).
+        let mut results = self.search_html(query, max_results).await;
+        if results.is_empty() {
+            results = self.search_lite(query, max_results).await;
+        }
 
         if results.is_empty() {
             return Err(tool_err(
-                "web_search returned no results — DuckDuckGo may have returned a CAPTCHA or the query has no matches. Try rephrasing.",
+                "web_search returned no results — the search engine may be rate-limiting or the query has no matches. Try rephrasing.",
             ));
         }
 
@@ -116,18 +147,17 @@ fn urlencoding(s: &str) -> String {
         .collect()
 }
 
-/// Very light HTML parser for DuckDuckGo search results.
+/// Very light HTML parser for DuckDuckGo HTML-endpoint results.
+///
+/// Searches for `result__a` as a substring so it tolerates extra CSS classes
+/// like `class="result__a result__a--overflow"`.
 fn parse_ddg_results(html: &str, max: usize) -> Vec<Value> {
     let mut results = vec![];
 
-    // DuckDuckGo HTML results are in <div class="result__body"> blocks
-    // Each result has: .result__title (with <a href>), .result__snippet
-    // We use simple string scanning rather than a full HTML parser.
-
     let mut pos = 0;
     while results.len() < max {
-        // Find a result title link
-        let Some(title_start) = html[pos..].find("class=\"result__a\"") else {
+        // Match any attribute value containing result__a (substring, not exact).
+        let Some(title_start) = html[pos..].find("result__a") else {
             break;
         };
         let abs_title_start = pos + title_start;
@@ -185,6 +215,87 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<Value> {
         }
 
         pos = abs_title_start + 1;
+    }
+
+    results
+}
+
+/// Parser for lite.duckduckgo.com results.
+///
+/// The lite endpoint uses a table layout where each result has a `result-link`
+/// anchor (title + URL) followed shortly by a `result-snippet` cell.
+fn parse_ddg_lite_results(html: &str, max: usize) -> Vec<Value> {
+    let mut results = vec![];
+    let mut pos = 0;
+
+    while results.len() < max {
+        let Some(rel) = html[pos..].find("result-link") else {
+            break;
+        };
+        let abs = pos + rel;
+
+        // Find the <a href="..."> after the class attribute.
+        let region_end = (abs + 600).min(html.len());
+        let region = &html[abs..region_end];
+
+        let url = if let Some(href_pos) = region.find("href=\"") {
+            let start = href_pos + 6;
+            let end = region[start..]
+                .find('"')
+                .map(|e| start + e)
+                .unwrap_or(region.len());
+            let raw = &region[start..end];
+            if raw.contains("uddg=") || raw.starts_with("/l/") {
+                extract_ddg_url(raw)
+            } else {
+                raw.to_string()
+            }
+        } else {
+            String::new()
+        };
+
+        let title = if let Some(gt) = region.find('>') {
+            let cs = gt + 1;
+            if let Some(end) = region[cs..].find("</a>") {
+                strip_html_tags(&region[cs..cs + end])
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        pos = abs + 1;
+
+        // Snippet is in the next result-snippet cell.
+        let snippet = if pos < html.len() {
+            if let Some(snip_rel) = html[abs..].find("result-snippet") {
+                let s = abs + snip_rel + "result-snippet".len();
+                let lookahead = (s + 60).min(html.len());
+                if let Some(gt) = html[s..lookahead].find('>') {
+                    let cs = s + gt + 1;
+                    if let Some(end) = html[cs..].find("</") {
+                        strip_html_tags(&html[cs..cs + end.min(400)])
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        if !title.is_empty() || !url.is_empty() {
+            results.push(json!({
+                "title": title.trim(),
+                "url": url,
+                "snippet": snippet.trim(),
+            }));
+        }
     }
 
     results
