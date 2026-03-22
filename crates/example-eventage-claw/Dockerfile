@@ -39,4 +39,4 @@ RUN mkdir -p /opt/claw/data
 EXPOSE 3000
 
 ENTRYPOINT ["claw"]
-CMD ["--no-tui", "--http-port", "3000", "--log", "/root/.claw/events.jsonl"]
+CMD ["--no-tui", "--http-port", "3000", "--log", "/opt/claw/data/events.jsonl"]
