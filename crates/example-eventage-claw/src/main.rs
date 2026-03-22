@@ -220,6 +220,15 @@ async fn main() -> anyhow::Result<()> {
                             .run(),
                     );
                 }
+                // Dynamically-spawned group buses: install a hook so the spawner
+                // attaches the exporter to any new bus created at runtime.
+                let exporter_for_hook = exporter.clone();
+                *claw.spawner_bus_hook.lock().unwrap() = Some(std::sync::Arc::new(
+                    move |bus: eventage::EventBus| {
+                        let exp = exporter_for_hook.clone();
+                        tokio::spawn(BusObserver::new(bus).add_exporter_arc(exp).run());
+                    },
+                ));
                 if !tui_mode {
                     eprintln!("Logging events to {}", log_path.display());
                 }

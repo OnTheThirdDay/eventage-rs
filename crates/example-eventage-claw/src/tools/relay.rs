@@ -34,9 +34,10 @@ impl Tool for MessageGroupTool {
         ToolDefinition::function(
             "message_group",
             format!(
-                "Send a message to another named group's agent via the event bus. \
-                 This demonstrates eventage's EventBus-as-IPC: no files, no sockets — \
-                 just events.{groups_hint}"
+                "Send a message to another named group's agent and wait for its reply. \
+                 Use this to delegate tasks to sub-agents and receive their results. \
+                 Set await_reply=false only for fire-and-forget notifications where you \
+                 do not need the response.{groups_hint}"
             ),
             json!({
                 "type": "object",
@@ -51,7 +52,7 @@ impl Tool for MessageGroupTool {
                     },
                     "await_reply": {
                         "type": "boolean",
-                        "description": "If true, wait up to 30s for a reply from the target group (default: false)."
+                        "description": "Wait up to 30s for the target group's reply (default: true). Set false only for fire-and-forget messaging where the response is not needed."
                     }
                 },
                 "required": ["target_group", "message"]
@@ -66,11 +67,14 @@ impl Tool for MessageGroupTool {
         let message = args["message"]
             .as_str()
             .ok_or_else(|| AgentError::Tool("missing 'message'".into()))?;
-        let await_reply = args["await_reply"].as_bool().unwrap_or(false);
+        let await_reply = args["await_reply"].as_bool().unwrap_or(true);
 
         let msg_id = Uuid::new_v4().to_string();
 
         // Publish the IPC event — RelayWorker will route this to target's bus.
+        // `caller_awaits` is forwarded so DelegationReplyWorker knows whether to
+        // push the reply back as an agent.message (async) or leave it on the
+        // shared bus for the blocking wait_for (sync).
         self.shared_bus
             .publish(Event::new(
                 CLAW_GROUP_MESSAGE,
@@ -79,6 +83,7 @@ impl Tool for MessageGroupTool {
                     "target_group": target,
                     "source_group": self.source_group,
                     "content": message,
+                    "caller_awaits": await_reply,
                 }),
             ))
             .await

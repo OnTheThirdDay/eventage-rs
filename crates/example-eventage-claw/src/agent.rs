@@ -45,6 +45,15 @@ pub struct GroupAgent {
     pub cancelled: Arc<AtomicBool>,
 }
 
+// ── BusHook ───────────────────────────────────────────────────────────────────
+
+/// Called with each newly-spawned group `EventBus` so observability workers
+/// (JSONL exporter, replay server, etc.) can be attached at runtime.
+///
+/// `main.rs` populates this slot after the exporter is created; the default
+/// no-op means observability is simply not attached when the slot is empty.
+pub type BusHook = Arc<dyn Fn(EventBus) + Send + Sync>;
+
 // ── ClawAgent ─────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -56,6 +65,9 @@ pub struct ClawAgent {
     pub schedule_state: ScheduleState,
     pub config: ClawConfig,
     pub active_group: Arc<Mutex<String>>,
+    /// Hook invoked for every dynamically-spawned group bus so `main.rs` can
+    /// attach observability (exporter, replay) without restarting.
+    pub spawner_bus_hook: Arc<std::sync::Mutex<Option<BusHook>>>,
 }
 
 #[allow(dead_code)]
@@ -213,6 +225,12 @@ impl ClawAgentBuilder {
                 group_buses: group_buses.clone(),
             });
 
+        // Shared hook slot: populated by main.rs after the exporter is ready.
+        // Both ClawGroupSpawner and ClawAgent hold the same Arc so main.rs can
+        // set it once via claw.spawner_bus_hook and the spawner sees it immediately.
+        let spawner_bus_hook: Arc<std::sync::Mutex<Option<BusHook>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
         // Spawner used by SpawnGroupTool — holds everything needed to build a
         // new GroupAgent at runtime and insert it into the live routing table.
         let spawner: Arc<dyn AgentSpawner> = Arc::new(ClawGroupSpawner {
@@ -223,6 +241,7 @@ impl ClawAgentBuilder {
             schedule_state: schedule_state.clone(),
             session_id_prefix: self.session_id_prefix.clone(),
             tui_mode: self.tui_mode,
+            bus_hook: spawner_bus_hook.clone(),
         });
 
         // Build each group agent
@@ -262,6 +281,7 @@ impl ClawAgentBuilder {
             schedule_state,
             active_group: Arc::new(Mutex::new(active_group_name)),
             config,
+            spawner_bus_hook,
         }
     }
 }
@@ -281,6 +301,9 @@ struct ClawGroupSpawner {
     schedule_state: ScheduleState,
     session_id_prefix: String,
     tui_mode: bool,
+    /// Shared slot populated by `main.rs` after the exporter is created.
+    /// Called with the new bus so observability workers can be attached.
+    bus_hook: Arc<std::sync::Mutex<Option<BusHook>>>,
 }
 
 #[async_trait::async_trait]
@@ -335,6 +358,12 @@ impl AgentSpawner for ClawGroupSpawner {
         let agent = group_agent.agent;
         let ws = group_agent.worker_set;
         let bus = group_agent.bus;
+
+        // Attach observability (JSONL exporter, replay) to the new bus if the
+        // hook has been populated by main.rs.
+        if let Some(hook) = self.bus_hook.lock().unwrap().as_ref() {
+            hook(bus.clone());
+        }
 
         tokio::spawn(async move {
             spawn_group_workers(group_name.clone(), ws, bus);

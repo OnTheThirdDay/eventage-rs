@@ -132,8 +132,8 @@ impl Tool for SpawnGroupTool {
         ToolDefinition::function(
             "spawn_group",
             "Spawn a new sub-agent group at runtime with an isolated context and event bus. \
-             The agent starts immediately and can be reached via message_group. \
-             Only usable by the main group.",
+             The agent starts immediately. Use message_group to send it a task and receive \
+             its reply. Only usable by the main group.",
             json!({
                 "type": "object",
                 "properties": {
@@ -165,7 +165,7 @@ impl Tool for SpawnGroupTool {
         Ok(json!({
             "spawned": true,
             "name": name,
-            "message": format!("Agent '{name}' is running. Use message_group to communicate with it."),
+            "message": format!("Agent '{name}' is running. Use message_group to send it a task — it will block until the sub-agent replies (up to 30s)."),
         }))
     }
 }

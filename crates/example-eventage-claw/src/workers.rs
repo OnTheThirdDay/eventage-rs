@@ -258,10 +258,18 @@ impl EventWorker for ChannelOutputWorker {
 
 // ── RelayWorker ───────────────────────────────────────────────────────────────
 
-/// Subscribes to `claw.group.message` events on the shared bus.
+/// Subscribes to `claw.group.message` and `claw.group.reply` events on the
+/// shared bus.
 ///
-/// Routes the message payload to the target group's per-group bus as a
-/// `user.message` event, completing the EventBus-as-IPC pattern.
+/// `claw.group.message` — routes to the target group's per-group bus as an
+/// `agent.message`, completing the EventBus-as-IPC pattern.
+///
+/// `claw.group.reply` — when the original caller used `await_reply=false`
+/// (async delegation), routes the sub-agent's reply back to the caller's
+/// per-group bus as an `agent.message` so the caller is woken up and can
+/// deliver the result to the user.  When `await_reply=true` (sync), the
+/// calling tool is already blocked on `wait_for` watching the shared bus
+/// directly, so no routing is needed.
 ///
 /// Authorization rules:
 /// - Main groups may message any registered target group.
@@ -275,10 +283,20 @@ pub struct RelayWorker {
 #[async_trait]
 impl EventWorker for RelayWorker {
     fn subscribed_kinds(&self) -> Vec<String> {
-        vec![CLAW_GROUP_MESSAGE.to_string()]
+        vec![CLAW_GROUP_MESSAGE.to_string(), CLAW_GROUP_REPLY.to_string()]
     }
 
     async fn handle(&self, event: &Event, _bus: &EventBus) -> Result<(), WorkerError> {
+        match event.kind.as_str() {
+            k if k == CLAW_GROUP_MESSAGE => self.handle_message(event).await,
+            k if k == CLAW_GROUP_REPLY => self.handle_reply(event).await,
+            _ => Ok(()),
+        }
+    }
+}
+
+impl RelayWorker {
+    async fn handle_message(&self, event: &Event) -> Result<(), WorkerError> {
         let target = match event.payload["target_group"].as_str() {
             Some(t) => t,
             None => return Ok(()),
@@ -286,6 +304,7 @@ impl EventWorker for RelayWorker {
         let content = event.payload["content"].as_str().unwrap_or("");
         let source = event.payload["source_group"].as_str().unwrap_or("unknown");
         let msg_id = event.payload["message_id"].as_str().unwrap_or("");
+        let caller_awaits = event.payload["caller_awaits"].as_bool().unwrap_or(true);
 
         // Authorization: non-main groups may only relay to themselves.
         let is_main = self.main_groups.iter().any(|g| g == source);
@@ -309,12 +328,57 @@ impl EventWorker for RelayWorker {
                     "source_group": source,
                     "message_id": msg_id,
                     "via": "relay",
+                    "caller_awaits": caller_awaits,
                 }),
             ))
             .await
             .map_err(WorkerError::Bus)?;
         } else {
             debug!(target = %target, "RelayWorker: target group not found");
+        }
+
+        Ok(())
+    }
+
+    /// Route a sub-agent reply back to the caller's per-group bus — only when
+    /// the caller used `await_reply=false` (async).  Sync callers (`await_reply=true`)
+    /// are already blocked on `wait_for` on the shared bus and don't need routing.
+    async fn handle_reply(&self, event: &Event) -> Result<(), WorkerError> {
+        // Only route async replies; sync callers pick up CLAW_GROUP_REPLY directly.
+        let caller_awaited = event.payload["caller_awaited"].as_bool().unwrap_or(true);
+        if caller_awaited {
+            return Ok(());
+        }
+
+        let target = match event.payload["target_group"].as_str() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let source = event.payload["source_group"].as_str().unwrap_or("unknown");
+        let content = event.payload["content"].as_str().unwrap_or("");
+        let in_reply_to = event.payload["in_reply_to"].as_str().unwrap_or("");
+
+        debug!(
+            target = %target,
+            source = %source,
+            "RelayWorker: routing async reply to caller"
+        );
+
+        let target_bus = self.group_buses.read().await.get(target).cloned();
+        if let Some(bus) = target_bus {
+            bus.publish(Event::new(
+                kinds::AGENT_MESSAGE,
+                json!({
+                    "text": format!("[Reply from sub-agent '{source}']\n{content}"),
+                    "source_group": source,
+                    "message_id": in_reply_to,
+                    "via": "async_reply",
+                }),
+            ))
+            .await
+            .map_err(WorkerError::Bus)?;
+        } else {
+            debug!(target = %target, "RelayWorker: caller group not found for async reply");
         }
 
         Ok(())
@@ -353,6 +417,8 @@ struct RelayState {
 struct PendingReply {
     source_group: String,
     message_id: String,
+    /// Whether the caller is blocking on `wait_for` (true) or async (false).
+    caller_awaits: bool,
 }
 
 impl DelegationReplyWorker {
@@ -388,6 +454,7 @@ impl EventWorker for DelegationReplyWorker {
                 }
                 let source = event.payload["source_group"].as_str().unwrap_or("").to_string();
                 let msg_id = event.payload["message_id"].as_str().unwrap_or("").to_string();
+                let caller_awaits = event.payload["caller_awaits"].as_bool().unwrap_or(true);
                 if !msg_id.is_empty() {
                     debug!(
                         group = %self.group_name,
@@ -398,6 +465,7 @@ impl EventWorker for DelegationReplyWorker {
                     self.state.lock().await.pending.push_back(PendingReply {
                         source_group: source,
                         message_id: msg_id,
+                        caller_awaits,
                     });
                 }
             }
@@ -437,7 +505,7 @@ impl EventWorker for DelegationReplyWorker {
                         .map(|r| (r, state.last_content.take().unwrap_or_default()))
                 };
 
-                let Some((PendingReply { source_group, message_id }, content)) = reply_data else {
+                let Some((PendingReply { source_group, message_id, caller_awaits }, content)) = reply_data else {
                     return Ok(());
                 };
 
@@ -456,6 +524,9 @@ impl EventWorker for DelegationReplyWorker {
                             "source_group": self.group_name,
                             "content": content,
                             "in_reply_to": message_id,
+                            // Tells RelayWorker whether to push this back as
+                            // agent.message (async path) or leave it for wait_for (sync path).
+                            "caller_awaited": caller_awaits,
                         }),
                     ))
                     .await
