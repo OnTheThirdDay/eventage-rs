@@ -11,13 +11,15 @@ use crate::hooks::{HumanApprovalHook, SecurityGateHook};
 use crate::prompt::build_system_prompt;
 use crate::streaming::StreamingOpenAiProvider;
 use crate::tools::{
-    AddTaskTool, BrowserTool, CancelTaskTool, CompleteTaskTool, DockerRunCommandTool, EditFileTool,
-    GlobTool, GrepTool, GroupRegistry, ListGroupsTool, ListSessionTasksTool, ListTasksTool, LsTool,
-    MessageGroupTool, PauseTaskTool, ReadFileTool, RegisterGroupTool, ScheduleState,
-    ScheduleTaskTool, TaskState, UpdateTaskTool, WebFetchTool, WebSearchTool, WriteFileTool,
-    load_tasks, new_group_registry, new_task_state,
+    AddTaskTool, AgentSpawner, BrowserTool, CancelTaskTool, CompleteTaskTool,
+    DockerRunCommandTool, EditFileTool, GlobTool, GrepTool, GroupRegistry, ListGroupsTool,
+    ListSessionTasksTool, ListTasksTool, LsTool, MessageGroupTool, PauseTaskTool, ReadFileTool,
+    RegisterGroupTool, ScheduleState, ScheduleTaskTool, SpawnGroupTool, TaskState, UpdateTaskTool,
+    WebFetchTool, WebSearchTool, WriteFileTool, load_tasks, new_group_registry, new_task_state,
 };
-use crate::workers::{ChannelOutputWorker, DelegationReplyWorker, RelayWorker, SchedulerWorker};
+use crate::workers::{
+    ChannelOutputWorker, DelegationReplyWorker, GroupBuses, RelayWorker, SchedulerWorker,
+};
 use eventage::{
     agent::{ContextAssembler, DefaultContextAssembler},
     llm::OpenAiProvider,
@@ -26,7 +28,7 @@ use eventage::{
 };
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
@@ -186,10 +188,13 @@ impl ClawAgentBuilder {
             .map(|g| g.name.clone())
             .collect();
 
-        // Build per-group buses first so we can pass them to workers
-        let mut group_buses: HashMap<String, EventBus> = HashMap::new();
+        // Shared live map: group name → per-group EventBus.
+        // Arc<RwLock<…>> so dynamically spawned groups are immediately routable.
+        let group_buses: GroupBuses = Arc::new(RwLock::new(HashMap::new()));
         for g in &config.groups {
-            group_buses.insert(g.name.clone(), EventBus::new());
+            group_buses
+                .blocking_write()
+                .insert(g.name.clone(), EventBus::new());
         }
 
         // Build shared workers
@@ -203,12 +208,24 @@ impl ClawAgentBuilder {
                 group_buses: group_buses.clone(),
             });
 
+        // Spawner used by SpawnGroupTool — holds everything needed to build a
+        // new GroupAgent at runtime and insert it into the live routing table.
+        let spawner: Arc<dyn AgentSpawner> = Arc::new(ClawGroupSpawner {
+            config: Arc::new(config.clone()),
+            shared_bus: shared_bus.clone(),
+            group_buses: group_buses.clone(),
+            group_registry: group_registry.clone(),
+            schedule_state: schedule_state.clone(),
+            session_id_prefix: self.session_id_prefix.clone(),
+            tui_mode: self.tui_mode,
+        });
+
         // Build each group agent
         let mut groups: HashMap<String, GroupAgent> = HashMap::new();
         let active_group_name = config.groups.first().map(|g| g.name.clone()).unwrap_or_default();
 
         for group_config in &config.groups {
-            let group_bus = group_buses[&group_config.name].clone();
+            let group_bus = group_buses.blocking_read()[&group_config.name].clone();
             let session_id = format!("{}-{}", self.session_id_prefix, group_config.name);
             let task_state = new_task_state();
 
@@ -223,6 +240,7 @@ impl ClawAgentBuilder {
                 self.tui_mode,
                 session_id,
                 task_state,
+                spawner.clone(),
             );
 
             groups.insert(group_config.name.clone(), group_agent);
@@ -236,6 +254,103 @@ impl ClawAgentBuilder {
             active_group: Arc::new(Mutex::new(active_group_name)),
             config,
         }
+    }
+}
+
+// ── ClawGroupSpawner ──────────────────────────────────────────────────────────
+
+/// Implements [`AgentSpawner`] for the claw runtime.
+///
+/// Held by `SpawnGroupTool` (main group only). On `spawn()`, it builds a full
+/// `GroupAgent`, inserts the new bus into the shared routing table, and starts
+/// the agent task — all without restarting the process.
+struct ClawGroupSpawner {
+    config: Arc<ClawConfig>,
+    shared_bus: EventBus,
+    group_buses: GroupBuses,
+    group_registry: GroupRegistry,
+    schedule_state: ScheduleState,
+    session_id_prefix: String,
+    tui_mode: bool,
+}
+
+#[async_trait::async_trait]
+impl AgentSpawner for ClawGroupSpawner {
+    async fn spawn(&self, name: &str, system_prompt: Option<&str>) -> Result<(), String> {
+        // Reject duplicates.
+        if self.group_buses.read().await.contains_key(name) {
+            return Err(format!("group '{name}' already exists"));
+        }
+
+        let group_bus = EventBus::new();
+        let session_id = format!("{}-{}", self.session_id_prefix, name);
+        let task_state = new_task_state();
+
+        let group_config = GroupConfig {
+            name: name.to_string(),
+            is_main: false,
+            system_prompt_suffix: system_prompt.map(|s| s.to_string()),
+            human_approval_tools: vec![],
+            require_approve_all: false,
+            work_dir: None,
+            allowed_senders: vec![],
+        };
+
+        // Snapshot current group names for the new agent's MessageGroupTool hint.
+        let known_groups: Vec<String> = self.group_registry.lock().await.clone();
+
+        // No recursive spawning from spawned sub-agents — pass a no-op spawner.
+        let no_spawn: Arc<dyn AgentSpawner> = Arc::new(NoopSpawner);
+
+        let group_agent = build_group_agent(
+            &group_config,
+            &self.config,
+            group_bus.clone(),
+            self.shared_bus.clone(),
+            self.schedule_state.clone(),
+            self.group_registry.clone(),
+            &known_groups,
+            self.tui_mode,
+            session_id,
+            task_state,
+            no_spawn,
+        );
+
+        // Register in routing table before spawning so RelayWorker can route
+        // the very first message the main agent sends after spawn returns.
+        self.group_buses.write().await.insert(name.to_string(), group_bus);
+        self.group_registry.lock().await.push(name.to_string());
+
+        let group_name = name.to_string();
+        let agent = group_agent.agent;
+        let ws = group_agent.worker_set;
+        let bus = group_agent.bus;
+
+        tokio::spawn(async move {
+            let worker_bus = bus.clone();
+            let worker_name = group_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ws.run_on(worker_bus).await {
+                    tracing::warn!(group = %worker_name, "spawned group worker error: {e}");
+                }
+            });
+            if let Err(e) = agent.run().await {
+                tracing::warn!(group = %group_name, "spawned group agent exited: {e}");
+            }
+        });
+
+        info!(group = %name, "ClawGroupSpawner: sub-agent spawned");
+        Ok(())
+    }
+}
+
+/// Placeholder spawner for sub-agents that should not spawn further agents.
+struct NoopSpawner;
+
+#[async_trait::async_trait]
+impl AgentSpawner for NoopSpawner {
+    async fn spawn(&self, name: &str, _system_prompt: Option<&str>) -> Result<(), String> {
+        Err(format!("sub-agent cannot spawn further agents (requested: '{name}')"))
     }
 }
 
@@ -253,6 +368,7 @@ fn build_group_agent(
     tui_mode: bool,
     session_id: String,
     task_state: TaskState,
+    spawner: Arc<dyn AgentSpawner>,
 ) -> GroupAgent {
     let work_dir = config.group_work_dir(&group_config.name);
     let _ = std::fs::create_dir_all(&work_dir);
@@ -398,7 +514,8 @@ fn build_group_agent(
             })
             .tool(ListGroupsTool {
                 registry: group_registry.clone(),
-            });
+            })
+            .tool(SpawnGroupTool { spawner });
     }
 
     // ── Hook ──────────────────────────────────────────────────────────────────

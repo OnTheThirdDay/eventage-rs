@@ -13,7 +13,10 @@ pub mod web;
 pub use browser::BrowserTool;
 pub use docker::DockerRunCommandTool;
 pub use fs::{EditFileTool, GlobTool, GrepTool, LsTool, ReadFileTool, WriteFileTool};
-pub use group::{new_group_registry, GroupRegistry, ListGroupsTool, RegisterGroupTool};
+pub use group::{
+    new_group_registry, AgentSpawner, GroupRegistry, ListGroupsTool, RegisterGroupTool,
+    SpawnGroupTool,
+};
 pub use relay::MessageGroupTool;
 pub use schedule::{
     load_tasks, CancelTaskTool, ListTasksTool, PauseTaskTool, ScheduleState, ScheduleTaskTool,

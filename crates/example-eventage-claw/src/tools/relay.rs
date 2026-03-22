@@ -1,9 +1,10 @@
 //! Inter-group IPC tool — the key EventBus-as-IPC demonstration.
 //!
 //! `MessageGroupTool` lets an agent send a message to another named group.
-//! It publishes a `CLAW_GROUP_MESSAGE` event on the shared bus; the
-//! `RelayWorker` subscribes and routes it to the target group's per-group bus
-//! as a `user.message` event.
+//! It publishes a `CLAW_GROUP_MESSAGE` event on the shared bus; `RelayWorker`
+//! routes it to the target group's per-group bus as an `agent.message` event.
+//! When `await_reply=true`, the tool waits on the shared bus for a matching
+//! `CLAW_GROUP_REPLY` published by the target group's `DelegationReplyWorker`.
 
 use async_trait::async_trait;
 use eventage::{AgentError, Event, EventBus, Tool, ToolDefinition};
@@ -11,7 +12,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::kinds::CLAW_GROUP_MESSAGE;
+use crate::kinds::{CLAW_GROUP_MESSAGE, CLAW_GROUP_REPLY};
 
 pub struct MessageGroupTool {
     /// Shared bus — events published here are visible to all workers.
@@ -90,7 +91,7 @@ impl Tool for MessageGroupTool {
 
             let result = tokio::time::timeout(Duration::from_secs(30), async move {
                 bus.wait_for(|e: &Event| {
-                    e.kind == CLAW_GROUP_MESSAGE
+                    e.kind == CLAW_GROUP_REPLY
                         && e.payload["source_group"].as_str() == Some(&target_owned)
                         && e.payload["in_reply_to"].as_str() == Some(&msg_id_clone)
                 })

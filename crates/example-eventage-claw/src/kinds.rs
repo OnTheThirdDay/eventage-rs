@@ -25,6 +25,11 @@ pub const CLAW_SCHEDULE_UPDATE: &str = "claw.schedule.update";
 /// `RelayWorker` subscribes and routes the message to the target group's bus.
 pub const CLAW_GROUP_MESSAGE: &str = "claw.group.message";
 
+/// Published by `DelegationReplyWorker` when a sub-agent completes a relay request.
+/// `MessageGroupTool` (await_reply=true) waits for this on the shared bus.
+/// Kept separate from `CLAW_GROUP_MESSAGE` so `RelayWorker` never re-routes replies.
+pub const CLAW_GROUP_REPLY: &str = "claw.group.reply";
+
 /// Published by the TUI when the user switches the active group.
 pub const CLAW_GROUP_SWITCH: &str = "claw.group.switch";
 

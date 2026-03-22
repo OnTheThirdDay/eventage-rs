@@ -14,10 +14,17 @@ use eventage::{
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::kinds::{CLAW_GROUP_MESSAGE, CLAW_SCHEDULE_FIRE};
+/// Shared, live map of group name → per-group EventBus.
+///
+/// Wrapped in `Arc<RwLock<…>>` so dynamically spawned groups can be inserted
+/// at runtime and immediately become routable by `RelayWorker` and
+/// `SchedulerWorker` without restarting.
+pub type GroupBuses = Arc<RwLock<HashMap<String, EventBus>>>;
+
+use crate::kinds::{CLAW_GROUP_MESSAGE, CLAW_GROUP_REPLY, CLAW_SCHEDULE_FIRE};
 use crate::tools::schedule::{advance_schedule, ScheduleState};
 
 // ── SchedulerWorker ───────────────────────────────────────────────────────────
@@ -29,8 +36,7 @@ use crate::tools::schedule::{advance_schedule, ScheduleState};
 /// group's bus so the agent processes it.
 pub struct SchedulerWorker {
     pub state: ScheduleState,
-    /// Map from group name → per-group EventBus.
-    pub group_buses: HashMap<String, EventBus>,
+    pub group_buses: GroupBuses,
 }
 
 #[async_trait]
@@ -93,12 +99,13 @@ impl EventWorker for SchedulerWorker {
             .map_err(WorkerError::Bus)?;
 
             // Inject user.message into the target group's bus
-            let targets: Vec<&EventBus> = if let Some(ref g) = target_group {
-                self.group_buses.get(g).into_iter().collect()
+            let buses = self.group_buses.read().await;
+            let targets: Vec<EventBus> = if let Some(ref g) = target_group {
+                buses.get(g).cloned().into_iter().collect()
             } else {
-                // Fire in all groups if no target specified
-                self.group_buses.values().collect()
+                buses.values().cloned().collect()
             };
+            drop(buses);
 
             for group_bus in targets {
                 let _ = group_bus
@@ -260,8 +267,7 @@ impl EventWorker for ChannelOutputWorker {
 /// - Main groups may message any registered target group.
 /// - Non-main groups may only message themselves (same name as source_group).
 pub struct RelayWorker {
-    /// Map from group name → per-group EventBus.
-    pub group_buses: HashMap<String, EventBus>,
+    pub group_buses: GroupBuses,
     /// Names of groups with admin / main-group privileges.
     pub main_groups: Vec<String>,
 }
@@ -294,19 +300,19 @@ impl EventWorker for RelayWorker {
 
         debug!(target = %target, source = %source, "RelayWorker: routing message");
 
-        if let Some(target_bus) = self.group_buses.get(target) {
-            target_bus
-                .publish(Event::new(
-                    kinds::AGENT_MESSAGE,
-                    json!({
-                        "text": format!("[Agent '{}' says]\n{content}", source),
-                        "source_group": source,
-                        "message_id": msg_id,
-                        "via": "relay",
-                    }),
-                ))
-                .await
-                .map_err(WorkerError::Bus)?;
+        let target_bus = self.group_buses.read().await.get(target).cloned();
+        if let Some(bus) = target_bus {
+            bus.publish(Event::new(
+                kinds::AGENT_MESSAGE,
+                json!({
+                    "text": format!("[Agent '{}' says]\n{content}", source),
+                    "source_group": source,
+                    "message_id": msg_id,
+                    "via": "relay",
+                }),
+            ))
+            .await
+            .map_err(WorkerError::Bus)?;
         } else {
             debug!(target = %target, "RelayWorker: target group not found");
         }
@@ -321,16 +327,22 @@ impl EventWorker for RelayWorker {
 ///
 /// Closes the reply loop for `MessageGroupTool(await_reply=true)`:
 /// 1. Detects inbound relay requests (`agent.message` with `via: "relay"`)
-/// 2. Captures the agent's final response (`assistant.message` content)
-/// 3. On `agent.cycle.end`, publishes `CLAW_GROUP_MESSAGE` on the shared bus
-///    with `in_reply_to` set, unblocking the calling agent's `await_reply`.
+/// 2. On `agent.cycle.start`, marks the cycle as relay-triggered if one is pending
+/// 3. Captures `assistant.message` content during relay-triggered cycles only
+/// 4. On `agent.cycle.end` of a relay-triggered cycle, publishes `CLAW_GROUP_REPLY`
+///    on the shared bus, unblocking the calling agent's `await_reply`.
 ///
-/// A `VecDeque` queue handles back-to-back delegations arriving before the
-/// agent finishes its current cycle.
+/// Tracking relay-to-cycle correlation via `AGENT_CYCLE_START` prevents returning
+/// content from a concurrent non-relay cycle (e.g. an inbound WhatsApp message
+/// being processed at the same time as a delegation arrives).
 pub struct DelegationReplyWorker {
     pub shared_bus: EventBus,
     pub group_name: String,
+    /// Relay requests waiting for the next relay-triggered cycle.
     pending: Arc<Mutex<VecDeque<PendingReply>>>,
+    /// Set true when a cycle starts with a pending relay — cleared on cycle end.
+    in_relay_cycle: Arc<Mutex<bool>>,
+    /// Content captured from the current relay-triggered cycle's assistant message.
     last_content: Arc<Mutex<Option<String>>>,
 }
 
@@ -345,6 +357,7 @@ impl DelegationReplyWorker {
             shared_bus,
             group_name: group_name.into(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            in_relay_cycle: Arc::new(Mutex::new(false)),
             last_content: Arc::new(Mutex::new(None)),
         }
     }
@@ -355,6 +368,7 @@ impl EventWorker for DelegationReplyWorker {
     fn subscribed_kinds(&self) -> Vec<String> {
         vec![
             kinds::AGENT_MESSAGE.to_string(),
+            kinds::AGENT_CYCLE_START.to_string(),
             kinds::ASSISTANT_MESSAGE.to_string(),
             kinds::AGENT_CYCLE_END.to_string(),
         ]
@@ -363,7 +377,6 @@ impl EventWorker for DelegationReplyWorker {
     async fn handle(&self, event: &Event, _bus: &EventBus) -> Result<(), WorkerError> {
         match event.kind.as_str() {
             k if k == kinds::AGENT_MESSAGE => {
-                // Only track relay requests, not broadcasts from this group's own agent.
                 if event.payload.get("via").and_then(|v| v.as_str()) != Some("relay") {
                     return Ok(());
                 }
@@ -380,15 +393,33 @@ impl EventWorker for DelegationReplyWorker {
                 }
             }
 
+            k if k == kinds::AGENT_CYCLE_START => {
+                // Mark this cycle as relay-triggered if a request is already pending.
+                // Cycles that started before the relay arrived are not marked, so their
+                // content is never mistakenly routed as the reply.
+                let has_pending = !self.pending.lock().await.is_empty();
+                if has_pending {
+                    *self.in_relay_cycle.lock().await = true;
+                    *self.last_content.lock().await = None;
+                }
+            }
+
             k if k == kinds::ASSISTANT_MESSAGE => {
-                if let Some(content) = event.payload.get("content").and_then(|v| v.as_str()) {
-                    if !content.trim().is_empty() {
-                        *self.last_content.lock().await = Some(content.to_string());
+                if *self.in_relay_cycle.lock().await {
+                    if let Some(content) = event.payload.get("content").and_then(|v| v.as_str()) {
+                        if !content.trim().is_empty() {
+                            *self.last_content.lock().await = Some(content.to_string());
+                        }
                     }
                 }
             }
 
             k if k == kinds::AGENT_CYCLE_END => {
+                if !*self.in_relay_cycle.lock().await {
+                    return Ok(());
+                }
+                *self.in_relay_cycle.lock().await = false;
+
                 let reply = self.pending.lock().await.pop_front();
                 let Some(PendingReply { source_group, message_id }) = reply else {
                     return Ok(());
@@ -405,7 +436,7 @@ impl EventWorker for DelegationReplyWorker {
 
                 self.shared_bus
                     .publish(Event::new(
-                        CLAW_GROUP_MESSAGE,
+                        CLAW_GROUP_REPLY,
                         json!({
                             "target_group": source_group,
                             "source_group": self.group_name,

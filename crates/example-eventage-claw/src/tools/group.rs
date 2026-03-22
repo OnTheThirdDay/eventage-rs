@@ -8,6 +8,15 @@ use tokio::sync::Mutex;
 
 use crate::kinds::CLAW_GROUP_REGISTER;
 
+// ── AgentSpawner trait ────────────────────────────────────────────────────────
+
+/// Abstracts over the runtime agent-spawning logic so `SpawnGroupTool` does
+/// not need to import from `agent.rs` (which would create a circular dep).
+#[async_trait]
+pub trait AgentSpawner: Send + Sync {
+    async fn spawn(&self, name: &str, system_prompt: Option<&str>) -> Result<(), String>;
+}
+
 /// Shared runtime group registry (name → bool for "active").
 pub type GroupRegistry = Arc<Mutex<Vec<String>>>;
 
@@ -102,6 +111,61 @@ impl Tool for ListGroupsTool {
         Ok(json!({
             "groups": *registry,
             "count": registry.len(),
+        }))
+    }
+}
+
+// ── SpawnGroupTool ────────────────────────────────────────────────────────────
+
+/// Dynamically spawns a new sub-agent group at runtime.
+///
+/// The new agent gets its own isolated EventBus, the full tool set, and begins
+/// listening immediately — no restart required.  `message_group` can reach it
+/// the moment this tool returns.  Only the main group has this tool.
+pub struct SpawnGroupTool {
+    pub spawner: Arc<dyn AgentSpawner>,
+}
+
+#[async_trait]
+impl Tool for SpawnGroupTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "spawn_group",
+            "Spawn a new sub-agent group at runtime with an isolated context and event bus. \
+             The agent starts immediately and can be reached via message_group. \
+             Only usable by the main group.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Unique group name for the new agent (e.g. 'researcher', 'coder')."
+                    },
+                    "system_prompt": {
+                        "type": "string",
+                        "description": "System prompt that defines this agent's persona and task focus."
+                    }
+                },
+                "required": ["name", "system_prompt"]
+            }),
+        )
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value, AgentError> {
+        let name = args["name"]
+            .as_str()
+            .ok_or_else(|| AgentError::Tool("missing 'name'".into()))?;
+        let prompt = args["system_prompt"].as_str();
+
+        self.spawner
+            .spawn(name, prompt)
+            .await
+            .map_err(AgentError::Tool)?;
+
+        Ok(json!({
+            "spawned": true,
+            "name": name,
+            "message": format!("Agent '{name}' is running. Use message_group to communicate with it."),
         }))
     }
 }
