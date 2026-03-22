@@ -108,7 +108,14 @@ impl ClawAgent {
                 .map_err(ClawError::Worker)
         });
 
-        // Wait for any to finish (or error)
+        // Wait for any to finish (or error).
+        // select_all panics on an empty iterator — fall through to shared_handle only.
+        if handles.is_empty() {
+            return shared_handle
+                .await
+                .unwrap_or_else(|e| Err(ClawError::Tool(e.to_string())));
+        }
+
         tokio::select! {
             Some(r) = async {
                 futures_util::future::select_all(handles).await.0.ok()
@@ -223,7 +230,11 @@ impl ClawAgentBuilder {
         let active_group_name = config.groups.first().map(|g| g.name.clone()).unwrap_or_default();
 
         for group_config in &config.groups {
-            let group_bus = bus_map[&group_config.name].clone();
+            let Some(group_bus) = bus_map.get(&group_config.name) else {
+                tracing::error!(group = %group_config.name, "bug: missing bus for group — skipping");
+                continue;
+            };
+            let group_bus = group_bus.clone();
             let session_id = format!("{}-{}", self.session_id_prefix, group_config.name);
             let task_state = new_task_state();
 
@@ -275,11 +286,6 @@ struct ClawGroupSpawner {
 #[async_trait::async_trait]
 impl AgentSpawner for ClawGroupSpawner {
     async fn spawn(&self, name: &str, system_prompt: Option<&str>) -> Result<(), String> {
-        // Reject duplicates.
-        if self.group_buses.read().await.contains_key(name) {
-            return Err(format!("group '{name}' already exists"));
-        }
-
         let group_bus = EventBus::new();
         let session_id = format!("{}-{}", self.session_id_prefix, name);
         let task_state = new_task_state();
@@ -314,9 +320,15 @@ impl AgentSpawner for ClawGroupSpawner {
             no_spawn,
         );
 
-        // Register in routing table before spawning so RelayWorker can route
-        // the very first message the main agent sends after spawn returns.
-        self.group_buses.write().await.insert(name.to_string(), group_bus);
+        // Atomically check for duplicates and register — single write lock prevents
+        // TOCTOU races from concurrent spawn calls.
+        {
+            let mut buses = self.group_buses.write().await;
+            if buses.contains_key(name) {
+                return Err(format!("group '{name}' already exists"));
+            }
+            buses.insert(name.to_string(), group_bus);
+        }
         self.group_registry.lock().await.push(name.to_string());
 
         let group_name = name.to_string();
