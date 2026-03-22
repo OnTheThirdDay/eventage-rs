@@ -1,6 +1,6 @@
 use crate::error::BusError;
-use crate::event::{Event, EventId};
 use crate::event::kinds;
+use crate::event::{Event, EventId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock};
@@ -237,6 +237,9 @@ struct BusInner {
     /// Active subscriber senders. Dead connections are pruned on publish.
     subs: Mutex<Vec<SenderInner>>,
     config: BusConfig,
+    /// Synchronous transforms applied to each event at publish time, in order.
+    #[allow(clippy::type_complexity)]
+    transforms: Mutex<Vec<Box<dyn Fn(Event) -> Event + Send + Sync>>>,
 }
 
 impl EventBus {
@@ -251,8 +254,33 @@ impl EventBus {
                 store: RwLock::new(DagStore::new()),
                 subs: Mutex::new(Vec::new()),
                 config,
+                transforms: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Register a synchronous transform applied to every event at publish time,
+    /// before it is stored in the DAG and fanned out to subscribers.
+    ///
+    /// Transforms are applied in registration order and are composable. Typical
+    /// uses include secrets masking, payload normalization, or tagging.
+    ///
+    /// ```no_run
+    /// use eventage::{EventBus, secrets_masking_transform};
+    ///
+    /// let bus = EventBus::new();
+    /// bus.add_publish_transform(secrets_masking_transform(vec!["sk-secret".to_string()]));
+    /// ```
+    pub fn add_publish_transform(
+        &self,
+        f: impl Fn(Event) -> Event + Send + Sync + 'static,
+    ) -> &Self {
+        self.inner
+            .transforms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Box::new(f));
+        self
     }
 
     /// Dispatches an event to all subscribers, pruning dropped connections.
@@ -269,12 +297,32 @@ impl EventBus {
     // ── Core publish / subscribe ──────────────────────────────────────────────
 
     /// Appends an event to the active branch and distributes it.
+    ///
+    /// If the event already has `parent_event_id` set (via [`Event::with_parent`]),
+    /// that value is preserved. Otherwise the current active-branch tip is used.
+    ///
+    /// Registered publish transforms (see [`add_publish_transform`]) are applied
+    /// to the event before storage and fan-out.
     #[instrument(skip(self, event), fields(kind = %event.kind, id = %event.id))]
     pub async fn publish(&self, mut event: Event) -> Result<(), BusError> {
         debug!("publishing event");
+
+        {
+            let transforms = self
+                .inner
+                .transforms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for transform in transforms.iter() {
+                event = transform(event);
+            }
+        }
+
         {
             let mut store = self.inner.store.write().await;
-            event.parent_event_id = store.active_tip();
+            if event.parent_event_id.is_none() {
+                event.parent_event_id = store.active_tip();
+            }
             let id = event.id;
             store.nodes.insert(id, event.clone());
             store.active_path.push(id);
@@ -485,6 +533,47 @@ impl Default for EventBus {
     }
 }
 
+// ── Official publish transforms ───────────────────────────────────────────────
+
+/// Returns a publish transform that replaces each secret string with `"[REDACTED]"`
+/// in the serialized event payload before it is stored or fanned out.
+///
+/// Register it with [`EventBus::add_publish_transform`]:
+///
+/// ```no_run
+/// use eventage::{EventBus, secrets_masking_transform};
+///
+/// let bus = EventBus::new();
+/// bus.add_publish_transform(secrets_masking_transform(vec!["sk-secret".to_string()]));
+/// ```
+///
+/// The in-memory DAG stores the masked copy; the original secret value is
+/// never written to the JSONL event log or visible to subscribers.
+pub fn secrets_masking_transform(
+    secrets: Vec<String>,
+) -> impl Fn(Event) -> Event + Send + Sync + 'static {
+    move |mut event: Event| {
+        let non_empty: Vec<&str> = secrets
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_str())
+            .collect();
+        if non_empty.is_empty() {
+            return event;
+        }
+        // Serialize → string-replace → deserialize so all nested fields are covered.
+        if let Ok(mut text) = serde_json::to_string(&event.payload) {
+            for secret in &non_empty {
+                text = text.replace(secret, "[REDACTED]");
+            }
+            if let Ok(masked) = serde_json::from_str(&text) {
+                event.payload = masked;
+            }
+        }
+        event
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -634,7 +723,10 @@ mod tests {
                 .unwrap();
         });
 
-        let event = bus.wait_for(|e| e.kind == kinds::TOOL_RESULT).await.unwrap();
+        let event = bus
+            .wait_for(|e| e.kind == kinds::TOOL_RESULT)
+            .await
+            .unwrap();
         assert_eq!(event.kind, kinds::TOOL_RESULT);
     }
 

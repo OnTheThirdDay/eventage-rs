@@ -15,7 +15,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use eventage::{kinds as core_kinds, Event, EventBus};
+use eventage::{kinds as core_kinds, meta_keys, Event, EventBus};
 use futures_util::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
@@ -72,6 +72,8 @@ struct AppState {
     in_cycle: bool,
     /// Selected index in the group picker overlay.
     group_select_idx: usize,
+    /// Cumulative session token count (input + output combined).
+    session_tokens_total: u64,
 }
 
 impl AppState {
@@ -304,6 +306,17 @@ fn render(frame: &mut Frame, state: &AppState) {
         Span::raw("")
     };
 
+    let token_hint = if state.session_tokens_total > 0 {
+        let display = if state.session_tokens_total >= 1000 {
+            format!("  tokens: {:.1}k", state.session_tokens_total as f64 / 1000.0)
+        } else {
+            format!("  tokens: {}", state.session_tokens_total)
+        };
+        Span::styled(display, Style::default().fg(Color::DarkGray))
+    } else {
+        Span::raw("")
+    };
+
     let status_bar = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(
@@ -314,6 +327,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         ),
         status_text,
         task_hint,
+        token_hint,
         scroll_hint,
     ]))
     .block(
@@ -586,6 +600,14 @@ fn handle_bus_event(state: &mut AppState, event: &Event) {
         }
 
         k if k == core_kinds::ASSISTANT_MESSAGE => {
+            // Accumulate token counts from event metadata.
+            if let Some(v) = event.metadata.get(meta_keys::LLM_INPUT_TOKENS).and_then(|v| v.as_u64()) {
+                state.session_tokens_total += v;
+            }
+            if let Some(v) = event.metadata.get(meta_keys::LLM_OUTPUT_TOKENS).and_then(|v| v.as_u64()) {
+                state.session_tokens_total += v;
+            }
+
             if let Some(content) = event.payload["content"].as_str() {
                 if !content.is_empty() && state.stream_chars == 0 {
                     state.push(Line::from(""));
@@ -966,6 +988,7 @@ pub async fn run_tui(
         pending_stream_newline: false,
         in_cycle: false,
         group_select_idx: 0,
+        session_tokens_total: 0,
     };
 
     state.push(Line::from(vec![

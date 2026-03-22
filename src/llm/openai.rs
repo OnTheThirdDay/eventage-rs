@@ -66,6 +66,14 @@ struct CompletionRequest<'a> {
 #[derive(Deserialize, Debug)]
 struct CompletionResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Usage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -167,10 +175,17 @@ impl LlmProvider for OpenAiProvider {
             })
             .collect();
 
+        let (input_tokens, output_tokens) = completion
+            .usage
+            .map(|u| (u.prompt_tokens, u.completion_tokens))
+            .unwrap_or((None, None));
+
         Ok(LlmResponse {
             content: choice.message.content,
             tool_calls,
             finish_reason: choice.finish_reason,
+            input_tokens,
+            output_tokens,
         })
     }
 

@@ -2,6 +2,7 @@ use super::context::{AssemblyContext, ContextAssembler};
 use super::error::AgentError;
 use super::hook::CycleHook;
 use super::strategy::{AgentContext, ExecutionStrategy};
+use super::stuck::detect_stuck;
 use super::tool::{ToolRegistry, ToolSelector};
 use crate::event::{kinds, meta_keys, Event};
 use crate::bus::EventBus;
@@ -9,7 +10,7 @@ use crate::llm::LlmProvider;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, instrument};
+use tracing::{error, instrument, warn};
 use uuid::Uuid;
 
 /// The orchestrator driving tool execution and LLM reasoning.
@@ -68,6 +69,30 @@ impl Agent {
         let initial_messages = self.context.assemble(&initial_ctx).await;
         if initial_messages.is_empty() {
             return Ok(());
+        }
+
+        // ── Stuck detection ───────────────────────────────────────────────────
+        // Check the recent event log for loop patterns before committing to a
+        // new cycle. If a pattern is found, publish a hint event so the LLM
+        // can see it in context and try a different approach.
+        if let Some(analysis) = detect_stuck(&initial_events, 10) {
+            warn!(kind = ?analysis.kind, repeat_count = analysis.repeat_count, "stuck pattern detected");
+            let _ = self
+                .bus
+                .publish(
+                    Event::new(
+                        kinds::AGENT_STUCK,
+                        json!({
+                            "kind": format!("{:?}", analysis.kind),
+                            "repeat_count": analysis.repeat_count,
+                            "hint": "You appear to be repeating the same action or error. \
+                                     Try a different approach, use different arguments, \
+                                     or ask the user for clarification.",
+                        }),
+                    )
+                    .with_meta(meta_keys::AGENT_ID, json!(self.agent_id)),
+                )
+                .await;
         }
 
         let trace_id = Uuid::new_v4().to_string();

@@ -41,6 +41,16 @@ impl Event {
         self.metadata.insert(key.into(), value);
         self
     }
+
+    /// Set an explicit parent event ID on this event before publishing.
+    ///
+    /// By default [`EventBus::publish`](crate::EventBus::publish) sets `parent_event_id` to the
+    /// current branch tip. Use this builder to override that with a specific event ID — for
+    /// example, to link a tool result directly back to the call event that produced it.
+    pub fn with_parent(mut self, parent: EventId) -> Self {
+        self.parent_event_id = Some(parent);
+        self
+    }
 }
 
 /// Predefined event kinds used throughout the framework.
@@ -68,6 +78,18 @@ pub mod kinds {
     pub const AGENT_SPAWNED: &str = "agent.spawned";
     /// Emitted when an agent's execution successfully completes.
     pub const AGENT_COMPLETED: &str = "agent.completed";
+
+    // ── Self-correction ───────────────────────────────────────────────────────
+    /// Emitted before a cycle when the agent detects it is repeating the same
+    /// actions or errors. Payload includes `"kind"` and `"hint"` so the LLM
+    /// can read the event and try a different approach.
+    pub const AGENT_STUCK: &str = "agent.stuck";
+
+    // ── Context management ────────────────────────────────────────────────────
+    /// Emitted by [`SummarizingContextAssembler`](crate::SummarizingContextAssembler) when
+    /// old conversation history is summarized to keep the context window bounded.
+    /// Payload includes `"summary_len"`, `"summarized_events"`, and `"retained_events"`.
+    pub const AGENT_CONTEXT_SUMMARIZED: &str = "agent.context.summarized";
 }
 
 /// Standard metadata keys for [`Event::metadata`].

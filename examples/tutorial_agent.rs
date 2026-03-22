@@ -587,6 +587,8 @@ fn orchestrator_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Cycle 2 — researcher returned findings; delegate to reporter.
         LlmResponse {
@@ -601,6 +603,8 @@ fn orchestrator_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Cycle 3 — both specialist agents done; synthesise the final answer.
         LlmResponse {
@@ -616,6 +620,8 @@ fn orchestrator_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
     ])
 }
@@ -638,6 +644,8 @@ fn researcher_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Attempt 1 — step 2: empty results → give up (triggers rollback externally).
         LlmResponse {
@@ -647,6 +655,8 @@ fn researcher_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Attempt 2 — step 1: specific query after negative-context injection.
         LlmResponse {
@@ -661,6 +671,8 @@ fn researcher_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Attempt 2 — step 2: extract structured stats from search results.
         LlmResponse {
@@ -675,6 +687,8 @@ fn researcher_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Attempt 2 — step 3: summarise findings.
         LlmResponse {
@@ -689,6 +703,8 @@ fn researcher_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
     ])
 }
@@ -708,6 +724,8 @@ fn reporter_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Step 2: confirm report is ready.
         LlmResponse {
@@ -718,6 +736,8 @@ fn reporter_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
     ])
 }

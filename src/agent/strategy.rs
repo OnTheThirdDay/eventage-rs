@@ -7,7 +7,7 @@ use super::error::AgentError;
 use super::hook::{CycleHook, HookAction, HookContext};
 use super::tool::{ToolRegistry, ToolSelector};
 use async_trait::async_trait;
-use crate::event::{kinds, meta_keys, Event};
+use crate::event::{kinds, meta_keys, Event, EventId};
 use crate::bus::EventBus;
 use crate::llm::{types::ToolCall, LlmProvider};
 use serde_json::{json, Value};
@@ -110,21 +110,25 @@ pub async fn execute_tools(
         args: Value,
         skipped: bool,
         is_terminal: bool,
+        /// ID of the TOOL_CALL_PROPOSED event published for this call.
+        /// Used to set `parent_event_id` on the corresponding TOOL_RESULT event,
+        /// maintaining the causal chain in the event DAG.
+        proposed_event_id: EventId,
     }
 
     // ── Phase 1: sequential pre-flight ────────────────────────────────────
     let mut plan: Vec<ToolPlan> = Vec::with_capacity(calls.len());
     for tc in calls {
-        ctx.bus
-            .publish(ctx.event(
-                kinds::TOOL_CALL_PROPOSED,
-                json!({
-                    "tool_call_id": tc.id,
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments
-                }),
-            ))
-            .await?;
+        let proposed = ctx.event(
+            kinds::TOOL_CALL_PROPOSED,
+            json!({
+                "tool_call_id": tc.id,
+                "name": tc.function.name,
+                "arguments": tc.function.arguments
+            }),
+        );
+        let proposed_event_id = proposed.id;
+        ctx.bus.publish(proposed).await?;
 
         let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Null);
 
@@ -146,6 +150,7 @@ pub async fn execute_tools(
             args,
             skipped,
             is_terminal,
+            proposed_event_id,
         });
     }
 
@@ -228,9 +233,11 @@ pub async fn execute_tools(
             .unwrap_or(result_payload.clone());
         ctx.hooks.after_tool(hook_ctx, &p.name, &result_val).await;
 
-        ctx.bus
-            .publish(ctx.event(kinds::TOOL_RESULT, result_payload))
-            .await?;
+        // Link this result back to its originating call in the event DAG.
+        let result_event = ctx
+            .event(kinds::TOOL_RESULT, result_payload)
+            .with_parent(p.proposed_event_id);
+        ctx.bus.publish(result_event).await?;
 
         if p.is_terminal {
             had_terminal = true;
@@ -341,15 +348,23 @@ impl ExecutionStrategy for ReactStrategy {
                 .map(tool_call_to_json)
                 .collect();
 
-            ctx.bus
-                .publish(ctx.event(
+            let msg_event = ctx
+                .event(
                     kinds::ASSISTANT_MESSAGE,
                     json!({
                         "content": response.content,
                         "tool_calls": tool_calls_json
                     }),
-                ))
-                .await?;
+                )
+                .with_meta(
+                    meta_keys::LLM_INPUT_TOKENS,
+                    json!(response.input_tokens.unwrap_or(0)),
+                )
+                .with_meta(
+                    meta_keys::LLM_OUTPUT_TOKENS,
+                    json!(response.output_tokens.unwrap_or(0)),
+                );
+            ctx.bus.publish(msg_event).await?;
 
             if let Some(text) = &response.content {
                 info!("assistant: {}", text);

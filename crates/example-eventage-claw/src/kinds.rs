@@ -30,3 +30,7 @@ pub const CLAW_GROUP_SWITCH: &str = "claw.group.switch";
 
 /// Published by `RegisterGroupTool` when a new group is registered at runtime.
 pub const CLAW_GROUP_REGISTER: &str = "claw.group.register";
+
+/// Published by the session task tools when the in-session task list changes.
+/// Distinct from `CLAW_SCHEDULE_*` events which track time-based scheduled tasks.
+pub const CLAW_TASK_UPDATED: &str = "claw.task.updated";

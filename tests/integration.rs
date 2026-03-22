@@ -93,11 +93,15 @@ async fn tool_call_executes_and_loops() {
             extra_content: None,
         }],
         finish_reason: "tool_calls".to_string(),
+        input_tokens: None,
+        output_tokens: None,
     };
     let final_response = LlmResponse {
         content: Some("The echo returned: ping".to_string()),
         tool_calls: vec![],
         finish_reason: "stop".to_string(),
+        input_tokens: None,
+        output_tokens: None,
     };
 
     let bus = EventBus::new();
@@ -523,11 +527,15 @@ async fn dynamic_tool_add_visible_in_cycle() {
                     extra_content: None,
                 }],
                 finish_reason: "tool_calls".into(),
+                input_tokens: None,
+                output_tokens: None,
             },
             LlmResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                input_tokens: None,
+                output_tokens: None,
             },
         ]))
         .strategy(ReactStrategy::default());
@@ -634,11 +642,15 @@ async fn keyword_tool_selector_filters_definitions() {
                     extra_content: None,
                 }],
                 finish_reason: "tool_calls".into(),
+                input_tokens: None,
+                output_tokens: None,
             },
             LlmResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
+                input_tokens: None,
+                output_tokens: None,
             },
         ]))
         .tool(CounterTool {

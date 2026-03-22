@@ -313,6 +313,8 @@ impl LlmProvider for StreamingOpenAiProvider {
             },
             tool_calls,
             finish_reason,
+            input_tokens: None,
+            output_tokens: None,
         })
     }
 

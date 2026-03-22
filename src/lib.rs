@@ -61,6 +61,7 @@ pub mod sandbox;
 
 pub use bus::{
     BranchData, BranchEvictionStrategy, BranchId, BusConfig, BusReceiver, EventBus, PruneStrategy,
+    secrets_masking_transform,
 };
 pub use error::{BusError, CoreError};
 pub use event::{Event, EventId, kinds, meta_keys};
@@ -68,9 +69,10 @@ pub use event::{Event, EventId, kinds, meta_keys};
 pub use agent::{
     Agent, AgentBuilder, AgentContext, AgentError, AgentSet, AssemblyContext, ContextAssembler,
     CycleHook, DEFAULT_MAX_CONCURRENT_TOOLS, DEFAULT_MAX_REACT_STEPS, DefaultContextAssembler,
-    DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle, EventWorker, ExecutionStrategy, HookAction,
-    HookContext, KeywordToolSelector, NegativeAwareContextAssembler, ReactStrategy, Session,
-    SessionBuilder, SingleShotStrategy, Tool, ToolRegistry, ToolSelector, WorkerError, WorkerSet,
+    DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle, EventWorker, ExecutionStrategy,
+    HookAction, HookContext, KeywordToolSelector, NegativeAwareContextAssembler, ReactStrategy,
+    Session, SessionBuilder, SingleShotStrategy, SummarizingContextAssembler, Tool, ToolRegistry,
+    ToolSelector, WorkerError, WorkerSet, detect_stuck, StuckAnalysis, StuckKind,
 };
 
 pub use bridge::BusBridge;

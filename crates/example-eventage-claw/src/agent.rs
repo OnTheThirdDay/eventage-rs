@@ -11,16 +11,18 @@ use crate::hooks::{HumanApprovalHook, SecurityGateHook};
 use crate::prompt::build_system_prompt;
 use crate::streaming::StreamingOpenAiProvider;
 use crate::tools::{
-    BrowserTool, CancelTaskTool, DockerRunCommandTool, EditFileTool, GlobTool, GrepTool,
-    GroupRegistry, ListGroupsTool, ListTasksTool, LsTool, MessageGroupTool, PauseTaskTool,
-    ReadFileTool, RegisterGroupTool, ScheduleState, ScheduleTaskTool, UpdateTaskTool,
-    WebFetchTool, WebSearchTool, WriteFileTool, load_tasks, new_group_registry,
+    AddTaskTool, BrowserTool, CancelTaskTool, CompleteTaskTool, DockerRunCommandTool, EditFileTool,
+    GlobTool, GrepTool, GroupRegistry, ListGroupsTool, ListSessionTasksTool, ListTasksTool, LsTool,
+    MessageGroupTool, PauseTaskTool, ReadFileTool, RegisterGroupTool, ScheduleState,
+    ScheduleTaskTool, TaskState, UpdateTaskTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    load_tasks, new_group_registry, new_task_state,
 };
 use crate::workers::{ChannelOutputWorker, RelayWorker, SchedulerWorker};
 use eventage::{
     agent::{ContextAssembler, DefaultContextAssembler},
     llm::OpenAiProvider,
-    AgentBuilder, EventBus, RateLimitedProvider, ReactStrategy, WorkerSet,
+    secrets_masking_transform, AgentBuilder, EventBus, RateLimitedProvider, ReactStrategy,
+    WorkerSet,
 };
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -208,6 +210,7 @@ impl ClawAgentBuilder {
         for group_config in &config.groups {
             let group_bus = group_buses[&group_config.name].clone();
             let session_id = format!("{}-{}", self.session_id_prefix, group_config.name);
+            let task_state = new_task_state();
 
             let group_agent = build_group_agent(
                 group_config,
@@ -219,6 +222,7 @@ impl ClawAgentBuilder {
                 &group_names,
                 self.tui_mode,
                 session_id,
+                task_state,
             );
 
             groups.insert(group_config.name.clone(), group_agent);
@@ -248,6 +252,7 @@ fn build_group_agent(
     known_groups: &[String],
     tui_mode: bool,
     session_id: String,
+    task_state: TaskState,
 ) -> GroupAgent {
     let work_dir = config.group_work_dir(&group_config.name);
     let _ = std::fs::create_dir_all(&work_dir);
@@ -290,12 +295,15 @@ fn build_group_agent(
         Arc::new(UserCorrectionsAssembler::new(base, llm.clone()));
 
     let with_summary: Arc<dyn ContextAssembler> = if config.max_tokens > 0 {
-        Arc::new(SummarizingAssembler::new(
-            with_corrections,
-            llm.clone(),
-            config.max_tokens,
-            &session_id,
-        ))
+        Arc::new(
+            SummarizingAssembler::new(
+                with_corrections,
+                llm.clone(),
+                config.max_tokens,
+                &session_id,
+            )
+            .with_archive_dir("/tmp/claw-history"),
+        )
     } else {
         with_corrections
     };
@@ -310,7 +318,13 @@ fn build_group_agent(
     // and re-scans on every cycle, enabling new skills to be picked up immediately.
     let skills_dir = config.skills_dir();
     let final_assembler: Arc<dyn ContextAssembler> =
-        Arc::new(SkillsAssembler::new(with_memory, &skills_dir));
+        Arc::new(SkillsAssembler::new(with_memory, &skills_dir).with_llm(llm.clone()));
+
+    // ── Secrets masking ───────────────────────────────────────────────────────
+    // Redact the API key from all events stored in the bus (JSONL log, subscribers).
+    if !config.api_key.is_empty() {
+        group_bus.add_publish_transform(secrets_masking_transform(vec![config.api_key.clone()]));
+    }
 
     // ── AgentBuilder ──────────────────────────────────────────────────────────
     let mut builder = AgentBuilder::new()
@@ -370,7 +384,10 @@ fn build_group_agent(
             shared_bus: shared_bus.clone(),
             known_groups: known_groups.to_vec(),
             source_group: group_config.name.clone(),
-        });
+        })
+        .tool(AddTaskTool { state: task_state.clone(), bus: group_bus.clone() })
+        .tool(CompleteTaskTool { state: task_state.clone(), bus: group_bus.clone() })
+        .tool(ListSessionTasksTool { state: task_state });
 
     // ── Admin tools (main group only) ─────────────────────────────────────────
     if group_config.is_main {

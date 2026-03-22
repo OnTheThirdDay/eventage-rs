@@ -268,6 +268,8 @@ fn orchestrator_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
         // Cycle 2: synthesise the summariser's reply (arrives via agent.message).
         LlmResponse {
@@ -279,6 +281,8 @@ fn orchestrator_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
+            input_tokens: None,
+            output_tokens: None,
         },
     ])
 }
