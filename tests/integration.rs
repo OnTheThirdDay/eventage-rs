@@ -1,11 +1,13 @@
 use async_trait::async_trait;
-use eventage::{kinds, meta_keys, Event, EventBus};
-use eventage::llm::{ChatMessage, FunctionCall, LlmResponse, ToolCall, ToolDefinition, MockLlmProvider};
 use eventage::agent::{
-    AgentBuilder, AgentError, AssemblyContext, ContextAssembler, DynamicContextAssembler,
-    DynamicHookChain, KeywordToolSelector, ReactStrategy, Session, Tool,
-    CycleHook, HookAction, HookContext,
+    AgentBuilder, AgentError, AssemblyContext, ContextAssembler, CycleHook,
+    DynamicContextAssembler, DynamicHookChain, HookAction, HookContext, KeywordToolSelector,
+    ReactStrategy, Session, Tool,
 };
+use eventage::llm::{
+    ChatMessage, FunctionCall, LlmResponse, MockLlmProvider, ToolCall, ToolDefinition,
+};
+use eventage::{kinds, meta_keys, Event, EventBus};
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -668,8 +670,16 @@ async fn keyword_tool_selector_filters_definitions() {
     .unwrap();
     agent.cycle().await.unwrap();
 
-    assert_eq!(search_calls.load(Ordering::Relaxed), 1, "search_web should be called");
-    assert_eq!(write_calls.load(Ordering::Relaxed), 0, "write_file should not be called");
+    assert_eq!(
+        search_calls.load(Ordering::Relaxed),
+        1,
+        "search_web should be called"
+    );
+    assert_eq!(
+        write_calls.load(Ordering::Relaxed),
+        0,
+        "write_file should not be called"
+    );
 }
 
 #[tokio::test]
@@ -706,7 +716,9 @@ async fn dynamic_hook_chain_add_remove() {
     agent.cycle().await.unwrap();
     assert_eq!(step_count.load(Ordering::Relaxed), 0);
 
-    handle.add_hook(CountingHook { counter: step_count2 });
+    handle.add_hook(CountingHook {
+        counter: step_count2,
+    });
     agent.cycle().await.unwrap();
     assert!(
         step_count.load(Ordering::Relaxed) > 0,
@@ -756,7 +768,11 @@ async fn dynamic_context_assembler_swap() {
         .iter()
         .filter(|e| e.kind == kinds::ASSISTANT_MESSAGE)
         .collect();
-    assert_eq!(replies.len(), 2, "each cycle should produce one assistant.message");
+    assert_eq!(
+        replies.len(),
+        2,
+        "each cycle should produce one assistant.message"
+    );
 }
 
 // ── Session::run() — reactive mode tests ─────────────────────────────────────
@@ -844,7 +860,11 @@ struct SlowTool;
 #[async_trait]
 impl Tool for SlowTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function("slow", "sleeps", json!({ "type": "object", "properties": {} }))
+        ToolDefinition::function(
+            "slow",
+            "sleeps",
+            json!({ "type": "object", "properties": {} }),
+        )
     }
     async fn execute(&self, _args: Value) -> Result<Value, AgentError> {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -905,7 +925,9 @@ async fn tool_timeout_produces_error_result() {
         .iter()
         .find(|e| e.kind == kinds::TOOL_RESULT)
         .expect("no tool.result");
-    let err = result.payload["error"].as_str().expect("expected error field");
+    let err = result.payload["error"]
+        .as_str()
+        .expect("expected error field");
     assert!(err.contains("timed out"), "unexpected error: {err}");
 }
 
@@ -946,7 +968,12 @@ async fn deny_hook_surfaces_reason_to_model() {
     struct DenyHook;
     #[async_trait]
     impl CycleHook for DenyHook {
-        async fn before_tool(&self, _ctx: &HookContext<'_>, _name: &str, _args: &Value) -> HookAction {
+        async fn before_tool(
+            &self,
+            _ctx: &HookContext<'_>,
+            _name: &str,
+            _args: &Value,
+        ) -> HookAction {
             HookAction::Deny("writes are not allowed in read-only mode".into())
         }
     }
@@ -990,7 +1017,11 @@ async fn oversized_tool_results_are_middle_truncated() {
     #[async_trait]
     impl Tool for BigTool {
         fn definition(&self) -> ToolDefinition {
-            ToolDefinition::function("big", "returns a lot", json!({ "type": "object", "properties": {} }))
+            ToolDefinition::function(
+                "big",
+                "returns a lot",
+                json!({ "type": "object", "properties": {} }),
+            )
         }
         async fn execute(&self, _args: Value) -> Result<Value, AgentError> {
             Ok(json!(format!("HEAD{}TAIL", "x".repeat(10_000))))
@@ -1019,7 +1050,11 @@ async fn oversized_tool_results_are_middle_truncated() {
     let log = bus.log().await;
     let result = log.iter().find(|e| e.kind == kinds::TOOL_RESULT).unwrap();
     let text = result.payload["result"].as_str().unwrap();
-    assert!(text.len() < 2_000, "result should be capped, got {}", text.len());
+    assert!(
+        text.len() < 2_000,
+        "result should be capped, got {}",
+        text.len()
+    );
     assert!(text.contains("HEAD"), "head must be preserved");
     assert!(text.contains("TAIL"), "tail must be preserved");
     assert!(text.contains("elided by the harness"), "marker missing");
@@ -1034,7 +1069,9 @@ async fn max_steps_finalizes_with_wrapup_instead_of_error() {
     // the step budget.
     let agent = AgentBuilder::new()
         .bus(bus.clone())
-        .llm(MockLlmProvider::new(vec![tool_call_response("counter", "{}")]))
+        .llm(MockLlmProvider::new(vec![tool_call_response(
+            "counter", "{}",
+        )]))
         .tool(CounterTool {
             name: "counter".into(),
             calls: Arc::clone(&calls),
@@ -1058,7 +1095,11 @@ async fn max_steps_finalizes_with_wrapup_instead_of_error() {
         .next_back()
         .unwrap();
     assert_eq!(final_msg.payload["finalized_due_to"], "max_steps");
-    assert_eq!(calls.load(Ordering::Relaxed), 2, "budget of 2 steps ran 2 tools");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "budget of 2 steps ran 2 tools"
+    );
 }
 
 #[tokio::test]
@@ -1104,7 +1145,10 @@ async fn reasoning_content_is_preserved_on_bus() {
     agent.cycle().await.unwrap();
 
     let log = bus.log().await;
-    let msg = log.iter().find(|e| e.kind == kinds::ASSISTANT_MESSAGE).unwrap();
+    let msg = log
+        .iter()
+        .find(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .unwrap();
     assert_eq!(msg.payload["reasoning_content"], "6 times 7 is 42");
 
     // But reasoning must NOT be replayed into subsequent LLM requests.
@@ -1306,9 +1350,12 @@ async fn session_resumes_from_prior_bus() {
 
     // First session: build history.
     let bus = EventBus::new();
-    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "remember 42"})))
-        .await
-        .unwrap();
+    bus.publish(Event::new(
+        kinds::USER_MESSAGE,
+        json!({"text": "remember 42"}),
+    ))
+    .await
+    .unwrap();
     bus.publish(Event::new(
         kinds::ASSISTANT_MESSAGE,
         json!({"content": "noted: 42", "tool_calls": []}),
@@ -1416,4 +1463,168 @@ async fn provider_extra_round_trips_through_event_log() {
         msg.payload["provider_extra"]["anthropic_blocks"][0]["signature"],
         "sig123"
     );
+}
+
+// ── Roadmap-closure tests ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn multimodal_user_message_reaches_the_provider() {
+    use eventage::llm::{ContentPart, Role};
+    init_tracing();
+
+    // A provider that asserts the image survived assembly.
+    struct VisionProvider;
+    #[async_trait]
+    impl eventage::llm::LlmProvider for VisionProvider {
+        async fn complete(
+            &self,
+            messages: Vec<ChatMessage>,
+            _tools: Vec<ToolDefinition>,
+        ) -> Result<LlmResponse, eventage::llm::LlmError> {
+            let user = messages.iter().find(|m| m.role == Role::User).unwrap();
+            assert!(
+                user.is_multimodal(),
+                "image part must survive the event log"
+            );
+            assert_eq!(user.parts.len(), 2);
+            assert_eq!(user.parts[0].as_text(), Some("what is this?"));
+
+            // And it must serialize to the OpenAI content-array wire form.
+            let wire = serde_json::to_value(user).unwrap();
+            assert_eq!(wire["content"][1]["type"], "image_url");
+            assert_eq!(
+                wire["content"][1]["image_url"]["url"],
+                "data:image/png;base64,QUJD"
+            );
+
+            Ok(LlmResponse {
+                content: Some("a screenshot".into()),
+                finish_reason: "stop".into(),
+                ..Default::default()
+            })
+        }
+        fn model(&self) -> &str {
+            "vision"
+        }
+    }
+
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(VisionProvider)
+        .strategy(ReactStrategy::default())
+        .build();
+
+    let parts = vec![
+        ContentPart::text("what is this?"),
+        ContentPart::image_base64("image/png", "QUJD"),
+    ];
+    bus.publish(Event::new(
+        kinds::USER_MESSAGE,
+        json!({ "parts": serde_json::to_value(&parts).unwrap() }),
+    ))
+    .await
+    .unwrap();
+
+    agent.cycle().await.unwrap();
+    let log = bus.log().await;
+    assert!(log
+        .iter()
+        .any(|e| e.payload.get("content").and_then(|c| c.as_str()) == Some("a screenshot")));
+}
+
+#[tokio::test]
+async fn token_estimates_are_recorded_for_calibration() {
+    use eventage::agent::TokenCalibration;
+    init_tracing();
+
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![LlmResponse {
+            content: Some("hi".into()),
+            finish_reason: "stop".into(),
+            // Provider says the prompt really cost 900 tokens.
+            input_tokens: Some(900),
+            ..Default::default()
+        }]))
+        .system_prompt("You are helpful.")
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "hello"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    let log = bus.log().await;
+    let msg = log
+        .iter()
+        .find(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .unwrap();
+    let estimated = msg.metadata["llm_estimated_input_tokens"].as_u64().unwrap();
+    assert!(estimated > 0, "estimate must be recorded on the event");
+
+    // A calibration fed this log learns the estimator ran low.
+    let cal = TokenCalibration::new();
+    cal.observe_events(&log);
+    assert_eq!(cal.samples(), 1);
+    assert!(
+        cal.ratio() > 1.0,
+        "calibration should learn the estimate was too low, got {}",
+        cal.ratio()
+    );
+}
+
+#[tokio::test]
+async fn interrupted_tool_call_is_reconciled_before_the_next_cycle() {
+    use eventage::agent::recovery::{reconcile_interrupted_tools, ToolRecovery};
+    init_tracing();
+
+    // Simulate a restored log that crashed mid-tool-call.
+    let bus = EventBus::new();
+    bus.publish(Event::new(
+        kinds::USER_MESSAGE,
+        json!({"text": "deploy it"}),
+    ))
+    .await
+    .unwrap();
+    bus.publish(Event::new(
+        kinds::ASSISTANT_MESSAGE,
+        json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": { "name": "deploy", "arguments": "{}" }
+            }]
+        }),
+    ))
+    .await
+    .unwrap();
+    bus.publish(Event::new(
+        kinds::TOOL_CALL_PROPOSED,
+        json!({ "tool_call_id": "c1", "name": "deploy", "arguments": "{}" }),
+    ))
+    .await
+    .unwrap();
+    // …crash here: no tool.result was ever written.
+
+    let report = reconcile_interrupted_tools(&bus, &ToolRecovery::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(report.reported, 1);
+
+    // The history is now valid: the model sees a result for every call.
+    let log = bus.log().await;
+    let messages = eventage::agent::events_to_messages(&log);
+    let tool_msgs: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == eventage::llm::Role::Tool)
+        .collect();
+    assert_eq!(tool_msgs.len(), 1);
+    assert!(tool_msgs[0]
+        .content
+        .as_deref()
+        .unwrap()
+        .contains("UNKNOWN whether it took effect"));
 }

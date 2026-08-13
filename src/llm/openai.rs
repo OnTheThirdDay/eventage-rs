@@ -410,6 +410,45 @@ impl LlmProvider for OpenAiProvider {
         })
     }
 
+    /// Native structured output via `response_format: json_schema` (strict).
+    #[instrument(skip(self, messages, schema), fields(model = %self.model, schema_name = schema_name))]
+    async fn complete_structured(
+        &self,
+        messages: Vec<ChatMessage>,
+        schema_name: &str,
+        schema: serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        let mut body = self.build_body(&messages, vec![], false)?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "response_format".into(),
+                serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": { "name": schema_name, "strict": true, "schema": schema }
+                }),
+            );
+            // Tool calls and constrained decoding are mutually exclusive.
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
+
+        let resp = self.post(&body).await?;
+        let completion: CompletionResponse = resp.json().await.map_err(LlmError::Http)?;
+        let text = completion
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .unwrap_or_default();
+
+        super::structured::extract_json(&text).ok_or_else(|| {
+            LlmError::Structured(format!(
+                "model did not return JSON for schema '{schema_name}': {}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })
+    }
+
     #[instrument(skip(self, messages, tools, on_delta), fields(model = %self.model, messages = messages.len()))]
     async fn complete_stream(
         &self,

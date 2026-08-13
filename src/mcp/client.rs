@@ -16,6 +16,9 @@ use tracing::{debug, instrument, warn};
 /// HTTP request via the `MCP-Protocol-Version` header, as the spec requires.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Default time to wait for an elicitation answer from the bus.
+const ELICITATION_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Default end-to-end timeout for HTTP requests to an MCP server.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -113,6 +116,13 @@ enum Transport {
 pub struct McpClient {
     transport: Transport,
     id_gen: AtomicU64,
+    /// When set, server-initiated elicitation requests and `list_changed`
+    /// notifications are surfaced as bus events.
+    bus: Option<crate::bus::EventBus>,
+    /// Label used in emitted events.
+    server_label: String,
+    /// How long to wait for an `mcp.elicitation.response` before declining.
+    elicitation_timeout: Duration,
 }
 
 impl McpClient {
@@ -143,6 +153,9 @@ impl McpClient {
                 negotiated_version: Mutex::new(None),
             },
             id_gen: AtomicU64::new(1),
+            bus: None,
+            server_label: "mcp".to_string(),
+            elicitation_timeout: ELICITATION_TIMEOUT,
         };
         mcp.handshake().await?;
         Ok(mcp)
@@ -191,9 +204,37 @@ impl McpClient {
                 round_trip: Mutex::new(()),
             })),
             id_gen: AtomicU64::new(1),
+            bus: None,
+            server_label: program,
+            elicitation_timeout: ELICITATION_TIMEOUT,
         };
         mcp.handshake().await?;
         Ok(mcp)
+    }
+
+    /// Route server-initiated **elicitation requests** and **`list_changed`
+    /// notifications** onto an [`EventBus`](crate::EventBus).
+    ///
+    /// With a bus attached, an `elicitation/create` request from the server
+    /// is published as `mcp.elicitation.request` and the client waits for a
+    /// matching `mcp.elicitation.response` (declining on timeout) — the same
+    /// asynchronous, transport-agnostic pattern used for tool permissions.
+    /// `notifications/tools/list_changed` is published as `mcp.tools.changed`
+    /// so a worker can call `McpToolset::reload`.
+    ///
+    /// Currently effective for the stdio transport; HTTP servers deliver
+    /// server-initiated requests on a separate SSE channel that this client
+    /// does not yet open.
+    pub fn with_bus(mut self, bus: crate::bus::EventBus, server_label: impl Into<String>) -> Self {
+        self.bus = Some(bus);
+        self.server_label = server_label.into();
+        self
+    }
+
+    /// Override how long elicitation waits for an answer (default 120s).
+    pub fn with_elicitation_timeout(mut self, timeout: Duration) -> Self {
+        self.elicitation_timeout = timeout;
+        self
     }
 
     async fn handshake(&self) -> Result<(), McpError> {
@@ -202,7 +243,11 @@ impl McpClient {
                 "initialize",
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
+                    "capabilities": if self.bus.is_some() {
+                        json!({ "elicitation": {} })
+                    } else {
+                        json!({})
+                    },
                     "clientInfo": {
                         "name": "eventage-mcp",
                         "version": env!("CARGO_PKG_VERSION")
@@ -317,7 +362,7 @@ impl McpClient {
 
         let resp = match &self.transport {
             Transport::Http { .. } => self.http_round_trip(&req, method).await?,
-            Transport::Stdio(t) => Self::stdio_round_trip(t, &req, id).await?,
+            Transport::Stdio(t) => self.stdio_round_trip(t, &req, id).await?,
         };
 
         if let Some(err) = resp.error {
@@ -407,6 +452,7 @@ impl McpClient {
     }
 
     async fn stdio_round_trip(
+        &self,
         t: &StdioTransport,
         req: &JsonRpcRequest<'_>,
         id: u64,
@@ -442,10 +488,19 @@ impl McpClient {
             if trimmed.is_empty() {
                 continue;
             }
+
+            // Server-initiated traffic (requests and notifications) is
+            // interleaved with our responses on the same pipe.
+            if let Ok(incoming) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(method) = incoming.get("method").and_then(|m| m.as_str()) {
+                    self.handle_server_message(t, method, &incoming).await;
+                    continue;
+                }
+            }
+
             match serde_json::from_str::<JsonRpcResponse>(trimmed) {
                 Ok(resp) => {
-                    // Skip server-initiated notifications/requests; we only
-                    // want the response to *our* id (round-trips are
+                    // Only the response to *our* id counts (round-trips are
                     // serialized, so no other response can be in flight).
                     let matches = resp
                         .id
@@ -459,6 +514,127 @@ impl McpClient {
                 Err(e) => warn!("skipping unparseable MCP stdio line: {e}"),
             }
         }
+    }
+
+    /// Dispatch a server-initiated request or notification.
+    async fn handle_server_message(&self, t: &StdioTransport, method: &str, msg: &Value) {
+        match method {
+            "elicitation/create" => {
+                let id = msg.get("id").cloned();
+                let response = self.run_elicitation(msg.get("params")).await;
+                if let Some(id) = id {
+                    let reply = json!({ "jsonrpc": "2.0", "id": id, "result": response });
+                    if let Err(e) = Self::write_line(t, &reply).await {
+                        warn!("failed to answer elicitation: {e}");
+                    }
+                }
+            }
+            "notifications/tools/list_changed" => {
+                debug!(server = %self.server_label, "MCP server announced tools/list_changed");
+                if let Some(bus) = &self.bus {
+                    let _ = bus
+                        .publish(crate::event::Event::new(
+                            crate::event::kinds::MCP_TOOLS_CHANGED,
+                            json!({ "server": self.server_label }),
+                        ))
+                        .await;
+                }
+            }
+            other => {
+                debug!(method = other, "ignoring server-initiated MCP message");
+                // Unknown *requests* (those with an id) get a proper
+                // method-not-found error so the server is not left hanging.
+                if let Some(id) = msg.get("id") {
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32601, "message": format!("method '{other}' not supported by this client") }
+                    });
+                    let _ = Self::write_line(t, &reply).await;
+                }
+            }
+        }
+    }
+
+    /// Publish an elicitation request onto the bus and await the answer.
+    ///
+    /// Returns the MCP elicitation result object. Without a bus, or on
+    /// timeout, the request is declined — never silently accepted.
+    async fn run_elicitation(&self, params: Option<&Value>) -> Value {
+        let Some(bus) = &self.bus else {
+            return json!({ "action": "decline" });
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let message = params
+            .and_then(|p| p.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or_default();
+        let schema = params
+            .and_then(|p| p.get("requestedSchema"))
+            .cloned()
+            .unwrap_or(json!({}));
+
+        // Subscribe before publishing so a fast responder cannot be missed.
+        let mut rx = bus.subscribe();
+        let request = crate::event::Event::new(
+            crate::event::kinds::MCP_ELICITATION_REQUEST,
+            json!({
+                "request_id": request_id,
+                "server": self.server_label,
+                "message": message,
+                "schema": schema,
+            }),
+        );
+        if bus.publish(request).await.is_err() {
+            return json!({ "action": "decline" });
+        }
+
+        let deadline = tokio::time::Instant::now() + self.elicitation_timeout;
+        loop {
+            let event = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Err(_) => {
+                    warn!(server = %self.server_label, "elicitation timed out — declining");
+                    return json!({ "action": "decline" });
+                }
+                Ok(None) => return json!({ "action": "decline" }),
+                Ok(Some(e)) => e,
+            };
+            if event.kind != crate::event::kinds::MCP_ELICITATION_RESPONSE {
+                continue;
+            }
+            if event.payload.get("request_id").and_then(|v| v.as_str()) != Some(&request_id) {
+                continue;
+            }
+            let action = event
+                .payload
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("decline");
+            return match action {
+                "accept" => json!({
+                    "action": "accept",
+                    "content": event.payload.get("content").cloned().unwrap_or(json!({}))
+                }),
+                "cancel" => json!({ "action": "cancel" }),
+                _ => json!({ "action": "decline" }),
+            };
+        }
+    }
+
+    /// Write one newline-delimited JSON frame to the server's stdin.
+    async fn write_line(t: &StdioTransport, value: &Value) -> Result<(), McpError> {
+        let mut line = serde_json::to_string(value)?;
+        line.push('\n');
+        let mut stdin = t.stdin.lock().await;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| McpError::Transport(format!("stdio write: {e}")))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| McpError::Transport(format!("stdio flush: {e}")))?;
+        Ok(())
     }
 
     /// Sends a JSON-RPC notification (no response expected).
@@ -554,6 +730,74 @@ mod tests {
     fn sse_parsing_handles_missing_trailing_blank() {
         let events = sse_data_lines("data: {\"jsonrpc\":\"2.0\"}");
         assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn elicitation_round_trips_through_the_bus() {
+        // Server calls a tool, which triggers an elicitation request, then
+        // returns whatever the client answered.
+        let script = r#"
+import sys, json
+def send(o): print(json.dumps(o), flush=True)
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method")
+    if m == "notifications/initialized":
+        continue
+    rid = msg.get("id")
+    if m == "initialize":
+        send({"jsonrpc":"2.0","id":rid,"result":{"protocolVersion":"2025-06-18"}})
+    elif m == "tools/call":
+        # Ask the user for input mid-call.
+        send({"jsonrpc":"2.0","id":99,"method":"elicitation/create",
+              "params":{"message":"Which branch?","requestedSchema":{"type":"object"}}})
+        answer = json.loads(sys.stdin.readline())
+        content = answer.get("result",{}).get("content",{})
+        send({"jsonrpc":"2.0","id":rid,
+              "result":{"content":[{"type":"text","text":json.dumps(content)}]}})
+"#;
+        let bus = crate::bus::EventBus::new();
+        let client =
+            match McpClient::connect_stdio("python3", vec!["-c".into(), script.into()], vec![])
+                .await
+            {
+                Ok(c) => c.with_bus(bus.clone(), "test-server"),
+                Err(e) => {
+                    eprintln!("skipping elicitation test: {e}");
+                    return;
+                }
+            };
+
+        // Stand in for the UI: approve every elicitation with a value.
+        let responder_bus = bus.clone();
+        let mut rx = bus.subscribe();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if event.kind == crate::event::kinds::MCP_ELICITATION_REQUEST {
+                    assert_eq!(event.payload["message"], "Which branch?");
+                    assert_eq!(event.payload["server"], "test-server");
+                    let id = event.payload["request_id"].as_str().unwrap().to_string();
+                    responder_bus
+                        .publish(crate::event::Event::new(
+                            crate::event::kinds::MCP_ELICITATION_RESPONSE,
+                            json!({
+                                "request_id": id,
+                                "action": "accept",
+                                "content": { "branch": "main" }
+                            }),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let result = client.call_tool("anything", json!({})).await.unwrap();
+        let text = result.as_str().unwrap();
+        assert!(
+            text.contains("main"),
+            "elicited value should reach the server: {text}"
+        );
     }
 
     #[tokio::test]

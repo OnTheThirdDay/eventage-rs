@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use tracing::debug;
 
 use super::context::{AssemblyContext, ContextAssembler};
-use super::tokens::messages_token_count;
+use super::tokens::TokenCalibration;
 use crate::llm::types::{ChatMessage, Role};
 
 /// Wraps a [`ContextAssembler`] and clears old tool-result content once the
@@ -58,6 +58,8 @@ pub struct ToolResultClearingAssembler {
     /// Monotonic count of tool results (from the start of the conversation)
     /// whose content has been cleared.
     cleared: Mutex<usize>,
+    /// Learns the estimator's error from real provider usage.
+    calibration: Arc<TokenCalibration>,
 }
 
 impl ToolResultClearingAssembler {
@@ -67,6 +69,7 @@ impl ToolResultClearingAssembler {
             trigger_tokens,
             keep_recent: 5,
             cleared: Mutex::new(0),
+            calibration: Arc::new(TokenCalibration::new()),
         }
     }
 
@@ -74,6 +77,19 @@ impl ToolResultClearingAssembler {
     pub fn with_keep_recent(mut self, n: usize) -> Self {
         self.keep_recent = n;
         self
+    }
+
+    /// Share a [`TokenCalibration`] with other components (e.g. a
+    /// [`SummarizingContextAssembler`](crate::SummarizingContextAssembler)
+    /// wrapped around this one) so they learn from the same samples.
+    pub fn with_calibration(mut self, calibration: Arc<TokenCalibration>) -> Self {
+        self.calibration = calibration;
+        self
+    }
+
+    /// The calibration this assembler is using.
+    pub fn calibration(&self) -> Arc<TokenCalibration> {
+        Arc::clone(&self.calibration)
     }
 
     fn placeholder(original: &str) -> String {
@@ -112,13 +128,16 @@ impl ContextAssembler for ToolResultClearingAssembler {
     async fn assemble(&self, context: &AssemblyContext<'_>) -> Vec<ChatMessage> {
         let mut messages = self.inner.assemble(context).await;
 
+        // Learn from the provider's real prompt-token counts before deciding.
+        self.calibration.observe_events(context.events);
+
         let total_tool_results = messages.iter().filter(|m| m.role == Role::Tool).count();
         let mut cleared = self.cleared.lock().unwrap_or_else(|e| e.into_inner());
 
         // Always re-apply the ratchet so previously cleared results stay cleared.
         Self::apply_clearing(&mut messages, *cleared);
 
-        if messages_token_count(&messages) > self.trigger_tokens {
+        if self.calibration.count(&messages) > self.trigger_tokens {
             let target = total_tool_results.saturating_sub(self.keep_recent);
             if target > *cleared {
                 debug!(

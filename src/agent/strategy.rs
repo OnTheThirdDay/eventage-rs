@@ -6,10 +6,10 @@ use super::context::{AssemblyContext, ContextAssembler};
 use super::error::AgentError;
 use super::hook::{CycleHook, HookAction, HookContext};
 use super::tool::{ToolRegistry, ToolSelector};
-use async_trait::async_trait;
-use crate::event::{kinds, meta_keys, Event, EventId};
 use crate::bus::EventBus;
+use crate::event::{kinds, meta_keys, Event, EventId};
 use crate::llm::{types::ToolCall, LlmProvider};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -236,9 +236,9 @@ pub async fn execute_tools(
             Some(v) => Some(v),
             None if opts.validate_args => ctx.tools.get(&tc.function.name).and_then(|tool| {
                 let schema = tool.definition().function.parameters;
-                super::schema::validate_args(&schema, &args)
-                    .err()
-                    .map(|e| Veto::BadArgs(format!("{e}. Re-issue the call with corrected arguments.")))
+                crate::schema::validate_args(&schema, &args).err().map(|e| {
+                    Veto::BadArgs(format!("{e}. Re-issue the call with corrected arguments."))
+                })
             }),
             None => None,
         };
@@ -340,7 +340,9 @@ pub async fn execute_tools(
     let mut exec_results: HashMap<usize, Value> = HashMap::new();
     while let Some(join_result) = join_set.join_next().await {
         match join_result {
-            Ok((idx, payload)) => { exec_results.insert(idx, payload); }
+            Ok((idx, payload)) => {
+                exec_results.insert(idx, payload);
+            }
             Err(join_err) => warn!("tool task panicked: {}", join_err),
         }
     }
@@ -464,14 +466,21 @@ impl Default for ReactStrategy {
 
 /// Run the LLM call for a step, streaming deltas as ephemeral
 /// `assistant.delta` broadcasts when `stream` is enabled.
+///
+/// Returns the response together with the harness's pre-call token estimate,
+/// which is recorded on the resulting event so
+/// [`TokenCalibration`](super::tokens::TokenCalibration) can learn the
+/// estimator's error from the provider's real usage numbers.
 async fn call_llm(
     ctx: &AgentContext,
     messages: Vec<crate::llm::ChatMessage>,
     tool_defs: Vec<crate::llm::ToolDefinition>,
     stream: bool,
-) -> Result<crate::llm::LlmResponse, AgentError> {
+) -> Result<(crate::llm::LlmResponse, usize), AgentError> {
+    let estimated = super::tokens::messages_token_count(&messages);
     if !stream {
-        return Ok(ctx.llm.complete(messages, tool_defs).await?);
+        let response = ctx.llm.complete(messages, tool_defs).await?;
+        return Ok((response, estimated));
     }
     let bus = ctx.bus.clone();
     let agent_id = ctx.agent_id.clone();
@@ -490,7 +499,11 @@ async fn call_llm(
                 .with_meta(meta_keys::TRACE_ID, json!(trace_id)),
         );
     });
-    Ok(ctx.llm.complete_stream(messages, tool_defs, on_delta).await?)
+    let response = ctx
+        .llm
+        .complete_stream(messages, tool_defs, on_delta)
+        .await?;
+    Ok((response, estimated))
 }
 
 /// Publish an `assistant.message` event for `response`, carrying reasoning
@@ -498,6 +511,7 @@ async fn call_llm(
 async fn publish_assistant_message(
     ctx: &AgentContext,
     response: &crate::llm::LlmResponse,
+    estimated_input_tokens: usize,
     extra: Option<(&str, Value)>,
 ) -> Result<(), AgentError> {
     let tool_calls_json: Vec<Value> = response.tool_calls.iter().map(tool_call_to_json).collect();
@@ -525,6 +539,10 @@ async fn publish_assistant_message(
         .with_meta(
             meta_keys::LLM_OUTPUT_TOKENS,
             json!(response.output_tokens.unwrap_or(0)),
+        )
+        .with_meta(
+            meta_keys::LLM_ESTIMATED_INPUT_TOKENS,
+            json!(estimated_input_tokens),
         );
     if let Some(cached) = response.cached_input_tokens {
         msg_event = msg_event.with_meta(meta_keys::LLM_CACHED_INPUT_TOKENS, json!(cached));
@@ -554,73 +572,100 @@ impl ExecutionStrategy for ReactStrategy {
                 return self.finalize(ctx).await;
             }
 
-            let hook_ctx = HookContext {
-                agent_id: &ctx.agent_id,
-                trace_id: &ctx.trace_id,
-                step,
-                bus: &ctx.bus,
-            };
-
-            // ── before_step hook ──────────────────────────────────────────────
-            match ctx.hooks.before_step(&hook_ctx).await {
-                HookAction::Continue => {}
-                _ => return Ok(()),
-            }
-
-            // ── Assemble context ──────────────────────────────────────────────
-            let events = ctx.bus.log().await;
-            let assembly_ctx = AssemblyContext::new(&events);
-            let mut messages = ctx.assembler.assemble(&assembly_ctx).await;
-            if messages.is_empty() {
-                return Ok(());
-            }
-
-            // ── before_llm hook (may mutate messages) ─────────────────────────
-            match ctx.hooks.before_llm(&hook_ctx, &mut messages).await {
-                HookAction::Continue => {}
-                _ => return Ok(()),
-            }
-
-            // ── Select tools for this step ────────────────────────────────────
-            let tool_defs = if ctx.tools.is_empty() {
-                vec![]
-            } else if let Some(sel) = &ctx.tool_selector {
-                let all = ctx.tools.all_tools();
-                let selected = sel.select(&all, &messages).await;
-                selected.iter().map(|t| t.definition()).collect()
-            } else {
-                ctx.tools.definitions()
-            };
-
-            // ── LLM call ──────────────────────────────────────────────────────
-            let response = call_llm(ctx, messages, tool_defs, self.stream).await?;
-
-            publish_assistant_message(ctx, &response, None).await?;
-
-            if let Some(text) = &response.content {
-                info!("assistant: {}", text);
-            }
-
-            if response.tool_calls.is_empty() {
-                return Ok(());
-            }
-
-            // ── Execute tools (hooks + bounded concurrency) ───────────────────
             let opts = ToolExecOptions {
                 max_concurrent: self.max_concurrent_tools,
                 timeout: self.tool_timeout,
                 max_result_chars: self.max_tool_result_chars,
                 ..Default::default()
             };
-            let had_terminal =
-                execute_tools(ctx, &response.tool_calls, &hook_ctx, &opts).await?;
-
-            if had_terminal {
-                return Ok(());
+            match run_react_step(ctx, step, &opts, self.stream).await? {
+                StepOutcome::Done => return Ok(()),
+                // Tool results are now in the log; re-assemble and call again.
+                StepOutcome::Continue => {}
             }
-            // Loop: tool results are now in the log; re-assemble and call LLM.
         }
     }
+}
+
+/// What one ReAct step decided about the cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// The cycle is finished (final answer, terminal tool, or hook veto).
+    Done,
+    /// Tool results were produced; another step should run.
+    Continue,
+}
+
+/// Run a single ReAct step: hooks → assemble → LLM → publish → execute tools.
+///
+/// This is the primitive the ReAct loop iterates, exposed so alternative
+/// search strategies (see [`beam_search`](super::speculate::beam_search)) can
+/// drive step-by-step exploration over forked buses.
+pub async fn run_react_step(
+    ctx: &AgentContext,
+    step: usize,
+    opts: &ToolExecOptions,
+    stream: bool,
+) -> Result<StepOutcome, AgentError> {
+    let hook_ctx = HookContext {
+        agent_id: &ctx.agent_id,
+        trace_id: &ctx.trace_id,
+        step,
+        bus: &ctx.bus,
+    };
+
+    // ── before_step hook ──────────────────────────────────────────────
+    match ctx.hooks.before_step(&hook_ctx).await {
+        HookAction::Continue => {}
+        _ => return Ok(StepOutcome::Done),
+    }
+
+    // ── Assemble context ──────────────────────────────────────────────
+    let events = ctx.bus.log().await;
+    let assembly_ctx = AssemblyContext::new(&events);
+    let mut messages = ctx.assembler.assemble(&assembly_ctx).await;
+    if messages.is_empty() {
+        return Ok(StepOutcome::Done);
+    }
+
+    // ── before_llm hook (may mutate messages) ─────────────────────────
+    match ctx.hooks.before_llm(&hook_ctx, &mut messages).await {
+        HookAction::Continue => {}
+        _ => return Ok(StepOutcome::Done),
+    }
+
+    // ── Select tools for this step ────────────────────────────────────
+    let tool_defs = if ctx.tools.is_empty() {
+        vec![]
+    } else if let Some(sel) = &ctx.tool_selector {
+        let all = ctx.tools.all_tools();
+        let selected = sel.select(&all, &messages).await;
+        selected.iter().map(|t| t.definition()).collect()
+    } else {
+        ctx.tools.definitions()
+    };
+
+    // ── LLM call ──────────────────────────────────────────────────────
+    let (response, estimated) = call_llm(ctx, messages, tool_defs, stream).await?;
+
+    publish_assistant_message(ctx, &response, estimated, None).await?;
+
+    if let Some(text) = &response.content {
+        info!("assistant: {}", text);
+    }
+
+    if response.tool_calls.is_empty() {
+        return Ok(StepOutcome::Done);
+    }
+
+    // ── Execute tools (hooks + bounded concurrency) ───────────────────
+    let had_terminal = execute_tools(ctx, &response.tool_calls, &hook_ctx, opts).await?;
+
+    Ok(if had_terminal {
+        StepOutcome::Done
+    } else {
+        StepOutcome::Continue
+    })
 }
 
 impl ReactStrategy {
@@ -644,11 +689,12 @@ impl ReactStrategy {
             .with_name("harness"),
         );
 
-        let response = call_llm(ctx, messages, vec![], self.stream).await?;
+        let (response, estimated) = call_llm(ctx, messages, vec![], self.stream).await?;
         // Tool calls (if any slipped through) are recorded but never executed.
         publish_assistant_message(
             ctx,
             &response,
+            estimated,
             Some(("finalized_due_to", json!("max_steps"))),
         )
         .await?;
@@ -696,9 +742,10 @@ impl ExecutionStrategy for SingleShotStrategy {
             ctx.tools.definitions()
         };
 
+        let estimated = super::tokens::messages_token_count(&messages);
         let response = ctx.llm.complete(messages, tool_defs).await?;
 
-        publish_assistant_message(ctx, &response, None).await?;
+        publish_assistant_message(ctx, &response, estimated, None).await?;
 
         if let Some(text) = &response.content {
             info!("assistant: {}", text);

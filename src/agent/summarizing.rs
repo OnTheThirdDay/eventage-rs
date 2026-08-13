@@ -39,7 +39,7 @@ use crate::llm::LlmProvider;
 
 // ── Token estimation ──────────────────────────────────────────────────────────
 
-use super::tokens::messages_token_count;
+use super::tokens::TokenCalibration;
 
 fn split_by_role(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
     let (sys, conv): (Vec<_>, Vec<_>) = messages
@@ -142,6 +142,8 @@ pub struct SummarizingContextAssembler {
     /// `None` disables archiving.
     pub archive_dir: Option<PathBuf>,
     state: Mutex<Option<SummaryState>>,
+    /// Learns the estimator's error from real provider usage.
+    calibration: Arc<TokenCalibration>,
 }
 
 impl SummarizingContextAssembler {
@@ -165,8 +167,21 @@ impl SummarizingContextAssembler {
             keep_recent: 20,
             session_id: session_id.into(),
             archive_dir: None,
+            calibration: Arc::new(TokenCalibration::new()),
             state: Mutex::new(None),
         }
+    }
+
+    /// Share a [`TokenCalibration`] with other components so they learn from
+    /// the same samples.
+    pub fn with_calibration(mut self, calibration: Arc<TokenCalibration>) -> Self {
+        self.calibration = calibration;
+        self
+    }
+
+    /// The calibration this assembler is using.
+    pub fn calibration(&self) -> Arc<TokenCalibration> {
+        Arc::clone(&self.calibration)
     }
 
     /// Set the directory where archived (summarized-away) conversation history
@@ -298,6 +313,8 @@ impl ContextAssembler for SummarizingContextAssembler {
         }
 
         let messages = self.inner.assemble(context).await;
+        // Learn from the provider's real prompt-token counts before deciding.
+        self.calibration.observe_events(context.events);
         let (sys_msgs, conv_msgs) = split_by_role(&messages);
         let budget = (self.max_tokens as f64 * self.threshold) as usize;
 
@@ -312,7 +329,7 @@ impl ContextAssembler for SummarizingContextAssembler {
                 Self::build_candidate(&sys_msgs, state.as_ref(), &conv_msgs)
             };
 
-            if messages_token_count(&candidate) < budget {
+            if self.calibration.count(&candidate) < budget {
                 return candidate;
             }
 

@@ -124,6 +124,24 @@ pub mod kinds {
     /// is aborted. Payload: `{ "used_tokens", "max_tokens" }`.
     pub const BUDGET_EXHAUSTED: &str = "budget.exhausted";
 
+    // ── MCP ───────────────────────────────────────────────────────────────────
+    /// An MCP server asked the user for structured input (2025-06-18
+    /// elicitation). Payload: `{ "request_id", "server", "message", "schema" }`.
+    /// Answer by publishing [`MCP_ELICITATION_RESPONSE`].
+    pub const MCP_ELICITATION_REQUEST: &str = "mcp.elicitation.request";
+    /// Answer to an [`MCP_ELICITATION_REQUEST`].
+    /// Payload: `{ "request_id", "action": "accept"|"decline"|"cancel",
+    /// "content": { ... } }`.
+    pub const MCP_ELICITATION_RESPONSE: &str = "mcp.elicitation.response";
+    /// An MCP server announced that its tool list changed; re-run
+    /// `McpToolset::reload`. Payload: `{ "server" }`.
+    pub const MCP_TOOLS_CHANGED: &str = "mcp.tools.changed";
+
+    // ── Recovery ──────────────────────────────────────────────────────────────
+    /// Emitted after a resume reconciles tool calls that were interrupted by
+    /// a restart. Payload: `{ "interrupted_tool_calls", "replayed", "reported" }`.
+    pub const SYSTEM_RECOVERED: &str = "system.recovered";
+
     // ── Speculation ───────────────────────────────────────────────────────────
     /// Emitted after a speculative best-of-N round completes.
     /// Payload: `{ "candidates", "winner_index", "scores" }`.
@@ -146,6 +164,11 @@ pub mod meta_keys {
     pub const LLM_OUTPUT_TOKENS: &str = "llm_output_tokens";
     /// Prompt tokens served from the provider's cache in the last LLM interaction.
     pub const LLM_CACHED_INPUT_TOKENS: &str = "llm_cached_input_tokens";
+    /// Harness estimate of the prompt tokens for the request that produced
+    /// this message. Paired with [`LLM_INPUT_TOKENS`] it lets
+    /// [`TokenCalibration`](crate::agent::tokens::TokenCalibration) learn the
+    /// estimator's error online.
+    pub const LLM_ESTIMATED_INPUT_TOKENS: &str = "llm_estimated_input_tokens";
 }
 
 #[cfg(test)]

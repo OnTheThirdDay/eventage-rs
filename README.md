@@ -142,11 +142,19 @@ Three native providers, all streaming, all reasoning-aware:
 
 Compose freely: `RetryProvider::new(RateLimitedProvider::new(AnthropicProvider::new(...), 60))`.
 
-### 10. Skills, AGENTS.md, and Plugins
+### 10. Multimodal, Structured, and Recoverable
+- **Multimodal content** — `ContentPart` text/image parts flow from event payloads through the assembler to every provider's native format; the token estimator charges images.
+- **Self-calibrating token accounting** — every turn records its pre-call estimate next to the provider's real usage, and `TokenCalibration` learns the error online, so context budgets stop drifting.
+- **Typed structured output** — `llm.complete_as::<T>(messages, "name", schema)` with native constrained decoding (Chat Completions `response_format`, Anthropic forced tools, Responses `text.format`) and a prompted-JSON fallback for everything else.
+- **Crash recovery** — `reconcile_interrupted_tools` resolves calls orphaned by a restart under an explicit per-tool policy: at-most-once by default, opt-in replay for idempotent tools.
+- **Beam search** — `beam_search` speculates at every *step*, not just per cycle, pruning weak action sequences into rejected branches.
+- **Distributed bus** — `DistributedBus` + `TcpTransport` share one logical event stream across hosts with no broker and no extra dependencies; implement `BusTransport` for NATS/Redis/Kafka.
+
+### 11. Skills, AGENTS.md, and Plugins
 - **Skills** — drop Claude-compatible `SKILL.md` bundles in a directory; `SkillsLibrary` discovers them and the `skill` tool loads them on demand (progressive disclosure keeps the context lean).
 - **AGENTS.md / CLAUDE.md** — `load_project_context` (and its monorepo walk-up variant) injects project instructions into the system prompt.
 - **Plugins** — distributable directories with an `eventage-plugin.toml` manifest bundling skills, MCP servers (stdio or HTTP, auto-prefixed), and prompt fragments; `PluginHost::install` wires everything into an agent in one call.
-- **MCP 2025-06-18** — stdio + Streamable HTTP transports, session IDs, version negotiation with `MCP-Protocol-Version` echo, SSE responses, and `structuredContent` tool results.
+- **MCP 2025-06-18** — stdio + Streamable HTTP transports, session IDs, version negotiation with `MCP-Protocol-Version` echo, SSE responses, `structuredContent` tool results, plus **elicitation** and `tools/list_changed` notifications routed onto the bus.
 
 ---
 

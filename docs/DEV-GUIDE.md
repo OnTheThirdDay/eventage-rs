@@ -371,26 +371,120 @@ By embracing the event bus, Eventage brings complete predictability to highly un
 
 ---
 
-## 11. Roadmap
+## 11. Advanced Capabilities
 
-Known gaps, in priority order:
+### Multimodal content
 
-1. **Multimodal content** — `ChatMessage.content` is text-only; image/file
-   content blocks need a content-part model across events, assemblers, and
-   providers. The largest remaining gap.
-2. **Token-budget calibration** — feed actual `input_tokens` from responses
-   back into the estimator used by the summarizing/clearing assemblers,
-   replacing the chars÷4 heuristic.
-3. **Typed structured output** — `complete_as<T: Deserialize>()` sugar over
-   `with_json_schema` (schema generation via `schemars`).
-4. **Multi-round speculation** — tree search over the DAG: speculate per
-   ReAct step (not per cycle) with beam-style pruning; the primitives
-   (`EventBus::fork`, `adopt_rejected_branch`) already support it.
-5. **Exactly-once tool semantics on resume** — journal tool intents so a
-   crash between `tool.call.proposed` and `tool.result` can be reconciled on
-   restart (skip, replay, or synthesize an interrupted-result).
-6. **Distributed bus** — a `BusBridge` transport over NATS/Redis streams so
-   agents on different hosts share one logical DAG.
-7. **MCP elicitation & notifications** — map 2025-06-18 elicitation requests
-   onto the `permission.request`/`decision` bus pattern; use
-   `tools/list_changed` notifications to drive `McpToolset::reload`.
+`ChatMessage` carries either plain text or ordered `ContentPart`s (text +
+images, from a URL or inline base64). Publish a multimodal turn by putting
+parts in the event payload:
+
+```rust
+let parts = vec![
+    ContentPart::text("What regressed in this chart?"),
+    ContentPart::image_base64("image/png", &b64),
+];
+bus.publish(Event::new(kinds::USER_MESSAGE,
+    json!({ "parts": serde_json::to_value(&parts)? }))).await?;
+```
+
+Each provider maps parts to its own wire format (Chat Completions
+`image_url`, Anthropic `image` blocks, Responses `input_image`), and the
+token estimator charges images so they cannot silently blow a budget.
+
+### Token calibration
+
+Estimating tokens without the model's tokenizer is guesswork, so the harness
+*measures* its own error: every `assistant.message` records the pre-call
+estimate alongside the provider's real `input_tokens`, and `TokenCalibration`
+learns the ratio (EWMA, outlier-clamped). The summarizing and clearing
+assemblers calibrate themselves from the events they already receive — no
+wiring needed. Share one calibration across both with `with_calibration`.
+
+### Structured output
+
+`complete_structured` is object-safe and returns JSON; `complete_as::<T>()`
+adds typing and validates the result against the schema before deserializing:
+
+```rust
+let verdict: Verdict = llm.complete_as(messages, "verdict", schema).await?;
+```
+
+Native paths: Chat Completions `response_format`, Anthropic forced tool use,
+Responses `text.format`. Providers without native support fall back to
+prompted JSON with fenced-block extraction, so this works everywhere —
+including local models.
+
+### Crash recovery for interrupted tools
+
+A process that dies between `tool.call.proposed` and `tool.result` leaves an
+orphaned call. Call `reconcile_interrupted_tools` after restoring a log:
+
+```rust
+let policy = ToolRecovery::new().replay("read_*").fail("transfer_*");
+reconcile_interrupted_tools(&bus, &policy, Some(&registry)).await?;
+```
+
+True exactly-once is impossible without tool cooperation, so the policy is
+explicit per tool: `ReportInterrupted` (default, **at-most-once** — tells the
+model the outcome is unknown), `Replay` (**at-least-once**, idempotent tools
+only), or `Fail`. Reconciliation also repairs the history so providers stop
+rejecting the next request.
+
+### Beam search (per-step speculation)
+
+Where `best_of_n` speculates over whole cycles, `beam_search` speculates at
+every ReAct step — exploring *actions*, not just wordings:
+
+```rust
+let config = BeamConfig { candidates_per_step: 3, beam_width: 1, ..Default::default() };
+let outcome = beam_search(&bus, &config, &scorer, |fork, candidate| {
+    build_agent(fork, temperature_for(candidate))
+}).await?;
+```
+
+Every pruned trajectory is sealed as a rejected branch, feeding
+`NegativeAwareContextAssembler`. Cost scales with
+`beam_width × candidates_per_step` per step — use a cheap model to explore.
+
+### Distributed bus
+
+`DistributedBus` bridges a local `EventBus` onto a `BusTransport`; the
+built-in `TcpTransport` speaks newline-delimited JSON with no broker and no
+extra dependencies. Events carry an origin marker so nothing echoes, and
+`filter_kinds` keeps bulky local traffic off the wire.
+
+```rust
+DistributedBus::new(bus.clone(), TcpTransport::listen("0.0.0.0:7700").await?)
+    .with_node_id("orchestrator")
+    .filter_kinds(vec![kinds::AGENT_MESSAGE])
+    .spawn();
+```
+
+Ordering is per-connection, not global, and delivery is best-effort — treat
+it as a coordination and observation fabric, and keep one writer per logical
+conversation. Implement `BusTransport` for NATS/Redis/Kafka as needed.
+
+### MCP elicitation
+
+Attach a bus to an MCP client with `with_bus` and server-initiated
+elicitation requests become `mcp.elicitation.request` events answered by
+`mcp.elicitation.response` — the same asynchronous approval pattern as tool
+permissions. `notifications/tools/list_changed` surfaces as
+`mcp.tools.changed` to drive `McpToolset::reload`.
+
+---
+
+## 12. Roadmap
+
+- **Global ordering for the distributed bus** — the current transport is
+  best-effort and per-connection; consensus or a log-server would be needed
+  for a single authoritative cross-host branch.
+- **Schema generation** — `complete_as` takes an explicit JSON Schema;
+  deriving it from `T` (via `schemars`) would remove the duplication.
+- **Bounded active-path memory** — eviction currently applies to rejected
+  branches only, so a 24/7 single-session agent grows without bound.
+- **Richer multimodal input** — audio and document parts (images are
+  supported today), plus provider-accurate image token accounting.
+- **MCP resources, prompts, and sampling** — tools and elicitation are
+  covered; the remaining server primitives are not.

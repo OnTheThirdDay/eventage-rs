@@ -29,14 +29,16 @@
 
 // ── Always-on modules ─────────────────────────────────────────────────────────
 
-pub mod bus;
-pub mod event;
-pub mod error;
-pub mod llm;
 pub mod agent;
 pub mod bridge;
+pub mod bus;
+pub mod distributed;
+pub mod error;
+pub mod event;
 pub mod eviction;
+pub mod llm;
 pub mod plugin;
+pub mod schema;
 
 // ── Feature-gated modules ─────────────────────────────────────────────────────
 
@@ -61,33 +63,35 @@ pub mod sandbox;
 // ── Flat re-exports ───────────────────────────────────────────────────────────
 
 pub use bus::{
-    BranchData, BranchEvictionStrategy, BranchId, BusConfig, BusReceiver, EventBus, PruneStrategy,
-    secrets_masking_transform,
+    secrets_masking_transform, BranchData, BranchEvictionStrategy, BranchId, BusConfig,
+    BusReceiver, EventBus, PruneStrategy,
 };
 pub use error::{BusError, CoreError};
-pub use event::{Event, EventId, kinds, meta_keys};
+pub use event::{kinds, meta_keys, Event, EventId};
 
 pub use agent::{
-    Agent, AgentBuilder, AgentContext, AgentError, AgentSet, AssemblyContext, BranchScorer,
-    BudgetScope, ContextAssembler, CycleHook, DEFAULT_MAX_CONCURRENT_TOOLS,
-    DEFAULT_MAX_REACT_STEPS, DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,
+    best_of_n, detect_stuck, truncate_middle, Agent, AgentBuilder, AgentContext, AgentError,
+    AgentSet, AssemblyContext, BranchScorer, BudgetScope, ContextAssembler, CycleHook,
     DefaultContextAssembler, DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle,
     EventWorker, ExecutionStrategy, FnScorer, HookAction, HookContext, KeywordToolSelector,
     LlmJudgeScorer, NegativeAwareContextAssembler, PermissionPolicyHook, PermissionVerdict,
     ReactStrategy, Session, SessionBuilder, SingleShotStrategy, SpeculationCandidate,
-    SpeculationOutcome, SummarizingContextAssembler, TokenBudgetHook, Tool, ToolExecOptions,
-    ToolRegistry, ToolResultClearingAssembler, ToolSelector, WorkerError, WorkerSet, best_of_n,
-    detect_stuck, truncate_middle, StuckAnalysis, StuckKind,
+    SpeculationOutcome, StuckAnalysis, StuckKind, SummarizingContextAssembler, TokenBudgetHook,
+    Tool, ToolExecOptions, ToolRegistry, ToolResultClearingAssembler, ToolSelector, WorkerError,
+    WorkerSet, DEFAULT_MAX_CONCURRENT_TOOLS, DEFAULT_MAX_REACT_STEPS,
+    DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,
 };
 
 pub use bridge::{BusBridge, BRIDGE_HOPS_KEY};
+pub use distributed::{BusTransport, DistributedBus, TcpTransport};
 pub use eviction::{EpitaphStore, EpitaphStrategy};
 
 #[cfg(feature = "observability")]
 pub use observability::{BusObserver, JsonlExporter};
 
 pub use llm::{
-    AnthropicProvider, ChatMessage, LlmError, LlmProvider, LlmResponse, OpenAiProvider,
-    OpenAiResponsesProvider, RateLimitedProvider, RetryProvider, ToolCall, ToolDefinition,
+    AnthropicProvider, ChatMessage, ContentPart, ImageSource, LlmError, LlmProvider, LlmResponse,
+    OpenAiProvider, OpenAiResponsesProvider, RateLimitedProvider, RetryProvider, StructuredExt,
+    ToolCall, ToolDefinition,
 };
 pub use plugin::{Plugin, PluginError, PluginHost};

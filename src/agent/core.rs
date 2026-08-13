@@ -4,8 +4,8 @@ use super::hook::CycleHook;
 use super::strategy::{AgentContext, ExecutionStrategy};
 use super::stuck::detect_stuck;
 use super::tool::{ToolRegistry, ToolSelector};
-use crate::event::{kinds, meta_keys, Event};
 use crate::bus::EventBus;
+use crate::event::{kinds, meta_keys, Event};
 use crate::llm::LlmProvider;
 use serde_json::json;
 use std::sync::Arc;
@@ -126,6 +126,30 @@ impl Agent {
         result
     }
 
+    /// Execute a **single** reasoning step (assemble → LLM → tools) rather
+    /// than a whole cycle.
+    ///
+    /// This is the primitive used by step-level search strategies such as
+    /// [`beam_search`](super::speculate::beam_search); ordinary agents should
+    /// use [`cycle`](Self::cycle).
+    pub async fn step(
+        &self,
+        step: usize,
+        opts: &super::strategy::ToolExecOptions,
+    ) -> Result<super::strategy::StepOutcome, AgentError> {
+        let agent_ctx = AgentContext {
+            agent_id: self.agent_id.clone(),
+            trace_id: Uuid::new_v4().to_string(),
+            bus: self.bus.clone(),
+            llm: self.llm.clone(),
+            assembler: self.context.clone(),
+            tools: self.tools.clone(),
+            tool_selector: self.tool_selector.clone(),
+            hooks: self.hooks.clone(),
+        };
+        super::strategy::run_react_step(&agent_ctx, step, opts, false).await
+    }
+
     /// Continuously listens and reacts to incoming events.
     pub async fn run(&self) -> Result<(), AgentError> {
         // Subscribe before inspecting the log so we cannot miss events published
@@ -140,25 +164,24 @@ impl Agent {
         let mut consecutive_errors: u32 = 0;
         let mut last_error_at: Option<Instant> = None;
 
-        let run_cycle = |consecutive_errors: &mut u32,
-                         last_error_at: &mut Option<Instant>|
-         -> bool {
-            if *consecutive_errors == 0 {
-                return true;
-            }
-            let wait = Duration::from_secs(2u64.pow((*consecutive_errors).min(6) - 1));
-            last_error_at.is_none_or(|t| t.elapsed() >= wait)
-        };
+        let run_cycle =
+            |consecutive_errors: &mut u32, last_error_at: &mut Option<Instant>| -> bool {
+                if *consecutive_errors == 0 {
+                    return true;
+                }
+                let wait = Duration::from_secs(2u64.pow((*consecutive_errors).min(6) - 1));
+                last_error_at.is_none_or(|t| t.elapsed() >= wait)
+            };
 
         // If wake events were published to the bus before this subscription was
         // registered — e.g. an HTTP message that arrived during startup before
         // the agent task was scheduled — run an initial cycle.
-        let has_pending = self
-            .bus
-            .log()
-            .await
-            .iter()
-            .any(|e| matches!(e.kind.as_str(), kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT | kinds::SYSTEM_MESSAGE));
+        let has_pending = self.bus.log().await.iter().any(|e| {
+            matches!(
+                e.kind.as_str(),
+                kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT | kinds::SYSTEM_MESSAGE
+            )
+        });
         if has_pending {
             if let Err(e) = self.cycle().await {
                 if matches!(e, AgentError::Bus(_)) {

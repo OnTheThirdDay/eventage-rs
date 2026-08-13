@@ -231,12 +231,31 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
             }
             Role::User => {
                 in_leading_system = false;
-                let text = msg.content.as_deref().unwrap_or_default();
-                let text = match &msg.name {
-                    Some(name) => format!("[{name}] {text}"),
-                    None => text.to_string(),
-                };
-                input.push(json!({ "role": "user", "content": text }));
+                if msg.is_multimodal() {
+                    let mut parts: Vec<Value> = Vec::new();
+                    let mut named = msg.name.is_none();
+                    for part in &msg.parts {
+                        let mut json_part = part.to_responses_json();
+                        if !named {
+                            if let Some(text) = part.as_text() {
+                                json_part = json!({
+                                    "type": "input_text",
+                                    "text": format!("[{}] {text}", msg.name.as_deref().unwrap_or_default())
+                                });
+                                named = true;
+                            }
+                        }
+                        parts.push(json_part);
+                    }
+                    input.push(json!({ "role": "user", "content": parts }));
+                } else {
+                    let text = msg.content.as_deref().unwrap_or_default();
+                    let text = match &msg.name {
+                        Some(name) => format!("[{name}] {text}"),
+                        None => text.to_string(),
+                    };
+                    input.push(json!({ "role": "user", "content": text }));
+                }
             }
             Role::Assistant => {
                 in_leading_system = false;
@@ -391,6 +410,41 @@ impl LlmProvider for OpenAiResponsesProvider {
         let resp = self.post(&body).await?;
         let parsed: Value = resp.json().await.map_err(LlmError::Http)?;
         Ok(parse_response(&parsed))
+    }
+
+    /// Native structured output via the Responses `text.format` json_schema.
+    #[instrument(skip(self, messages, schema), fields(model = %self.model, schema_name = schema_name))]
+    async fn complete_structured(
+        &self,
+        messages: Vec<ChatMessage>,
+        schema_name: &str,
+        schema: Value,
+    ) -> Result<Value, LlmError> {
+        let mut body = self.build_body(&messages, &[], false);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "text".into(),
+                json!({
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "strict": true,
+                        "schema": schema
+                    }
+                }),
+            );
+        }
+
+        let resp = self.post(&body).await?;
+        let parsed: Value = resp.json().await.map_err(LlmError::Http)?;
+        let text = parse_response(&parsed).content.unwrap_or_default();
+
+        super::structured::extract_json(&text).ok_or_else(|| {
+            LlmError::Structured(format!(
+                "model did not return JSON for schema '{schema_name}': {}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })
     }
 
     #[instrument(skip(self, messages, tools, on_delta), fields(model = %self.model, messages = messages.len()))]

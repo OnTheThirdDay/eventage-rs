@@ -10,4 +10,6 @@ pub enum LlmError {
     EmptyResponse,
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("Structured output error: {0}")]
+    Structured(String),
 }

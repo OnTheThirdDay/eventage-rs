@@ -33,5 +33,31 @@ pub trait LlmProvider: Send + Sync {
         Ok(response)
     }
 
+    /// Complete with the output constrained to a JSON Schema.
+    ///
+    /// The default implementation is provider-agnostic: it appends schema
+    /// instructions to the prompt and extracts JSON from the reply, so every
+    /// provider (including local models) supports structured output. Native
+    /// providers override this to constrain decoding server-side.
+    ///
+    /// Prefer the typed [`complete_as`](super::StructuredExt::complete_as)
+    /// wrapper, which also validates the result against the schema.
+    async fn complete_structured(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        schema_name: &str,
+        schema: serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        messages.push(super::structured::json_instruction(schema_name, &schema));
+        let response = self.complete(messages, vec![]).await?;
+        let text = response.content.unwrap_or_default();
+        super::structured::extract_json(&text).ok_or_else(|| {
+            LlmError::Structured(format!(
+                "model did not return JSON for schema '{schema_name}': {}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })
+    }
+
     fn model(&self) -> &str;
 }

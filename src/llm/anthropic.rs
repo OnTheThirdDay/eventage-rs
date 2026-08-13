@@ -358,16 +358,40 @@ fn convert_messages(messages: &[ChatMessage], caching: bool) -> (Option<Value>, 
             }
             Role::User => {
                 in_leading_system = false;
-                let text = msg.content.as_deref().unwrap_or_default();
-                let text = match &msg.name {
-                    Some(name) => format!("[{name}] {text}"),
-                    None => text.to_string(),
-                };
-                push(
-                    "user",
-                    vec![json!({ "type": "text", "text": text })],
-                    &mut out,
-                );
+                if msg.is_multimodal() {
+                    // Map each part to its Anthropic block, prefixing the
+                    // sender name onto the first text block.
+                    let mut blocks: Vec<Value> = Vec::new();
+                    let mut named = msg.name.is_none();
+                    for part in &msg.parts {
+                        let mut block = part.to_anthropic_json();
+                        if !named {
+                            if let Some(text) = part.as_text() {
+                                block = json!({
+                                    "type": "text",
+                                    "text": format!(
+                                        "[{}] {text}",
+                                        msg.name.as_deref().unwrap_or_default()
+                                    )
+                                });
+                                named = true;
+                            }
+                        }
+                        blocks.push(block);
+                    }
+                    push("user", blocks, &mut out);
+                } else {
+                    let text = msg.content.as_deref().unwrap_or_default();
+                    let text = match &msg.name {
+                        Some(name) => format!("[{name}] {text}"),
+                        None => text.to_string(),
+                    };
+                    push(
+                        "user",
+                        vec![json!({ "type": "text", "text": text })],
+                        &mut out,
+                    );
+                }
             }
             Role::Assistant => {
                 in_leading_system = false;
@@ -483,6 +507,56 @@ impl LlmProvider for AnthropicProvider {
             read_u32("output_tokens"),
             read_u32("cache_read_input_tokens"),
         ))
+    }
+
+    /// Native structured output via forced single-tool use — the canonical
+    /// Anthropic technique: the schema becomes a tool's `input_schema` and
+    /// the model is required to call it, so the input *is* the result.
+    #[instrument(skip(self, messages, schema), fields(model = %self.model, schema_name = schema_name))]
+    async fn complete_structured(
+        &self,
+        messages: Vec<ChatMessage>,
+        schema_name: &str,
+        schema: Value,
+    ) -> Result<Value, LlmError> {
+        let (system, converted) = convert_messages(&messages, self.prompt_caching);
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": converted,
+            "tools": [{
+                "name": schema_name,
+                "description": format!("Return the structured '{schema_name}' result."),
+                "input_schema": schema,
+            }],
+            "tool_choice": { "type": "tool", "name": schema_name },
+        });
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(system) = system {
+                obj.insert("system".into(), system);
+            }
+            for (k, v) in &self.extra_body {
+                obj.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+
+        let resp = self.post(&body).await?;
+        let parsed: Value = resp.json().await.map_err(LlmError::Http)?;
+
+        parsed
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            })
+            .and_then(|b| b.get("input").cloned())
+            .ok_or_else(|| {
+                LlmError::Structured(format!(
+                    "model did not invoke the '{schema_name}' structured-output tool"
+                ))
+            })
     }
 
     #[instrument(skip(self, messages, tools, on_delta), fields(model = %self.model, messages = messages.len()))]

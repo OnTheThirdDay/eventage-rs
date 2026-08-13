@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use super::content::ContentPart;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -10,30 +12,114 @@ pub enum Role {
 }
 
 /// A single message in the chat history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Content is either plain [`content`](Self::content) text or, for multimodal
+/// messages, an ordered list of [`parts`](Self::parts). When `parts` is
+/// non-empty it takes precedence: serialization emits the OpenAI-style
+/// content array, and native providers map the parts to their own block
+/// formats.
+#[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: Role,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Multimodal content parts (text + images). Empty for text-only messages.
+    pub parts: Vec<ContentPart>,
     pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Provider-opaque blocks round-tripped through the event log so
     /// stateful reasoning survives multi-step tool loops — e.g. Anthropic
     /// thinking blocks (with signatures) or OpenAI Responses reasoning items
     /// (with encrypted content). Never serialized onto the OpenAI-compatible
     /// wire; native providers read it explicitly.
-    #[serde(skip_serializing, default)]
     pub provider_extra: Option<serde_json::Value>,
+}
+
+// Serialization targets the OpenAI Chat Completions wire format: `content` is
+// a bare string for text-only messages and an array of typed parts for
+// multimodal ones. `provider_extra` is harness-internal and never sent.
+impl Serialize for ChatMessage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let has_content = self.content.is_some() || !self.parts.is_empty();
+        let field_count = 1
+            + usize::from(has_content)
+            + usize::from(self.tool_calls.is_some())
+            + usize::from(self.tool_call_id.is_some())
+            + usize::from(self.name.is_some());
+
+        let mut state = serializer.serialize_struct("ChatMessage", field_count)?;
+        state.serialize_field("role", &self.role)?;
+        if !self.parts.is_empty() {
+            let parts: Vec<serde_json::Value> =
+                self.parts.iter().map(|p| p.to_openai_json()).collect();
+            state.serialize_field("content", &parts)?;
+        } else if let Some(text) = &self.content {
+            state.serialize_field("content", text)?;
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            state.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(id) = &self.tool_call_id {
+            state.serialize_field("tool_call_id", id)?;
+        }
+        if let Some(name) = &self.name {
+            state.serialize_field("name", name)?;
+        }
+        state.end()
+    }
+}
+
+/// Accepts `content` as either a string or an array of content parts.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContentField {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Deserialize)]
+struct ChatMessageRepr {
+    role: Role,
+    #[serde(default)]
+    content: Option<ContentField>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    provider_extra: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = ChatMessageRepr::deserialize(deserializer)?;
+        let (content, parts) = match repr.content {
+            Some(ContentField::Text(text)) => (Some(text), Vec::new()),
+            Some(ContentField::Parts(parts)) => {
+                let text = super::content::parts_to_text(&parts);
+                ((!text.is_empty()).then_some(text), parts)
+            }
+            None => (None, Vec::new()),
+        };
+        Ok(ChatMessage {
+            role: repr.role,
+            content,
+            parts,
+            tool_calls: repr.tool_calls,
+            tool_call_id: repr.tool_call_id,
+            name: repr.name,
+            provider_extra: repr.provider_extra,
+        })
+    }
 }
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
+            parts: Vec::new(),
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
@@ -45,6 +131,7 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
+            parts: Vec::new(),
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
@@ -56,6 +143,7 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
+            parts: Vec::new(),
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
@@ -67,6 +155,7 @@ impl ChatMessage {
     pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: Role::Assistant,
+            parts: Vec::new(),
             content,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
@@ -78,11 +167,62 @@ impl ChatMessage {
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
+            parts: Vec::new(),
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: None,
             provider_extra: None,
+        }
+    }
+
+    /// A user message with multimodal content (text and/or images).
+    ///
+    /// ```
+    /// use eventage::llm::{ChatMessage, ContentPart};
+    ///
+    /// let msg = ChatMessage::user_with_parts(vec![
+    ///     ContentPart::text("Describe this:"),
+    ///     ContentPart::image_url("https://example.com/a.png"),
+    /// ]);
+    /// ```
+    pub fn user_with_parts(parts: Vec<ContentPart>) -> Self {
+        let text = super::content::parts_to_text(&parts);
+        Self {
+            role: Role::User,
+            parts,
+            content: (!text.is_empty()).then_some(text),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            provider_extra: None,
+        }
+    }
+
+    /// Replace this message's content with multimodal parts.
+    pub fn with_parts(mut self, parts: Vec<ContentPart>) -> Self {
+        let text = super::content::parts_to_text(&parts);
+        self.content = (!text.is_empty()).then_some(text);
+        self.parts = parts;
+        self
+    }
+
+    /// `true` if this message carries any non-text content.
+    pub fn is_multimodal(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| !matches!(p, ContentPart::Text { .. }))
+    }
+
+    /// The message's content as content parts — synthesizing a single text
+    /// part for plain-text messages. Empty when there is no content.
+    pub fn content_parts(&self) -> Vec<ContentPart> {
+        if !self.parts.is_empty() {
+            return self.parts.clone();
+        }
+        match self.content.as_deref() {
+            Some(text) if !text.is_empty() => vec![ContentPart::text(text)],
+            _ => Vec::new(),
         }
     }
 

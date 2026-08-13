@@ -1,6 +1,7 @@
-use async_trait::async_trait;
 use crate::event::{kinds, Event, EventId};
 use crate::llm::types::{ChatMessage, FunctionCall, Role, ToolCall};
+use crate::llm::ContentPart;
+use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
 // ── AssemblyContext ───────────────────────────────────────────────────────────
@@ -90,6 +91,23 @@ fn apply_name(msg: ChatMessage, payload: &serde_json::Value) -> ChatMessage {
     }
 }
 
+/// Build a user message from a payload, honoring multimodal `parts`.
+///
+/// A payload may carry `{"text": "..."}` (text-only) and/or
+/// `{"parts": [ ... ]}` for images and interleaved content. When both are
+/// present, `parts` wins — publishers should include the text as a text part.
+fn user_message_from_payload(payload: &serde_json::Value) -> Option<ChatMessage> {
+    if let Some(parts) = payload.get("parts") {
+        if let Ok(parts) = serde_json::from_value::<Vec<ContentPart>>(parts.clone()) {
+            if !parts.is_empty() {
+                return Some(apply_name(ChatMessage::user_with_parts(parts), payload));
+            }
+        }
+    }
+    let text = payload.get("text").and_then(|v| v.as_str())?;
+    Some(apply_name(ChatMessage::user(text), payload))
+}
+
 /// Converts raw events to `ChatMessage`s.
 ///
 /// Includes a repair pass: if an `assistant` message declares `tool_calls` but
@@ -108,8 +126,7 @@ fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
     for event in events {
         match event.kind.as_str() {
             kinds::USER_MESSAGE => {
-                if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
-                    let msg = apply_name(ChatMessage::user(text), &event.payload);
+                if let Some(msg) = user_message_from_payload(&event.payload) {
                     messages.push(msg);
                 }
             }
@@ -187,14 +204,12 @@ fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
                 }
             }
             kinds::AGENT_MESSAGE => {
-                if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
-                    let msg = apply_name(ChatMessage::user(text), &event.payload);
+                if let Some(msg) = user_message_from_payload(&event.payload) {
                     messages.push(msg);
                 }
             }
             kinds::SYSTEM_MESSAGE => {
-                if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
-                    let msg = apply_name(ChatMessage::user(text), &event.payload);
+                if let Some(msg) = user_message_from_payload(&event.payload) {
                     messages.push(msg);
                 }
             }
@@ -209,10 +224,8 @@ fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("Loop");
                     messages.push(
-                        ChatMessage::user(format!(
-                            "[harness] Loop detected ({pattern}): {hint}"
-                        ))
-                        .with_name("loop_detector"),
+                        ChatMessage::user(format!("[harness] Loop detected ({pattern}): {hint}"))
+                            .with_name("loop_detector"),
                     );
                 }
             }

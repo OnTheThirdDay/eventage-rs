@@ -58,10 +58,11 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::core::Agent;
 use super::error::AgentError;
+use super::strategy::{StepOutcome, ToolExecOptions};
 use crate::bus::{BranchId, EventBus};
 use crate::event::{kinds, Event};
 use crate::llm::{ChatMessage, LlmProvider};
@@ -338,6 +339,231 @@ pub async fn best_of_n(
     })
 }
 
+// ── Beam search (per-step speculation) ────────────────────────────────────────
+
+/// Configuration for [`beam_search`].
+#[derive(Debug, Clone)]
+pub struct BeamConfig {
+    /// Candidate continuations sampled per surviving branch, per step.
+    pub candidates_per_step: usize,
+    /// How many branches survive each step (`1` = greedy best-of-N).
+    pub beam_width: usize,
+    /// Hard cap on steps before the best branch so far is accepted.
+    pub max_steps: usize,
+    /// Guardrails applied to tool execution inside each explored step.
+    pub tool_opts: ToolExecOptions,
+}
+
+impl Default for BeamConfig {
+    fn default() -> Self {
+        Self {
+            candidates_per_step: 3,
+            beam_width: 1,
+            max_steps: super::strategy::DEFAULT_MAX_REACT_STEPS,
+            tool_opts: ToolExecOptions::default(),
+        }
+    }
+}
+
+/// One live branch of the search.
+struct BeamMember {
+    bus: EventBus,
+    /// Events this branch added on top of the shared history.
+    events: Vec<Event>,
+    score: f64,
+    done: bool,
+}
+
+/// Explore the reasoning tree **one step at a time**, keeping the highest
+/// scoring branches and pruning the rest.
+///
+/// Where [`best_of_n`] speculates over whole cycles, `beam_search` speculates
+/// at every ReAct step: each surviving branch is forked
+/// `candidates_per_step` ways, one step is run on each fork, all resulting
+/// trajectories are scored, and only `beam_width` survive. Because a step
+/// includes tool execution, this explores *actions*, not just wordings —
+/// letting the agent try several tool strategies and keep whichever the
+/// scorer prefers.
+///
+/// The winner's events are spliced onto `bus`; every pruned trajectory is
+/// sealed as a rejected branch, so
+/// [`NegativeAwareContextAssembler`](crate::NegativeAwareContextAssembler)
+/// can feed the failures back into later turns.
+///
+/// **Cost warning**: this multiplies LLM calls by roughly
+/// `beam_width × candidates_per_step` per step. Use a cheap model or a small
+/// budget for exploration, and prefer `beam_width: 1` unless the scorer is
+/// genuinely discriminating.
+///
+/// `agent_factory` must build an agent context bound to the bus it is given;
+/// use it to vary temperature, model, or prompt across candidates (it
+/// receives the candidate index).
+pub async fn beam_search<F>(
+    bus: &EventBus,
+    config: &BeamConfig,
+    scorer: &dyn BranchScorer,
+    agent_factory: F,
+) -> Result<SpeculationOutcome, AgentError>
+where
+    F: Fn(EventBus, usize) -> Agent + Send + Sync + Clone + 'static,
+{
+    if config.candidates_per_step == 0 || config.beam_width == 0 {
+        return Err(AgentError::Tool(
+            "beam_search: candidates_per_step and beam_width must be >= 1".into(),
+        ));
+    }
+
+    let anchor = bus.log().await.last().map(|e| e.id);
+    let baseline = bus.log_len().await;
+
+    // The beam starts as a single branch: the current conversation.
+    let mut beam: Vec<BeamMember> = vec![BeamMember {
+        bus: bus.fork().await,
+        events: Vec::new(),
+        score: 0.0,
+        done: false,
+    }];
+    let mut pruned: Vec<Vec<Event>> = Vec::new();
+
+    for step in 1..=config.max_steps {
+        if beam.iter().all(|m| m.done) {
+            break;
+        }
+
+        let mut expanded: Vec<BeamMember> = Vec::new();
+        for member in &beam {
+            if member.done {
+                // Finished branches stay in the running unchanged.
+                expanded.push(BeamMember {
+                    bus: member.bus.clone(),
+                    events: member.events.clone(),
+                    score: member.score,
+                    done: true,
+                });
+                continue;
+            }
+
+            // Fan out: one fork per candidate continuation.
+            let mut join_set: JoinSet<(EventBus, Vec<Event>, bool)> = JoinSet::new();
+            for candidate in 0..config.candidates_per_step {
+                let parent_bus = member.bus.clone();
+                let factory = agent_factory.clone();
+                let opts = config.tool_opts.clone();
+                join_set.spawn(async move {
+                    let fork = parent_bus.fork().await;
+                    let from = fork.log_len().await;
+                    let agent = factory(fork.clone(), candidate);
+                    let outcome = agent.step(step, &opts).await;
+                    let new_events = fork.log_since(from).await;
+                    let done = !matches!(outcome, Ok(StepOutcome::Continue));
+                    (fork, new_events, done)
+                });
+            }
+
+            while let Some(joined) = join_set.join_next().await {
+                match joined {
+                    Ok((fork, new_events, done)) => {
+                        let mut events = member.events.clone();
+                        events.extend(new_events);
+                        expanded.push(BeamMember {
+                            bus: fork,
+                            events,
+                            score: 0.0,
+                            done,
+                        });
+                    }
+                    Err(e) => warn!("beam candidate panicked: {e}"),
+                }
+            }
+        }
+
+        if expanded.is_empty() {
+            break;
+        }
+
+        // Score every expanded branch on its full trajectory so far.
+        for member in &mut expanded {
+            member.score = scorer.score(&member.events).await;
+        }
+        expanded.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Prune: everything past the beam width is sealed as rejected.
+        let survivors: Vec<BeamMember> = expanded
+            .drain(..config.beam_width.min(expanded.len()))
+            .collect();
+        for loser in expanded {
+            if !loser.events.is_empty() {
+                pruned.push(loser.events);
+            }
+        }
+        debug!(
+            step,
+            survivors = survivors.len(),
+            pruned = pruned.len(),
+            best = survivors.first().map(|m| m.score).unwrap_or(0.0),
+            "beam step complete"
+        );
+        beam = survivors;
+    }
+
+    let winner = beam
+        .into_iter()
+        .max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| AgentError::Tool("beam_search: no surviving branch".into()))?;
+
+    // Splice the winner onto the main bus; seal the pruned trajectories.
+    let winner_event_count = winner.events.len();
+    let winner_score = winner.score;
+    for event in winner.events {
+        bus.publish(event).await?;
+    }
+    let mut rejected_branch_ids = Vec::new();
+    for events in pruned {
+        rejected_branch_ids.push(bus.adopt_rejected_branch(anchor, events).await);
+    }
+
+    info!(
+        score = winner_score,
+        events = winner_event_count,
+        pruned = rejected_branch_ids.len(),
+        "beam search complete"
+    );
+
+    bus.publish(Event::new(
+        kinds::SPECULATION_COMPLETED,
+        json!({
+            "mode": "beam_search",
+            "winner_name": "beam",
+            "winner_index": 0,
+            "scores": [winner_score],
+            "beam_width": config.beam_width,
+            "candidates_per_step": config.candidates_per_step,
+            "baseline_events": baseline,
+            "rejected_branches": rejected_branch_ids
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>(),
+        }),
+    ))
+    .await?;
+
+    Ok(SpeculationOutcome {
+        winner: 0,
+        winner_name: "beam".to_string(),
+        scores: vec![winner_score],
+        winner_event_count,
+        rejected_branch_ids,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +678,89 @@ mod tests {
 
         assert_eq!(outcome.winner_name, "works");
         assert_eq!(outcome.scores[0], f64::NEG_INFINITY);
+    }
+
+    #[tokio::test]
+    async fn beam_search_keeps_best_branch_and_seals_the_rest() {
+        use crate::agent::strategy::ToolExecOptions;
+
+        let bus = EventBus::new();
+        bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "solve"})))
+            .await
+            .unwrap();
+        let anchor = bus.log().await.last().unwrap().id;
+
+        // Candidate index decides the reply length, so scoring is deterministic.
+        let factory = |fork: EventBus, candidate: usize| {
+            let reply = match candidate {
+                0 => "short",
+                1 => "a considerably longer answer",
+                _ => "mid length",
+            };
+            AgentBuilder::new()
+                .agent_id(format!("cand-{candidate}"))
+                .bus(fork)
+                .llm(MockLlmProvider::with_texts([reply]))
+                .strategy(ReactStrategy::default())
+                .build()
+        };
+
+        let scorer = FnScorer::new(|events: &[Event]| {
+            events
+                .iter()
+                .rev()
+                .find_map(|e| e.payload.get("content").and_then(|c| c.as_str()))
+                .map(|c| c.len() as f64)
+                .unwrap_or(0.0)
+        });
+
+        let config = BeamConfig {
+            candidates_per_step: 3,
+            beam_width: 1,
+            max_steps: 3,
+            tool_opts: ToolExecOptions::default(),
+        };
+        let outcome = beam_search(&bus, &config, &scorer, factory).await.unwrap();
+
+        // Longest reply wins and lands on the active branch.
+        let log = bus.log().await;
+        let final_msg = log
+            .iter()
+            .filter(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+            .next_back()
+            .expect("winner message");
+        assert_eq!(
+            final_msg.payload["content"].as_str().unwrap(),
+            "a considerably longer answer"
+        );
+        assert!(outcome.scores[0] > 0.0);
+
+        // The two pruned candidates are available as negative context.
+        let rejected = bus.rejected_branches_from(anchor).await;
+        assert_eq!(rejected.len(), 2, "losing branches must be sealed");
+        assert!(log.iter().any(|e| e.kind == kinds::SPECULATION_COMPLETED));
+    }
+
+    #[tokio::test]
+    async fn beam_search_rejects_zero_width() {
+        use crate::agent::strategy::ToolExecOptions;
+        let bus = EventBus::new();
+        let config = BeamConfig {
+            candidates_per_step: 0,
+            beam_width: 1,
+            max_steps: 1,
+            tool_opts: ToolExecOptions::default(),
+        };
+        let err = beam_search(&bus, &config, &FnScorer::new(|_| 1.0), |fork, _| {
+            AgentBuilder::new()
+                .bus(fork)
+                .llm(MockLlmProvider::with_texts(["x"]))
+                .strategy(ReactStrategy::default())
+                .build()
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("must be >= 1"));
     }
 
     #[test]
