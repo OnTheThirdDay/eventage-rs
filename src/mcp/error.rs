@@ -16,4 +16,7 @@ pub enum McpError {
 
     #[error("no result returned by tool")]
     NoResult,
+
+    #[error("transport error: {0}")]
+    Transport(String),
 }

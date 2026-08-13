@@ -7,8 +7,10 @@ pub mod error;
 pub mod hook;
 pub mod multi;
 pub mod permission;
+pub mod project;
 pub mod schema;
 pub mod session;
+pub mod skills;
 pub mod speculate;
 pub mod strategy;
 pub mod stuck;
@@ -29,8 +31,10 @@ pub use error::AgentError;
 pub use hook::{CycleHook, DynamicHookChain, HookAction, HookContext};
 pub use multi::AgentSet;
 pub use permission::{glob_match, PermissionPolicyHook, PermissionVerdict};
+pub use project::{load_project_context, load_project_context_walkup, ProjectContext};
 pub use schema::validate_args;
 pub use session::{Session, SessionBuilder};
+pub use skills::{Skill, SkillTool, SkillsLibrary};
 pub use speculate::{
     best_of_n, BranchScorer, FnScorer, LlmJudgeScorer, SpeculationCandidate, SpeculationOutcome,
 };

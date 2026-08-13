@@ -36,6 +36,7 @@ pub mod llm;
 pub mod agent;
 pub mod bridge;
 pub mod eviction;
+pub mod plugin;
 
 // ── Feature-gated modules ─────────────────────────────────────────────────────
 
@@ -89,3 +90,4 @@ pub use llm::{
     AnthropicProvider, ChatMessage, LlmError, LlmProvider, LlmResponse, OpenAiProvider,
     OpenAiResponsesProvider, RateLimitedProvider, RetryProvider, ToolCall, ToolDefinition,
 };
+pub use plugin::{Plugin, PluginError, PluginHost};
