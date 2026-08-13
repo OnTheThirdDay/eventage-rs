@@ -239,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         .strategy(ReactStrategy {
             max_steps: 1,
             max_concurrent_tools: 4,
+            ..Default::default()
         })
         .build();
 

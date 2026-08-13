@@ -147,7 +147,7 @@ impl Agent {
                 return true;
             }
             let wait = Duration::from_secs(2u64.pow((*consecutive_errors).min(6) - 1));
-            last_error_at.map_or(true, |t| t.elapsed() >= wait)
+            last_error_at.is_none_or(|t| t.elapsed() >= wait)
         };
 
         // If wake events were published to the bus before this subscription was

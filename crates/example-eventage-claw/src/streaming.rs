@@ -260,8 +260,7 @@ impl LlmProvider for StreamingOpenAiProvider {
             content: if content.is_empty() { None } else { Some(content) },
             tool_calls,
             finish_reason,
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         })
     }
 

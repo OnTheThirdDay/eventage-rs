@@ -4,6 +4,16 @@
 //! directly from a running [`EventBus`]. Embed it to observe agent execution
 //! in real-time.
 //!
+//! # Security
+//!
+//! This is a **development tool**: it binds to `127.0.0.1` only, but is
+//! unauthenticated and `/events` exposes the complete event log (prompts,
+//! tool arguments, results). Do not port-forward or reverse-proxy it to an
+//! untrusted network; put it behind your own authenticating proxy if remote
+//! access is required, and register
+//! [`secrets_masking_transform`](crate::secrets_masking_transform) on the bus
+//! so credentials never enter the log in the first place.
+//!
 //! # Quick start
 //!
 //! ```rust,no_run

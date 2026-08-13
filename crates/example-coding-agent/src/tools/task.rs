@@ -96,6 +96,7 @@ impl Tool for TaskTool {
             .strategy(ReactStrategy {
                 max_steps: self.max_steps,
                 max_concurrent_tools: 4,
+                ..Default::default()
             });
 
         for tool in tools {

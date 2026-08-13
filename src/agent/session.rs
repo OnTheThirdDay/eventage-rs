@@ -29,12 +29,24 @@ pub struct SessionBuilder {
     max_steps: Option<usize>,
     max_concurrent_tools: Option<usize>,
     context_max_events: Option<usize>,
+    bus: Option<EventBus>,
 }
 
 impl SessionBuilder {
     /// Sets the LLM provider.
     pub fn llm(mut self, llm: impl LlmProvider + 'static) -> Self {
         self.llm = Some(Arc::new(llm));
+        self
+    }
+
+    /// Attach an existing [`EventBus`] instead of creating a fresh one.
+    ///
+    /// This is the durable-resume path: restore a persisted log (e.g. from
+    /// `SqliteEventStore::load_all` via `EventBus::restore_from`) and hand
+    /// the bus to the session — the agent continues the conversation with
+    /// full history.
+    pub fn bus(mut self, bus: EventBus) -> Self {
+        self.bus = Some(bus);
         self
     }
 
@@ -79,7 +91,7 @@ impl SessionBuilder {
     /// # Panics
     /// Panics if no LLM provider was set.
     pub fn build(self) -> Session {
-        let bus = EventBus::new();
+        let bus = self.bus.unwrap_or_default();
         let llm = self
             .llm
             .expect("Session::builder: llm provider is required");
@@ -87,6 +99,7 @@ impl SessionBuilder {
         let strategy = ReactStrategy {
             max_steps: self.max_steps.unwrap_or(20),
             max_concurrent_tools: self.max_concurrent_tools.unwrap_or(4),
+            ..Default::default()
         };
 
         // Build the context assembler using DefaultContextAssembler.

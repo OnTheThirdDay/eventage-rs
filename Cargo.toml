@@ -29,7 +29,7 @@ observability = []
 scheduler = []
 sqlite         = ["observability", "dep:rusqlite"]
 sqlite-bundled = ["sqlite", "rusqlite/bundled"]
-replay         = ["dep:axum", "dep:tower-http", "dep:futures-util"]
+replay         = ["dep:axum", "dep:tower-http"]
 mcp            = []
 sandbox        = []
 sandbox-wasm   = ["sandbox", "dep:wasmtime", "dep:wasmtime-wasi"]
@@ -62,12 +62,12 @@ thiserror    = "2"
 tracing      = "0.1"
 arc-swap     = "1"
 reqwest      = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
 
 # ── Feature-gated optional dependencies ──────────────────────────────────────
 
 axum         = { version = "0.7", optional = true }
 tower-http   = { version = "0.6", features = ["cors"], optional = true }
-futures-util = { version = "0.3", optional = true }
 rusqlite     = { version = "0.32", optional = true }
 
 wasmtime      = { version = "28", optional = true }
@@ -89,6 +89,7 @@ nix      = { version = "0.29", features = ["process", "signal", "user"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile           = "3"
 anyhow             = "1"
+tokio              = { version = "1", features = ["full", "test-util"] }
 
 [[example]]
 name = "basic_chat"

@@ -68,7 +68,16 @@ pub mod kinds {
     /// Emitted by [`EventBus::checkpoint`](crate::EventBus::checkpoint) to mark a safe rollback point.
     pub const CHECKPOINT: &str = "system.checkpoint";
     /// Emitted after a successful rollback to indicate a branch was rejected.
+    /// **Broadcast-only** (never stored in the DAG); see [`SYSTEM_ROLLBACK`]
+    /// for the durable record.
     pub const BRANCH_SEALED: &str = "system.branch_sealed";
+    /// Durable tombstone appended to the new active tip by
+    /// [`EventBus::rollback`](crate::EventBus::rollback). Records the branch
+    /// topology so persisted logs can be restored faithfully — without it, a
+    /// restore would resurrect rolled-back events into the active branch.
+    /// Payload: `{ "branch_id", "checkpoint_event_id", "parent_event_id"?,
+    /// "rejected_event_ids": [...] }`.
+    pub const SYSTEM_ROLLBACK: &str = "system.rollback";
     /// Emitted when evicted branches are removed from memory.
     ///
     /// Payload: `{ "evicted_branches": usize, "evicted_nodes": usize }`.
@@ -93,6 +102,32 @@ pub mod kinds {
     /// old conversation history is summarized to keep the context window bounded.
     /// Payload includes `"summary_len"`, `"summarized_events"`, and `"retained_events"`.
     pub const AGENT_CONTEXT_SUMMARIZED: &str = "agent.context.summarized";
+
+    // ── Streaming (ephemeral — broadcast only, never stored in the DAG) ──────
+    /// Incremental completion text emitted while an LLM response streams.
+    /// Payload: `{ "content": Option<str>, "reasoning_content": Option<str> }`.
+    /// Broadcast via [`EventBus::broadcast`](crate::EventBus::broadcast); the
+    /// complete text still arrives as a durable `assistant.message`.
+    pub const ASSISTANT_DELTA: &str = "assistant.delta";
+
+    // ── Governance ────────────────────────────────────────────────────────────
+    /// Emitted by `PermissionPolicyHook` when a tool call needs approval.
+    /// Payload: `{ "request_id", "tool", "arguments" }`.
+    pub const PERMISSION_REQUEST: &str = "permission.request";
+    /// Approval verdict for a pending `permission.request`.
+    /// Payload: `{ "request_id", "approve": bool, "reason"? }`.
+    pub const PERMISSION_DECISION: &str = "permission.decision";
+    /// Emitted by `TokenBudgetHook` when usage crosses the warn threshold.
+    /// Payload: `{ "used_tokens", "max_tokens" }`.
+    pub const BUDGET_WARNING: &str = "budget.warning";
+    /// Emitted by `TokenBudgetHook` when the budget is exhausted; the cycle
+    /// is aborted. Payload: `{ "used_tokens", "max_tokens" }`.
+    pub const BUDGET_EXHAUSTED: &str = "budget.exhausted";
+
+    // ── Speculation ───────────────────────────────────────────────────────────
+    /// Emitted after a speculative best-of-N round completes.
+    /// Payload: `{ "candidates", "winner_index", "scores" }`.
+    pub const SPECULATION_COMPLETED: &str = "speculation.completed";
 }
 
 /// Standard metadata keys for [`Event::metadata`].
@@ -109,6 +144,8 @@ pub mod meta_keys {
     pub const LLM_INPUT_TOKENS: &str = "llm_input_tokens";
     /// Completion tokens generated in the last LLM interaction.
     pub const LLM_OUTPUT_TOKENS: &str = "llm_output_tokens";
+    /// Prompt tokens served from the provider's cache in the last LLM interaction.
+    pub const LLM_CACHED_INPUT_TOKENS: &str = "llm_cached_input_tokens";
 }
 
 #[cfg(test)]

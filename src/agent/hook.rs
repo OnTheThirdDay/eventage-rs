@@ -37,6 +37,14 @@ pub enum HookAction {
     /// a synthetic skipped result for a vetoed tool call.
     Skip,
 
+    /// Vetoes a tool call and tells the model *why*.
+    ///
+    /// Unlike [`Skip`](Self::Skip), the reason is placed in the synthetic
+    /// `tool.result` so the LLM can adapt (pick another tool, adjust
+    /// arguments, or ask the user) instead of silently seeing a generic veto.
+    /// At other hook points this behaves like `Skip`.
+    Deny(String),
+
     /// Aborts the current cycle immediately.
     AbortCycle,
 }

@@ -153,10 +153,26 @@ fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
                     })
                     .unwrap_or_default();
 
-                if !tool_calls.is_empty() {
-                    messages.push(ChatMessage::assistant_with_tool_calls(content, tool_calls));
+                let provider_extra = event.payload.get("provider_extra").cloned();
+
+                let mut msg = if !tool_calls.is_empty() {
+                    Some(ChatMessage::assistant_with_tool_calls(content, tool_calls))
                 } else if let Some(text) = content {
-                    messages.push(ChatMessage::assistant(text));
+                    Some(ChatMessage::assistant(text))
+                } else if provider_extra.is_some() {
+                    // Reasoning-only turn (e.g. thinking followed by tool use
+                    // that got vetoed): keep the message so provider state
+                    // still round-trips. `tool_calls` stays None so the
+                    // OpenAI wire format remains valid.
+                    Some(ChatMessage::assistant(String::new()))
+                } else {
+                    None
+                };
+                if let (Some(m), Some(extra)) = (msg.as_mut(), provider_extra) {
+                    m.provider_extra = Some(extra);
+                }
+                if let Some(m) = msg {
+                    messages.push(m);
                 }
             }
             kinds::TOOL_RESULT => {
@@ -180,6 +196,24 @@ fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
                 if let Some(text) = event.payload.get("text").and_then(|v| v.as_str()) {
                     let msg = apply_name(ChatMessage::user(text), &event.payload);
                     messages.push(msg);
+                }
+            }
+            kinds::AGENT_STUCK => {
+                // Surface the loop-detection hint to the model. Without this the
+                // agent.stuck event exists only for observers and the LLM never
+                // learns it is looping.
+                if let Some(hint) = event.payload.get("hint").and_then(|v| v.as_str()) {
+                    let pattern = event
+                        .payload
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Loop");
+                    messages.push(
+                        ChatMessage::user(format!(
+                            "[harness] Loop detected ({pattern}): {hint}"
+                        ))
+                        .with_name("loop_detector"),
+                    );
                 }
             }
             _ => {}

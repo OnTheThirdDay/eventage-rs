@@ -323,6 +323,7 @@ impl CodingAgentBuilder {
             .strategy(ReactStrategy {
                 max_steps: self.max_steps,
                 max_concurrent_tools: 4,
+                ..Default::default()
             });
 
         // ── Register standard tools ──────────────────────────────────────────

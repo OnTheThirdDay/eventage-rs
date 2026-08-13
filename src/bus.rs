@@ -332,6 +332,17 @@ impl EventBus {
         Ok(())
     }
 
+    /// Broadcasts an **ephemeral** event to subscribers without storing it in
+    /// the DAG log.
+    ///
+    /// Use for high-frequency signals that must never enter the LLM context or
+    /// the persisted history: streaming deltas (`assistant.delta`), progress
+    /// ticks, UI hints. Durable facts belong in [`publish`](Self::publish).
+    pub fn broadcast(&self, event: Event) {
+        let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
+        Self::fan_out(&mut subs, event);
+    }
+
     /// Grants a new subscription channel for future events.
     pub fn subscribe(&self) -> BusReceiver {
         let cap = self.inner.config.subscriber_capacity;
@@ -394,9 +405,14 @@ impl EventBus {
     /// Reverts the active branch to immediately prior to `checkpoint_event_id`.
     ///
     /// Converts discarded events into an immutable rejected branch and triggers GC.
+    /// Appends a durable `system.rollback` tombstone to the new active tip so
+    /// persisted logs can be restored with the correct branch topology (see
+    /// [`restore_from`](Self::restore_from)).
     /// Returns the new `BranchId`. Err if the checkpoint is undiscoverable.
     pub async fn rollback(&self, checkpoint_event_id: EventId) -> Result<BranchId, BusError> {
         let branch_id;
+        let parent_event_id;
+        let rejected_event_ids;
         {
             let mut store = self.inner.store.write().await;
 
@@ -406,19 +422,19 @@ impl EventBus {
                 .position(|&id| id == checkpoint_event_id)
                 .ok_or(BusError::CheckpointNotFound(checkpoint_event_id))?;
 
-            let parent_event_id = if pos > 0 {
+            parent_event_id = if pos > 0 {
                 Some(store.active_path[pos - 1])
             } else {
                 None
             };
 
-            let rejected_event_ids: Vec<EventId> = store.active_path[pos..].to_vec();
+            rejected_event_ids = store.active_path[pos..].to_vec();
 
             branch_id = BranchId::new_v4();
             store.rejected_branches.push(RejectedBranch {
                 id: branch_id,
                 parent_event_id,
-                event_ids: rejected_event_ids,
+                event_ids: rejected_event_ids.clone(),
             });
 
             store.active_path.truncate(pos);
@@ -434,30 +450,49 @@ impl EventBus {
         };
 
         // Broadcast observability events (not appended to active log).
-        let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
-        Self::fan_out(
-            &mut subs,
-            Event::new(
-                kinds::BRANCH_SEALED,
-                serde_json::json!({
-                    "branch_id": branch_id.to_string(),
-                    "checkpoint_event_id": checkpoint_event_id.to_string(),
-                    "reason": "rejected_trajectory"
-                }),
-            ),
-        );
-        if evicted_branches > 0 {
+        {
+            let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
             Self::fan_out(
                 &mut subs,
                 Event::new(
-                    kinds::SYSTEM_PRUNED,
+                    kinds::BRANCH_SEALED,
                     serde_json::json!({
-                        "evicted_branches": evicted_branches,
-                        "evicted_nodes": evicted_nodes,
+                        "branch_id": branch_id.to_string(),
+                        "checkpoint_event_id": checkpoint_event_id.to_string(),
+                        "reason": "rejected_trajectory"
                     }),
                 ),
             );
+            if evicted_branches > 0 {
+                Self::fan_out(
+                    &mut subs,
+                    Event::new(
+                        kinds::SYSTEM_PRUNED,
+                        serde_json::json!({
+                            "evicted_branches": evicted_branches,
+                            "evicted_nodes": evicted_nodes,
+                        }),
+                    ),
+                );
+            }
         }
+
+        // Durable tombstone: records the branch topology in the active log so
+        // exporters persist it and `restore_from` can replay the rollback
+        // instead of resurrecting rejected events onto the active branch.
+        self.publish(Event::new(
+            kinds::SYSTEM_ROLLBACK,
+            serde_json::json!({
+                "branch_id": branch_id.to_string(),
+                "checkpoint_event_id": checkpoint_event_id.to_string(),
+                "parent_event_id": parent_event_id.map(|id| id.to_string()),
+                "rejected_event_ids": rejected_event_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>(),
+            }),
+        ))
+        .await?;
 
         Ok(branch_id)
     }
@@ -497,14 +532,156 @@ impl EventBus {
 
     // ── Restore ───────────────────────────────────────────────────────────────
 
-    /// Silently ingests events into the store, preserving `parent_event_id` linkages.
+    /// Silently ingests a persisted event stream, preserving `parent_event_id`
+    /// linkages **and replaying rollbacks**.
+    ///
+    /// `system.rollback` tombstones (written by [`rollback`](Self::rollback))
+    /// are honored: the events they reference are moved off the active path
+    /// into a reconstructed rejected branch, so a restored session never
+    /// resurrects trajectories that were rolled away. Broadcast-only
+    /// observability kinds (`system.branch_sealed`, `system.pruned`) that an
+    /// exporter may have captured are skipped.
+    ///
+    /// Limitation: rejected branches grafted via
+    /// [`adopt_rejected_branch`](Self::adopt_rejected_branch) (speculation
+    /// losers) are in-memory only and are not reconstructed — the active
+    /// path remains correct, but that negative context is lost on restore.
     pub async fn restore_from(&self, events: Vec<Event>) {
+        use std::collections::HashSet;
+
         let mut store = self.inner.store.write().await;
         for event in events {
+            // Skip broadcast-only kinds: they were never part of the DAG.
+            if matches!(
+                event.kind.as_str(),
+                kinds::BRANCH_SEALED | kinds::SYSTEM_PRUNED
+            ) {
+                continue;
+            }
+
+            if event.kind == kinds::SYSTEM_ROLLBACK {
+                let rejected: HashSet<EventId> = event
+                    .payload
+                    .get("rejected_event_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .filter_map(|s| Uuid::parse_str(s).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !rejected.is_empty() {
+                    let branch_id = event
+                        .payload
+                        .get("branch_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .unwrap_or_else(BranchId::new_v4);
+                    let parent_event_id = event
+                        .payload
+                        .get("parent_event_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok());
+
+                    // Move the rejected events (in order) off the active path.
+                    let event_ids: Vec<EventId> = store
+                        .active_path
+                        .iter()
+                        .copied()
+                        .filter(|id| rejected.contains(id))
+                        .collect();
+                    store.active_path.retain(|id| !rejected.contains(id));
+                    store.rejected_branches.push(RejectedBranch {
+                        id: branch_id,
+                        parent_event_id,
+                        event_ids,
+                    });
+                }
+                // The tombstone itself lives on the active path, as on the
+                // original bus.
+            }
+
             let id = event.id;
             store.nodes.insert(id, event);
             store.active_path.push(id);
         }
+    }
+
+    // ── Speculation primitives ────────────────────────────────────────────────
+
+    /// Creates an independent bus seeded with a copy of this bus's active branch.
+    ///
+    /// The fork shares **no** subscribers, transforms, or rejected branches with
+    /// the original — it is a sandbox for speculative execution. Event IDs are
+    /// preserved, so events appended on the fork keep valid `parent_event_id`
+    /// links back into the original history and can later be spliced onto the
+    /// original bus (see [`adopt_rejected_branch`](Self::adopt_rejected_branch)
+    /// and [`crate::agent::speculate`]).
+    pub async fn fork(&self) -> EventBus {
+        let events = self.log().await;
+        let forked = EventBus::with_config(self.inner.config.clone());
+        forked.restore_from(events).await;
+        forked
+    }
+
+    /// Grafts an externally produced trajectory onto this bus as a sealed
+    /// rejected branch anchored at `parent_event_id`.
+    ///
+    /// Used by speculative execution to preserve losing candidate trajectories:
+    /// they become visible to [`rejected_branches_from`](Self::rejected_branches_from)
+    /// (and thus to `NegativeAwareContextAssembler`) exactly like branches
+    /// created by [`rollback`](Self::rollback). Broadcasts a
+    /// `system.branch_sealed` observability event; triggers the same eviction
+    /// policy as rollback.
+    pub async fn adopt_rejected_branch(
+        &self,
+        parent_event_id: Option<EventId>,
+        events: Vec<Event>,
+    ) -> BranchId {
+        let branch_id = BranchId::new_v4();
+        let (evicted_branches, evicted_nodes) = {
+            let mut store = self.inner.store.write().await;
+            let event_ids: Vec<EventId> = events.iter().map(|e| e.id).collect();
+            for event in events {
+                store.nodes.insert(event.id, event);
+            }
+            store.rejected_branches.push(RejectedBranch {
+                id: branch_id,
+                parent_event_id,
+                event_ids,
+            });
+            store.evict_excess_branches(
+                self.inner.config.max_retained_branches,
+                self.inner.config.eviction_strategy.as_ref(),
+            )
+        };
+
+        let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
+        Self::fan_out(
+            &mut subs,
+            Event::new(
+                kinds::BRANCH_SEALED,
+                serde_json::json!({
+                    "branch_id": branch_id.to_string(),
+                    "reason": "adopted_rejected_trajectory"
+                }),
+            ),
+        );
+        if evicted_branches > 0 {
+            Self::fan_out(
+                &mut subs,
+                Event::new(
+                    kinds::SYSTEM_PRUNED,
+                    serde_json::json!({
+                        "evicted_branches": evicted_branches,
+                        "evicted_nodes": evicted_nodes,
+                    }),
+                ),
+            );
+        }
+        branch_id
     }
 
     // ── Utility ───────────────────────────────────────────────────────────────
@@ -662,9 +839,11 @@ mod tests {
 
         bus.rollback(cp_id).await.unwrap();
 
-        assert_eq!(bus.log_len().await, 1);
+        // Active branch: the user message plus the durable rollback tombstone.
         let log = bus.log().await;
+        assert_eq!(log.len(), 2);
         assert_eq!(log[0].kind, kinds::USER_MESSAGE);
+        assert_eq!(log[1].kind, kinds::SYSTEM_ROLLBACK);
 
         let rejected = bus.rejected_branches_from(log[0].id).await;
         assert_eq!(rejected.len(), 1);
@@ -697,10 +876,62 @@ mod tests {
         .await
         .unwrap();
 
+        // [user, rollback tombstone, retry] — the retry chains off the tombstone.
         let log = bus.log().await;
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[1].payload["content"], "retry");
-        assert_eq!(log[1].parent_event_id, Some(log[0].id));
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[1].kind, kinds::SYSTEM_ROLLBACK);
+        assert_eq!(log[2].payload["content"], "retry");
+        assert_eq!(log[2].parent_event_id, Some(log[1].id));
+    }
+
+    #[tokio::test]
+    async fn restore_replays_rollbacks_instead_of_resurrecting_them() {
+        // Simulate an exporter capturing every published + broadcast event.
+        let bus = EventBus::new();
+        let mut tap = bus.subscribe();
+
+        bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "q"})))
+            .await
+            .unwrap();
+        let cp = bus.checkpoint().await.unwrap();
+        bus.publish(Event::new(
+            kinds::ASSISTANT_MESSAGE,
+            json!({"content": "bad"}),
+        ))
+        .await
+        .unwrap();
+        bus.rollback(cp).await.unwrap();
+        bus.publish(Event::new(
+            kinds::ASSISTANT_MESSAGE,
+            json!({"content": "good"}),
+        ))
+        .await
+        .unwrap();
+
+        let mut captured = Vec::new();
+        while let Ok(Some(e)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), tap.recv()).await
+        {
+            captured.push(e);
+        }
+
+        // Restore the captured stream into a fresh bus.
+        let restored = EventBus::new();
+        restored.restore_from(captured).await;
+
+        let original_log: Vec<EventId> = bus.log().await.iter().map(|e| e.id).collect();
+        let restored_log: Vec<EventId> = restored.log().await.iter().map(|e| e.id).collect();
+        assert_eq!(
+            restored_log, original_log,
+            "restored active path must match the original exactly (no resurrected events)"
+        );
+
+        // The rejected branch is reconstructed too.
+        let anchor = bus.log().await[0].id;
+        let rejected = restored.rejected_branches_from(anchor).await;
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].len(), 2, "checkpoint + bad assistant message");
+        assert_eq!(rejected[0][1].payload["content"], "bad");
     }
 
     #[tokio::test]

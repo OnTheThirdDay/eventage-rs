@@ -127,11 +127,12 @@ impl WorkerSet {
 
     /// Spawn all workers and drive them until the bus closes.
     ///
-    /// Each worker runs under supervision: if it panics or returns a non-bus
-    /// error it is automatically restarted after a 1-second delay.  Only a
-    /// bus-closed signal (all `EventBus` clones dropped) causes workers to stop
-    /// cleanly.  This prevents any single misbehaving worker from bringing down
-    /// the whole set.
+    /// Each worker runs under supervision: a panic or non-bus error while
+    /// handling one event is logged and the worker moves on to the next event
+    /// — **the subscription stays alive, so no events are lost**. Only a
+    /// bus-closed signal (all `EventBus` clones dropped) or a bus error stops
+    /// a worker. This prevents any single misbehaving worker from bringing
+    /// down the whole set.
     pub async fn run_on(self, bus: EventBus) -> Result<(), WorkerError> {
         let mut set: JoinSet<()> = JoinSet::new();
 
@@ -197,26 +198,36 @@ async fn run_worker(worker: Arc<dyn EventWorker>, bus: EventBus) -> Result<(), W
     Ok(())
 }
 
-/// Run a worker under supervision: restart it on panic or transient error.
+/// Run a worker under supervision.
 ///
-/// Stops only when the bus closes (`rx.recv()` returns `None` → `Ok(())`) or
-/// when the worker returns a `WorkerError::Bus` (channel gone).
+/// The subscription is created **once** and kept alive for the worker's whole
+/// life: a panic or transient error while handling one event is contained to
+/// that event (logged, then processing continues), so no events are dropped
+/// during recovery. Stops when the bus closes or a bus error is returned.
 async fn run_worker_supervised(worker: Arc<dyn EventWorker>, bus: EventBus) {
-    loop {
-        let result = tokio::spawn(run_worker(worker.clone(), bus.clone())).await;
-        match result {
-            // Bus closed — exit cleanly.
-            Ok(Ok(())) => break,
+    use futures_util::FutureExt;
+
+    let kinds = worker.subscribed_kinds();
+    let mut rx = bus.subscribe();
+    while let Some(event) = rx.recv().await {
+        let interested = kinds.is_empty() || kinds.iter().any(|k| k == &event.kind);
+        if !interested {
+            continue;
+        }
+        let outcome = std::panic::AssertUnwindSafe(worker.handle(&event, &bus))
+            .catch_unwind()
+            .await;
+        match outcome {
+            Ok(Ok(())) => {}
             Ok(Err(WorkerError::Bus(_))) => break,
-            // Transient error — log and restart.
             Ok(Err(e)) => {
-                warn!(error = %e, "event worker returned error — restarting in 1 s");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                warn!(error = %e, kind = %event.kind, "event worker error — continuing");
             }
-            // Panic in the worker task — log and restart.
-            Err(panic_err) => {
-                warn!(error = %panic_err, "event worker panicked — restarting in 1 s");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(_panic) => {
+                warn!(kind = %event.kind, "event worker panicked on event — continuing");
+                // Brief pause so a worker that panics on *every* event
+                // cannot spin the CPU.
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }

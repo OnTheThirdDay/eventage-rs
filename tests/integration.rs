@@ -93,15 +93,13 @@ async fn tool_call_executes_and_loops() {
             extra_content: None,
         }],
         finish_reason: "tool_calls".to_string(),
-        input_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     };
     let final_response = LlmResponse {
         content: Some("The echo returned: ping".to_string()),
         tool_calls: vec![],
         finish_reason: "stop".to_string(),
-        input_tokens: None,
-        output_tokens: None,
+        ..Default::default()
     };
 
     let bus = EventBus::new();
@@ -361,7 +359,8 @@ async fn checkpoint_and_rollback_truncates_active_log() {
     assert_eq!(bus.log_len().await, 3);
 
     let branch_id = bus.rollback(cp_id).await.unwrap();
-    assert_eq!(bus.log_len().await, 1);
+    // user message + durable rollback tombstone
+    assert_eq!(bus.log_len().await, 2);
 
     let all = bus.all_rejected_branches().await;
     assert_eq!(all.len(), 1);
@@ -527,15 +526,13 @@ async fn dynamic_tool_add_visible_in_cycle() {
                     extra_content: None,
                 }],
                 finish_reason: "tool_calls".into(),
-                input_tokens: None,
-                output_tokens: None,
+                ..Default::default()
             },
             LlmResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                input_tokens: None,
-                output_tokens: None,
+                ..Default::default()
             },
         ]))
         .strategy(ReactStrategy::default());
@@ -642,15 +639,13 @@ async fn keyword_tool_selector_filters_definitions() {
                     extra_content: None,
                 }],
                 finish_reason: "tool_calls".into(),
-                input_tokens: None,
-                output_tokens: None,
+                ..Default::default()
             },
             LlmResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
                 finish_reason: "stop".into(),
-                input_tokens: None,
-                output_tokens: None,
+                ..Default::default()
             },
         ]))
         .tool(CounterTool {
@@ -839,4 +834,586 @@ async fn session_run_handles_multiple_turns() {
 
     assert_eq!(replies, 2);
     assert_eq!(last_content, "second");
+}
+
+// ── Harness guardrail tests (2026 upgrades) ──────────────────────────────────
+
+/// A tool whose execution sleeps, for timeout testing.
+struct SlowTool;
+
+#[async_trait]
+impl Tool for SlowTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function("slow", "sleeps", json!({ "type": "object", "properties": {} }))
+    }
+    async fn execute(&self, _args: Value) -> Result<Value, AgentError> {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        Ok(json!({ "done": true }))
+    }
+}
+
+fn tool_call_response(name: &str, args: &str) -> LlmResponse {
+    LlmResponse {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: "t1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+            extra_content: None,
+        }],
+        finish_reason: "tool_calls".into(),
+        ..Default::default()
+    }
+}
+
+fn text_response(text: &str) -> LlmResponse {
+    LlmResponse {
+        content: Some(text.into()),
+        tool_calls: vec![],
+        finish_reason: "stop".into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn tool_timeout_produces_error_result() {
+    init_tracing();
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("slow", "{}"),
+            text_response("gave up"),
+        ]))
+        .tool(SlowTool)
+        .strategy(ReactStrategy {
+            tool_timeout: Some(std::time::Duration::from_millis(50)),
+            ..Default::default()
+        })
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    let log = bus.log().await;
+    let result = log
+        .iter()
+        .find(|e| e.kind == kinds::TOOL_RESULT)
+        .expect("no tool.result");
+    let err = result.payload["error"].as_str().expect("expected error field");
+    assert!(err.contains("timed out"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn invalid_json_args_are_reported_to_model_without_executing() {
+    init_tracing();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("counter", "{not json"),
+            text_response("ok"),
+        ]))
+        .tool(CounterTool {
+            name: "counter".into(),
+            calls: Arc::clone(&calls),
+        })
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "tool must not execute");
+    let log = bus.log().await;
+    let result = log.iter().find(|e| e.kind == kinds::TOOL_RESULT).unwrap();
+    let err = result.payload["error"].as_str().unwrap();
+    assert!(err.contains("invalid JSON"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn deny_hook_surfaces_reason_to_model() {
+    init_tracing();
+
+    struct DenyHook;
+    #[async_trait]
+    impl CycleHook for DenyHook {
+        async fn before_tool(&self, _ctx: &HookContext<'_>, _name: &str, _args: &Value) -> HookAction {
+            HookAction::Deny("writes are not allowed in read-only mode".into())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("counter", "{}"),
+            text_response("understood"),
+        ]))
+        .tool(CounterTool {
+            name: "counter".into(),
+            calls: Arc::clone(&calls),
+        })
+        .hook(DenyHook)
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "denied tool must not run");
+    let log = bus.log().await;
+    let result = log.iter().find(|e| e.kind == kinds::TOOL_RESULT).unwrap();
+    assert_eq!(result.payload["result"]["denied"], true);
+    assert_eq!(
+        result.payload["result"]["reason"],
+        "writes are not allowed in read-only mode"
+    );
+}
+
+#[tokio::test]
+async fn oversized_tool_results_are_middle_truncated() {
+    init_tracing();
+
+    struct BigTool;
+    #[async_trait]
+    impl Tool for BigTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function("big", "returns a lot", json!({ "type": "object", "properties": {} }))
+        }
+        async fn execute(&self, _args: Value) -> Result<Value, AgentError> {
+            Ok(json!(format!("HEAD{}TAIL", "x".repeat(10_000))))
+        }
+    }
+
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("big", "{}"),
+            text_response("done"),
+        ]))
+        .tool(BigTool)
+        .strategy(ReactStrategy {
+            max_tool_result_chars: Some(1_000),
+            ..Default::default()
+        })
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    let log = bus.log().await;
+    let result = log.iter().find(|e| e.kind == kinds::TOOL_RESULT).unwrap();
+    let text = result.payload["result"].as_str().unwrap();
+    assert!(text.len() < 2_000, "result should be capped, got {}", text.len());
+    assert!(text.contains("HEAD"), "head must be preserved");
+    assert!(text.contains("TAIL"), "tail must be preserved");
+    assert!(text.contains("elided by the harness"), "marker missing");
+}
+
+#[tokio::test]
+async fn max_steps_finalizes_with_wrapup_instead_of_error() {
+    init_tracing();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+    // The mock always proposes another tool call, so the loop only ends via
+    // the step budget.
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![tool_call_response("counter", "{}")]))
+        .tool(CounterTool {
+            name: "counter".into(),
+            calls: Arc::clone(&calls),
+        })
+        .strategy(ReactStrategy {
+            max_steps: 2,
+            ..Default::default()
+        })
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+
+    agent.cycle().await.expect("finalization should not error");
+
+    let log = bus.log().await;
+    let final_msg = log
+        .iter()
+        .filter(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .next_back()
+        .unwrap();
+    assert_eq!(final_msg.payload["finalized_due_to"], "max_steps");
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "budget of 2 steps ran 2 tools");
+}
+
+#[tokio::test]
+async fn stuck_hint_reaches_llm_context() {
+    use eventage::agent::events_to_messages;
+
+    let events = vec![
+        Event::new(kinds::USER_MESSAGE, json!({"text": "go"})),
+        Event::new(
+            kinds::AGENT_STUCK,
+            json!({
+                "kind": "RepeatingAction",
+                "repeat_count": 3,
+                "hint": "Try a different approach."
+            }),
+        ),
+    ];
+    let messages = events_to_messages(&events);
+    assert_eq!(messages.len(), 2);
+    let hint = messages[1].content.as_deref().unwrap();
+    assert!(hint.contains("Loop detected"), "got: {hint}");
+    assert!(hint.contains("Try a different approach."), "got: {hint}");
+}
+
+#[tokio::test]
+async fn reasoning_content_is_preserved_on_bus() {
+    init_tracing();
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![LlmResponse {
+            content: Some("42".into()),
+            reasoning_content: Some("6 times 7 is 42".into()),
+            finish_reason: "stop".into(),
+            ..Default::default()
+        }]))
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "6*7?"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    let log = bus.log().await;
+    let msg = log.iter().find(|e| e.kind == kinds::ASSISTANT_MESSAGE).unwrap();
+    assert_eq!(msg.payload["reasoning_content"], "6 times 7 is 42");
+
+    // But reasoning must NOT be replayed into subsequent LLM requests.
+    let messages = eventage::agent::events_to_messages(&log);
+    let assistant = messages
+        .iter()
+        .find(|m| m.role == eventage::llm::Role::Assistant)
+        .unwrap();
+    assert_eq!(assistant.content.as_deref(), Some("42"));
+}
+
+// ── Enterprise-harness tests (streaming, governance, speculation) ────────────
+
+#[tokio::test]
+async fn streaming_broadcasts_ephemeral_deltas() {
+    init_tracing();
+    let bus = EventBus::new();
+    let mut rx = bus.subscribe();
+
+    // MockLlmProvider has no native streaming — the default complete_stream
+    // emits the whole answer as one delta, exercising the fallback path.
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::with_texts(["streamed answer"]))
+        .strategy(ReactStrategy {
+            stream: true,
+            ..Default::default()
+        })
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    // Deltas are broadcast to subscribers…
+    let mut saw_delta = false;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+    {
+        if event.kind == kinds::ASSISTANT_DELTA {
+            assert_eq!(event.payload["content"], "streamed answer");
+            saw_delta = true;
+        }
+    }
+    assert!(saw_delta, "subscriber should receive assistant.delta");
+
+    // …but never stored in the durable log.
+    let log = bus.log().await;
+    assert!(
+        log.iter().all(|e| e.kind != kinds::ASSISTANT_DELTA),
+        "deltas must not pollute the DAG"
+    );
+    assert!(log.iter().any(|e| e.kind == kinds::ASSISTANT_MESSAGE));
+}
+
+#[tokio::test]
+async fn permission_ask_flow_approves_via_bus() {
+    use eventage::agent::PermissionPolicyHook;
+    init_tracing();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+
+    // Approver: watches for permission.request and approves it.
+    // Subscribe before spawning so no request can be missed.
+    let mut rx = bus.subscribe();
+    let approver_bus = bus.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if event.kind == kinds::PERMISSION_REQUEST {
+                let request_id = event.payload["request_id"].as_str().unwrap().to_string();
+                approver_bus
+                    .publish(Event::new(
+                        kinds::PERMISSION_DECISION,
+                        json!({ "request_id": request_id, "approve": true }),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("counter", "{}"),
+            text_response("done"),
+        ]))
+        .tool(CounterTool {
+            name: "counter".into(),
+            calls: Arc::clone(&calls),
+        })
+        .hook(
+            PermissionPolicyHook::new()
+                .ask("counter")
+                .deny_by_default("not allowlisted"),
+        )
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "approved tool should run");
+}
+
+#[tokio::test]
+async fn permission_deny_by_default_blocks_unlisted_tools() {
+    use eventage::agent::PermissionPolicyHook;
+    init_tracing();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("counter", "{}"),
+            text_response("ok"),
+        ]))
+        .tool(CounterTool {
+            name: "counter".into(),
+            calls: Arc::clone(&calls),
+        })
+        .hook(
+            PermissionPolicyHook::new()
+                .allow("read_*")
+                .deny_by_default("tool not in the deployment allowlist"),
+        )
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let log = bus.log().await;
+    let result = log.iter().find(|e| e.kind == kinds::TOOL_RESULT).unwrap();
+    assert_eq!(result.payload["result"]["denied"], true);
+    assert_eq!(
+        result.payload["result"]["reason"],
+        "tool not in the deployment allowlist"
+    );
+}
+
+#[tokio::test]
+async fn schema_violations_are_fed_back_to_model() {
+    init_tracing();
+
+    struct StrictTool;
+    #[async_trait]
+    impl Tool for StrictTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function(
+                "strict",
+                "needs a path",
+                json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            )
+        }
+        async fn execute(&self, _args: Value) -> Result<Value, AgentError> {
+            panic!("must not execute with invalid args");
+        }
+    }
+
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("strict", r#"{"path": 42}"#),
+            text_response("corrected"),
+        ]))
+        .tool(StrictTool)
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    let log = bus.log().await;
+    let result = log.iter().find(|e| e.kind == kinds::TOOL_RESULT).unwrap();
+    let err = result.payload["error"].as_str().unwrap();
+    assert!(err.contains("arguments.path"), "got: {err}");
+    assert!(err.contains("'string'"), "got: {err}");
+}
+
+#[tokio::test]
+async fn session_resumes_from_prior_bus() {
+    init_tracing();
+
+    // First session: build history.
+    let bus = EventBus::new();
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "remember 42"})))
+        .await
+        .unwrap();
+    bus.publish(Event::new(
+        kinds::ASSISTANT_MESSAGE,
+        json!({"content": "noted: 42", "tool_calls": []}),
+    ))
+    .await
+    .unwrap();
+
+    // Second session: attach the restored bus and continue.
+    let mut session = Session::builder()
+        .llm(MockLlmProvider::with_texts(["it was 42"]))
+        .system_prompt("You are helpful.")
+        .bus(bus.clone())
+        .build();
+
+    let reply = session.chat("what number?").await.unwrap();
+    assert_eq!(reply, "it was 42");
+    assert!(
+        bus.log().await.len() >= 4,
+        "resumed bus must retain prior history"
+    );
+}
+
+#[tokio::test]
+async fn provider_extra_round_trips_through_event_log() {
+    init_tracing();
+
+    // A response carrying provider-opaque state (e.g. Anthropic thinking
+    // blocks or OpenAI Responses reasoning items).
+    let with_state = LlmResponse {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "counter".into(),
+                arguments: "{}".into(),
+            },
+            extra_content: None,
+        }],
+        finish_reason: "tool_calls".into(),
+        provider_extra: Some(json!({
+            "anthropic_blocks": [{ "type": "thinking", "thinking": "hmm", "signature": "sig123" }]
+        })),
+        ..Default::default()
+    };
+
+    // A provider that asserts the opaque state comes back on the next call.
+    struct AssertingProvider {
+        first: std::sync::Mutex<Option<LlmResponse>>,
+    }
+    #[async_trait]
+    impl eventage::llm::LlmProvider for AssertingProvider {
+        async fn complete(
+            &self,
+            messages: Vec<ChatMessage>,
+            _tools: Vec<ToolDefinition>,
+        ) -> Result<LlmResponse, eventage::llm::LlmError> {
+            if let Some(first) = self.first.lock().unwrap().take() {
+                return Ok(first);
+            }
+            // Second step: the assistant turn must carry the state back.
+            let assistant = messages
+                .iter()
+                .find(|m| m.role == eventage::llm::Role::Assistant)
+                .expect("assistant turn in history");
+            let extra = assistant.provider_extra.as_ref().expect("state restored");
+            assert_eq!(extra["anthropic_blocks"][0]["signature"], "sig123");
+            Ok(LlmResponse {
+                content: Some("done".into()),
+                finish_reason: "stop".into(),
+                ..Default::default()
+            })
+        }
+        fn model(&self) -> &str {
+            "asserting"
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(AssertingProvider {
+            first: std::sync::Mutex::new(Some(with_state)),
+        })
+        .tool(CounterTool {
+            name: "counter".into(),
+            calls: Arc::clone(&calls),
+        })
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    // The opaque blocks are also durable on the event itself.
+    let log = bus.log().await;
+    let msg = log
+        .iter()
+        .find(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .unwrap();
+    assert_eq!(
+        msg.payload["provider_extra"]["anthropic_blocks"][0]["signature"],
+        "sig123"
+    );
 }

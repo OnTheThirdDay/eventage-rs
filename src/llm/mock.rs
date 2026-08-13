@@ -29,8 +29,7 @@ impl MockLlmProvider {
                 content: Some(t.into()),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
-                input_tokens: None,
-                output_tokens: None,
+                ..Default::default()
             })
             .collect();
         Self::new(responses)
@@ -50,8 +49,7 @@ impl LlmProvider for MockLlmProvider {
                 content: Some("(mock empty response)".to_string()),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
-                input_tokens: None,
-                output_tokens: None,
+                ..Default::default()
             });
         }
         let mut idx = self.index.lock().unwrap();

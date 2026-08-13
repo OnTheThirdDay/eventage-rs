@@ -98,6 +98,24 @@ impl LlmProvider for RateLimitedProvider {
         self.inner.complete(messages, tools).await
     }
 
+    async fn complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+        on_delta: super::types::DeltaHandler,
+    ) -> Result<LlmResponse, LlmError> {
+        let wait = self.reserve_slot().await;
+        if !wait.is_zero() {
+            debug!(
+                wait_ms = wait.as_millis(),
+                model = self.inner.model(),
+                "rate limiter: waiting before LLM request"
+            );
+            sleep(wait).await;
+        }
+        self.inner.complete_stream(messages, tools, on_delta).await
+    }
+
     fn model(&self) -> &str {
         self.inner.model()
     }

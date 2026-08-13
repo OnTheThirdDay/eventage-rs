@@ -145,6 +145,7 @@ async fn run_sub_agent(
         .strategy(ReactStrategy {
             max_steps,
             max_concurrent_tools: 4,
+            ..Default::default()
         });
 
     for tool in tools {

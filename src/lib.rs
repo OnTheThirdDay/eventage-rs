@@ -67,18 +67,25 @@ pub use error::{BusError, CoreError};
 pub use event::{Event, EventId, kinds, meta_keys};
 
 pub use agent::{
-    Agent, AgentBuilder, AgentContext, AgentError, AgentSet, AssemblyContext, ContextAssembler,
-    CycleHook, DEFAULT_MAX_CONCURRENT_TOOLS, DEFAULT_MAX_REACT_STEPS, DefaultContextAssembler,
-    DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle, EventWorker, ExecutionStrategy,
-    HookAction, HookContext, KeywordToolSelector, NegativeAwareContextAssembler, ReactStrategy,
-    Session, SessionBuilder, SingleShotStrategy, SummarizingContextAssembler, Tool, ToolRegistry,
-    ToolSelector, WorkerError, WorkerSet, detect_stuck, StuckAnalysis, StuckKind,
+    Agent, AgentBuilder, AgentContext, AgentError, AgentSet, AssemblyContext, BranchScorer,
+    BudgetScope, ContextAssembler, CycleHook, DEFAULT_MAX_CONCURRENT_TOOLS,
+    DEFAULT_MAX_REACT_STEPS, DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,
+    DefaultContextAssembler, DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle,
+    EventWorker, ExecutionStrategy, FnScorer, HookAction, HookContext, KeywordToolSelector,
+    LlmJudgeScorer, NegativeAwareContextAssembler, PermissionPolicyHook, PermissionVerdict,
+    ReactStrategy, Session, SessionBuilder, SingleShotStrategy, SpeculationCandidate,
+    SpeculationOutcome, SummarizingContextAssembler, TokenBudgetHook, Tool, ToolExecOptions,
+    ToolRegistry, ToolResultClearingAssembler, ToolSelector, WorkerError, WorkerSet, best_of_n,
+    detect_stuck, truncate_middle, StuckAnalysis, StuckKind,
 };
 
-pub use bridge::BusBridge;
+pub use bridge::{BusBridge, BRIDGE_HOPS_KEY};
 pub use eviction::{EpitaphStore, EpitaphStrategy};
 
 #[cfg(feature = "observability")]
 pub use observability::{BusObserver, JsonlExporter};
 
-pub use llm::{ChatMessage, LlmError, LlmProvider, LlmResponse, RateLimitedProvider, ToolCall, ToolDefinition};
+pub use llm::{
+    AnthropicProvider, ChatMessage, LlmError, LlmProvider, LlmResponse, OpenAiProvider,
+    OpenAiResponsesProvider, RateLimitedProvider, RetryProvider, ToolCall, ToolDefinition,
+};

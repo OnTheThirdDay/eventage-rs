@@ -7,7 +7,20 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
-/// Sandbox executor using Linux Landlock for filesystem isolation.
+/// Sandbox executor using Linux Landlock for **filesystem** isolation.
+///
+/// # Security scope — read before trusting
+///
+/// Landlock (ABI v1) restricts *filesystem access only*. This executor is a
+/// defense-in-depth seatbelt, **not** a security boundary for untrusted code:
+///
+/// - **No network isolation** — the child can open sockets and exfiltrate
+///   anything it can read. Use [`DockerExecutor`](super::DockerExecutor)
+///   (`--network none`) for untrusted code.
+/// - **No resource limits** — no memory/CPU/pid caps; only the wall-clock
+///   timeout bounds runaway processes.
+/// - The environment is always cleared: the child receives only `PATH` plus
+///   the variables in [`SandboxRequest::env`] — never the parent's secrets.
 pub struct LandlockExecutor;
 
 impl LandlockExecutor {
@@ -41,14 +54,15 @@ impl SandboxExecutor for LandlockExecutor {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        if req.env.is_empty() {
-            cmd.env_clear();
-            if let Ok(path) = std::env::var("PATH") {
-                cmd.env("PATH", path);
-            }
-        } else {
-            cmd.envs(&req.env);
+        // Always start from an empty environment so the parent's secrets
+        // (API keys, tokens) can never leak into sandboxed code. The child
+        // gets PATH (needed to resolve the program) plus the explicit
+        // request-scoped variables, nothing else.
+        cmd.env_clear();
+        if let Ok(path) = std::env::var("PATH") {
+            cmd.env("PATH", path);
         }
+        cmd.envs(&req.env);
 
         if req.stdin.is_some() {
             cmd.stdin(std::process::Stdio::piped());

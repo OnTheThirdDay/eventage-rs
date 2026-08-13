@@ -587,8 +587,7 @@ fn orchestrator_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
         // Cycle 2 — researcher returned findings; delegate to reporter.
         LlmResponse {
@@ -603,8 +602,7 @@ fn orchestrator_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
         // Cycle 3 — both specialist agents done; synthesise the final answer.
         LlmResponse {
@@ -620,8 +618,7 @@ fn orchestrator_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
     ])
 }
@@ -644,8 +641,7 @@ fn researcher_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
         // Attempt 1 — step 2: empty results → give up (triggers rollback externally).
         LlmResponse {
@@ -655,8 +651,7 @@ fn researcher_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
         // Attempt 2 — step 1: specific query after negative-context injection.
         LlmResponse {
@@ -671,8 +666,7 @@ fn researcher_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
         // Attempt 2 — step 2: extract structured stats from search results.
         LlmResponse {
@@ -687,8 +681,7 @@ fn researcher_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
         // Attempt 2 — step 3: summarise findings.
         LlmResponse {
@@ -703,8 +696,7 @@ fn researcher_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
     ])
 }
@@ -724,8 +716,7 @@ fn reporter_llm() -> MockLlmProvider {
                 extra_content: None,
             }],
             finish_reason: "tool_calls".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
         // Step 2: confirm report is ready.
         LlmResponse {
@@ -736,8 +727,7 @@ fn reporter_llm() -> MockLlmProvider {
             ),
             tool_calls: vec![],
             finish_reason: "stop".into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         },
     ])
 }
@@ -862,6 +852,7 @@ async fn main() -> anyhow::Result<()> {
         .strategy(ReactStrategy {
             max_steps: 20,
             max_concurrent_tools: 2,
+            ..Default::default()
         })
         .build();
 
@@ -890,6 +881,7 @@ async fn main() -> anyhow::Result<()> {
         .strategy(ReactStrategy {
             max_steps: 5,
             max_concurrent_tools: 4,
+            ..Default::default()
         }) // cap the internal ReAct loop
         .build();
 

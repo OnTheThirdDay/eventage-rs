@@ -515,6 +515,7 @@ fn build_group_agent(
         .strategy(ReactStrategy {
             max_steps: config.max_steps,
             max_concurrent_tools: 4,
+            ..Default::default()
         });
 
     // ── Standard tools (all groups) ───────────────────────────────────────────

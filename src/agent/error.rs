@@ -12,4 +12,6 @@ pub enum AgentError {
     Serde(#[from] serde_json::Error),
     #[error("React loop exceeded maximum steps ({0})")]
     MaxStepsReached(usize),
+    #[error("tool '{name}' timed out after {secs}s")]
+    ToolTimeout { name: String, secs: u64 },
 }
