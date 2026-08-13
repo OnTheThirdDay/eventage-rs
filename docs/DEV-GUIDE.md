@@ -132,6 +132,14 @@ The assembler's job is to read the raw DAG of events and format them into an arr
 1.  **`DefaultContextAssembler`**: The standard chronological parser. It maps `"user.message"` to User, `"assistant.message"` to Assistant, etc.
 2.  **`NegativeAwareContextAssembler`**: Uses the DAG's rejected branches. If a rollback occurs, this assembler gathers the rejected trajectory and inserts it into the prompt with instructions like *"You previously attempted X, which failed with error Y."*
 3.  **`DynamicContextAssembler`**: A Thread-safe Mutex-backed assembler that lets you hot-swap the internal context logic perfectly mid-flight without pausing the agent.
+4.  **`ToolResultClearingAssembler`** *(context editing)*: The cheap first line of context management. Once the assembled context crosses a token trigger, the *content* of the oldest tool results is replaced with a short placeholder — zero LLM calls, and lossless because the full output still lives in the event log. Clearing is a monotonic ratchet, so the edited prefix stays stable for provider prompt caches.
+5.  **`SummarizingContextAssembler`**: The heavyweight fallback. When the context still exceeds a token budget, the oldest conversation messages are folded into an LLM-generated summary (optionally archived to disk). Compose it *around* the clearing assembler so summarization only fires when clearing alone cannot reclaim enough:
+
+```rust
+let base = DefaultContextAssembler::new("You are helpful.");
+let clearing = ToolResultClearingAssembler::new(Arc::new(base), 24_000);
+let assembler = SummarizingContextAssembler::new(Arc::new(clearing), llm, 32_000, "session-id");
+```
 
 ```rust
 // Instantiating and attaching a Context Assembler
@@ -155,6 +163,34 @@ An `ExecutionStrategy` dictates the precise orchestration inside a reasoning cyc
 ### Provided Implementations (`eventage-provided-impl`):
 1.  **`ReactStrategy` (Reason + Act)**: The heavyweight champion. The LLM generates thought + tool calls, the tools execute, the results are pushed to the bus, and the LLM is queried again until it yields a final answer. 
 2.  **`SingleShotStrategy`**: Highly optimized for simple text transformation or routing. It calls the LLM exactly once, preventing tool-loop spin-outs and dramatically reducing latency.
+
+`ReactStrategy` ships with harness guardrails **on by default**:
+
+| Field | Default | Behavior |
+|---|---|---|
+| `tool_timeout` | `300s` | A hung tool produces an error `tool.result` (visible to the model) instead of blocking the cycle forever. |
+| `max_tool_result_chars` | `30_000` | Oversized tool outputs are middle-truncated (head + tail preserved) with an explanatory marker; the full output stays in the event log. |
+| `finalize_on_max_steps` | `true` | On step-budget exhaustion the strategy makes one final *tool-free* LLM call, nudging the model to report progress, remaining work, and blockers — instead of erroring with `MaxStepsReached`. |
+
+Malformed tool arguments (invalid JSON) never reach the tool: the parse error is returned to the model as a tool error so it can self-correct on the next step. Parsed arguments are additionally validated against the tool's JSON Schema (`type` / `required` / `properties` / `items` / `enum`) — violations are phrased for the model (`ToolExecOptions { validate_args: false, .. }` opts out).
+
+**Streaming**: set `ReactStrategy { stream: true, .. }` to use `LlmProvider::complete_stream`. Incremental tokens are broadcast as **ephemeral** `assistant.delta` events (`EventBus::broadcast` — delivered to subscribers, never stored in the DAG or the LLM context); the durable `assistant.message` event is unchanged. All three native providers stream via SSE (including reasoning deltas and usage); providers without native support fall back to a single delta per response, so TUIs can subscribe uniformly.
+
+### LLM providers
+
+| Provider | API | Highlights |
+|---|---|---|
+| `AnthropicProvider` | Messages API (native) | Automatic prompt caching, extended thinking (`with_thinking(budget)`) with signature round-trip, betas, top_k/stop sequences |
+| `OpenAiResponsesProvider` | Responses API | Encrypted reasoning items round-trip statelessly through the event log, `with_reasoning_effort("high")` |
+| `OpenAiProvider` | Chat Completions | Works with any compatible server (Ollama, Groq, vLLM, OpenRouter…); typed sampling params, `with_json_schema` structured outputs, `with_body_param` escape hatch |
+
+Wrap any provider with `RetryProvider` (transient-error backoff) and `RateLimitedProvider` (request pacing); both forward streaming. Provider-specific reasoning state (thinking blocks, reasoning items) is carried in `provider_extra`, persisted on `assistant.message` events, and restored automatically by the context assemblers — multi-step tool loops keep their chain of thought with zero configuration.
+
+### Skills, project context, and plugins
+
+- **Skills** (`eventage::agent::skills`): point `SkillsLibrary::discover` at a directory of Claude-compatible `SKILL.md` bundles, append `library.system_prompt_section()` to the prompt, and register `SkillTool::new(library)`. The model sees one line per skill and loads full instructions on demand.
+- **Project context** (`eventage::agent::project`): `load_project_context(dir)` reads `AGENTS.md` (or `CLAUDE.md`); `load_project_context_walkup` collects nested files monorepo-style, nearest last.
+- **Plugins** (`eventage::plugin`): `PluginHost::load` reads `eventage-plugin.toml` manifests (prompt fragment + skills dir + MCP servers); `host.install(&registry)` connects everything and returns the combined prompt fragment.
 
 ```rust
 // Choosing a strategy for the agent
@@ -209,6 +245,43 @@ A `CycleHook` lets you cleanly intercept, observe, or manipulate the agent proce
 Typical uses include:
 *   Building manual approval gates (`before_tool` pausing).
 *   Injecting runtime RAG context (`before_llm` mutating the `messages` array).
+
+Hooks return a `HookAction`:
+*   `Continue` — proceed normally.
+*   `Skip` — veto the operation silently (the model sees a generic "vetoed by hook" result).
+*   `Deny(reason)` — veto a tool call **and tell the model why**. The reason lands in the synthetic `tool.result`, so the model can pick another tool, adjust arguments, or ask the user — prefer this over `Skip` for permission gates.
+*   `AbortCycle` — end the cycle immediately.
+
+### Provided governance hooks
+
+*   **`PermissionPolicyHook`** — glob-based `allow` / `deny(reason)` / `ask` rules evaluated first-match-wins, with `deny_by_default` / `ask_by_default` hardening. `ask` publishes a durable `permission.request` event and waits (with timeout) for a `permission.decision` published by any approver on the bus — approval is fully asynchronous and transport-agnostic.
+
+    ```rust
+    let policy = PermissionPolicyHook::new()
+        .allow("read_*").allow("search_*")
+        .ask("write_*")
+        .deny("delete_*", "deletion is disabled")
+        .deny_by_default("tool not allowlisted");
+    ```
+
+*   **`TokenBudgetHook`** — enforces a token ceiling computed from usage metadata in the event log (session-wide by default, `agent_scoped()` optional). At 80% it publishes `budget.warning` and injects a wrap-up note into the prompt; at 100% it publishes `budget.exhausted` and aborts the cycle. Accounting is derived from the bus, so it survives restore-from-SQLite restarts.
+
+---
+
+## 7.5 Speculative Best-of-N Execution
+
+`eventage::agent::speculate::best_of_n` runs N candidate agents **in parallel forks of the bus**, scores their trajectories, splices the winner onto the main log, and seals every loser as a rejected branch (feeding `NegativeAwareContextAssembler`).
+
+```rust
+use eventage::agent::speculate::{best_of_n, SpeculationCandidate, LlmJudgeScorer};
+
+let outcome = best_of_n(&bus, vec![
+    SpeculationCandidate::new("temp-0.2", |fork| build_agent(fork, 0.2)),
+    SpeculationCandidate::new("temp-0.9", |fork| build_agent(fork, 0.9)),
+], &LlmJudgeScorer::new(judge, "correctness and brevity")).await?;
+```
+
+Scorers implement `BranchScorer`: use `FnScorer` for heuristics (tests pass? shortest diff?) or `LlmJudgeScorer` for LLM-as-judge on a 0–10 scale. The round is recorded as a durable `speculation.completed` event.
 
 ### Provided Implementation (`eventage-provided-impl`):
 *   **`DynamicHookChain`**: Allows for hooks to be safely swapped, updated, or manipulated at runtime on a live agent system.
@@ -295,3 +368,29 @@ When executed, an Eventage system follows this cadence:
 5.  **Broadcast:** Everything happening inside the execution cycle (heartbeats, LLM responses) emits live back into the bus. Observers instantly stream changes to UI, file, and tracing backends.
 
 By embracing the event bus, Eventage brings complete predictability to highly unpredictable AI behavior.
+
+---
+
+## 11. Roadmap
+
+Known gaps, in priority order:
+
+1. **Multimodal content** — `ChatMessage.content` is text-only; image/file
+   content blocks need a content-part model across events, assemblers, and
+   providers. The largest remaining gap.
+2. **Token-budget calibration** — feed actual `input_tokens` from responses
+   back into the estimator used by the summarizing/clearing assemblers,
+   replacing the chars÷4 heuristic.
+3. **Typed structured output** — `complete_as<T: Deserialize>()` sugar over
+   `with_json_schema` (schema generation via `schemars`).
+4. **Multi-round speculation** — tree search over the DAG: speculate per
+   ReAct step (not per cycle) with beam-style pruning; the primitives
+   (`EventBus::fork`, `adopt_rejected_branch`) already support it.
+5. **Exactly-once tool semantics on resume** — journal tool intents so a
+   crash between `tool.call.proposed` and `tool.result` can be reconciled on
+   restart (skip, replay, or synthesize an interrupted-result).
+6. **Distributed bus** — a `BusBridge` transport over NATS/Redis streams so
+   agents on different hosts share one logical DAG.
+7. **MCP elicitation & notifications** — map 2025-06-18 elicitation requests
+   onto the `permission.request`/`decision` bus pattern; use
+   `tools/list_changed` notifications to drive `McpToolset::reload`.

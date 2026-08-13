@@ -109,7 +109,44 @@ AgentBuilder::new()
 Boot up multiple independent agents on the same or separate `EventBus`. Because the bus is the single reliable source of truth, agents organically share a context graph and can route messages to each other asynchronously without writing complex peer-to-peer networking logic.
 
 ### 4. Sandboxing
-When an agent decides to compile arbitrary C code or run a shell script, Eventage natively supports wrapping those tool executions in strict, pluggable secure contexts via the `eventage-sandbox` crate — out-of-box options ranging from lightweight local Kernel restrictions (`LandlockExecutor`) to process isolation (`DockerExecutor`).
+When an agent decides to compile arbitrary C code or run a shell script, Eventage supports wrapping those tool executions in pluggable execution contexts. Be honest about what each buys you: **`DockerExecutor`** is the option for untrusted code (no network, memory/CPU/pid caps, `--cap-drop=ALL`, `no-new-privileges`, fresh container per call, killed on timeout); **`LandlockExecutor`** is filesystem-only defense-in-depth (no network or resource isolation — a seatbelt, not a boundary); **`WasmExecutor`** runs WASI modules with fuel, memory, and output caps. All executors run with a scrubbed environment so host API keys never reach sandboxed code.
+
+### 5. Harness Guardrails, On By Default
+The ReAct loop is production-hardened out of the box: per-tool wall-clock timeouts, middle-truncation of oversized tool outputs (the full data stays in the event log), model-visible feedback for malformed tool arguments and policy denials (`HookAction::Deny("reason")`), loop/stuck detection whose hints actually reach the model, and a graceful tool-free wrap-up turn when the step budget runs out. The LLM layer composes `RetryProvider` (exponential backoff on 429/5xx) with `RateLimitedProvider` (request pacing).
+
+### 6. Layered Context Management: Edit the View, Not the History
+Because the event log is the source of truth, context management is *assembly-time editing* — lossless by construction. `ToolResultClearingAssembler` reclaims budget for free by clearing stale tool outputs from the LLM's view (a monotonic ratchet that stays prompt-cache friendly), and `SummarizingContextAssembler` folds old conversation into an LLM-generated summary only when clearing isn't enough. Reasoning traces from thinking models and cached-token usage are captured on every `assistant.message` event for observability and replay.
+
+### 7. Speculative Best-of-N Execution
+The capability the DAG was built for: fork the bus once per candidate, run N agents on the same task in parallel (different temperatures, models, or strategies), score the trajectories (heuristic or LLM judge), splice the winner onto the main log, and seal the losers as rejected branches the agent can *learn from* on future turns.
+
+```rust
+let outcome = best_of_n(&bus, vec![
+    SpeculationCandidate::new("fast", |fork| build_agent(fork, "gpt-5-mini")),
+    SpeculationCandidate::new("deep", |fork| build_agent(fork, "gpt-5")),
+], &LlmJudgeScorer::new(judge_llm, "correct, concise, complete")).await?;
+```
+
+### 8. Enterprise Governance & Operations
+- **`PermissionPolicyHook`** — glob-based allow/deny/ask rules per tool. `ask` publishes a `permission.request` event and waits for a `permission.decision` from *any* approver on the bus (TUI, Slack bridge, dashboard, another agent), denying on timeout.
+- **`TokenBudgetHook`** — session- or agent-scoped token budgets computed from the event log (they survive restarts): a warn threshold nudges the model to wrap up, the hard ceiling stops the loop and emits `budget.exhausted`.
+- **Native streaming** — `LlmProvider::complete_stream` with SSE support in every native provider; `ReactStrategy { stream: true, .. }` broadcasts ephemeral `assistant.delta` events that never pollute the durable log.
+- **Schema-validated tool calls** — arguments are checked against each tool's JSON Schema before execution; violations go back to the model as correctable errors.
+- **Durable resume** — `Session::builder().bus(restored_bus)` continues a conversation from a SQLite-restored event log; rollbacks are replayed faithfully.
+
+### 9. First-Class Provider Support
+Three native providers, all streaming, all reasoning-aware:
+- **`AnthropicProvider`** — native Messages API with **automatic prompt caching** (`cache_control` breakpoints on the system prompt and the moving conversation tip) and **extended thinking**: thinking blocks and signatures are persisted on the event bus and replayed across tool-loop steps as the API requires.
+- **`OpenAiResponsesProvider`** — the Responses API for reasoning models: encrypted reasoning items round-trip through the event log (`store: false`, fully stateless), with `reasoning_effort` control.
+- **`OpenAiProvider`** — Chat Completions for OpenAI and every compatible server (Ollama, Groq, Mistral, vLLM, OpenRouter…), with typed params (temperature, top_p, max_tokens, stop, seed, penalties, `reasoning_effort`, `parallel_tool_calls`), **structured outputs** (`with_json_schema`), and an `extra_body` escape hatch.
+
+Compose freely: `RetryProvider::new(RateLimitedProvider::new(AnthropicProvider::new(...), 60))`.
+
+### 10. Skills, AGENTS.md, and Plugins
+- **Skills** — drop Claude-compatible `SKILL.md` bundles in a directory; `SkillsLibrary` discovers them and the `skill` tool loads them on demand (progressive disclosure keeps the context lean).
+- **AGENTS.md / CLAUDE.md** — `load_project_context` (and its monorepo walk-up variant) injects project instructions into the system prompt.
+- **Plugins** — distributable directories with an `eventage-plugin.toml` manifest bundling skills, MCP servers (stdio or HTTP, auto-prefixed), and prompt fragments; `PluginHost::install` wires everything into an agent in one call.
+- **MCP 2025-06-18** — stdio + Streamable HTTP transports, session IDs, version negotiation with `MCP-Protocol-Version` echo, SSE responses, and `structuredContent` tool results.
 
 ---
 
