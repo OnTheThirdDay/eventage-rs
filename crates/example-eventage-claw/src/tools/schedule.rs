@@ -1,7 +1,7 @@
 //! Scheduled task tools.
 //!
 //! Agents create tasks by calling `schedule_task`; `SchedulerWorker` fires them
-//! on heartbeat events. State is in-memory (Arc<Mutex<Vec<ScheduledTask>>>),
+//! on heartbeat events. State is in-memory (`Arc<Mutex<Vec<ScheduledTask>>>`),
 //! persisted across restarts via session JSONL.
 
 use async_trait::async_trait;

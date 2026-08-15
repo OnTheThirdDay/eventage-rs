@@ -37,7 +37,8 @@ async fn a_reopened_session_still_knows_what_it_sent_the_model() {
 
     // Write a log by hand: a real conversation event, and an assembly record
     // marked ephemeral exactly as `broadcast` marks it.
-    let id = "resume-history-probe";
+    // A UUID, because ids become file names and are validated as such.
+    let id = "3f2b9c10-5d41-4a2e-9b77-0c1d2e3f4a5b";
     let db = config.state_dir().join(format!("{id}.db"));
     tokio::fs::create_dir_all(config.state_dir()).await.unwrap();
 

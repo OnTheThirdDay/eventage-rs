@@ -59,6 +59,19 @@ pub struct AnthropicProvider {
     tool_choice: Option<Value>,
     beta_headers: Vec<String>,
     extra_body: Map<String, Value>,
+    /// Extra headers sent with every request.
+    ///
+    /// Gateways in front of the Messages API are configured this way rather
+    /// than through the body — Portkey routes on `x-portkey-provider`,
+    /// LiteLLM and Helicone on their own keys — so a gateway needs no
+    /// provider of its own, only somewhere to put its headers.
+    extra_headers: Vec<(String, String)>,
+    /// Send the credential as `Authorization: Bearer` instead of `x-api-key`.
+    ///
+    /// Anthropic itself takes `x-api-key`; gateways generally take a bearer
+    /// token, and Anthropic's own SDKs make the same distinction between an
+    /// API key and an auth token.
+    bearer_auth: bool,
 }
 
 impl AnthropicProvider {
@@ -83,12 +96,37 @@ impl AnthropicProvider {
             tool_choice: None,
             beta_headers: Vec::new(),
             extra_body: Map::new(),
+            extra_headers: Vec::new(),
+            bearer_auth: false,
         }
     }
 
     /// Point at a different endpoint (proxy, gateway).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Add a header to every request.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Add several headers at once.
+    pub fn with_headers<K, V>(mut self, headers: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.extra_headers
+            .extend(headers.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Send the credential as a bearer token rather than `x-api-key`.
+    pub fn with_bearer_auth(mut self, bearer: bool) -> Self {
+        self.bearer_auth = bearer;
         self
     }
 
@@ -224,10 +262,19 @@ impl AnthropicProvider {
         let mut req = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION);
+        req = if self.bearer_auth {
+            req.header("authorization", format!("Bearer {}", self.api_key))
+        } else {
+            req.header("x-api-key", &self.api_key)
+        };
         if !self.beta_headers.is_empty() {
             req = req.header("anthropic-beta", self.beta_headers.join(","));
+        }
+        // Applied last so a gateway can override anything above it — including
+        // `anthropic-beta`, which some gateways need to forward verbatim.
+        for (name, value) in &self.extra_headers {
+            req = req.header(name, value);
         }
         let resp = req.json(body).send().await.map_err(LlmError::Http)?;
 

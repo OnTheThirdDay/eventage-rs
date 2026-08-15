@@ -1,7 +1,7 @@
 //! Structured output: constrain a completion to a JSON Schema and
 //! deserialize it into a Rust type.
 //!
-//! [`LlmProvider::complete_structured`](super::LlmProvider::complete_structured)
+//! [`super::LlmProvider::complete_structured`]
 //! is object-safe and returns a [`Value`]; the [`StructuredExt::complete_as`]
 //! extension adds the typed sugar:
 //!

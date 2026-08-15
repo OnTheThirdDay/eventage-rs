@@ -1,7 +1,7 @@
 //! The ACP server: JSON-RPC over stdio, backed by the event bus.
 //!
 //! The bus *is* the protocol. Everything the editor sees is derived from bus
-//! events by [`bridge`]:
+//! events by the bridge below:
 //!
 //! | Bus event | ACP `session/update` |
 //! |---|---|
@@ -769,7 +769,17 @@ impl AcpServer {
 
         session.submit_prompt(&req.prompt).await?;
         let outcome = session.run_cycle().await;
-        bridge.abort();
+
+        // Let the bridge drain rather than killing it. Aborting dropped
+        // whatever was still queued — the final assistant chunk, a tool
+        // completion, the usage record — so a turn could look unfinished in
+        // the editor purely because the forwarder was cut off. It ends on its
+        // own once it sees the turn-ending event; the timeout is only there
+        // so a missing one cannot hang the response.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), bridge).await {
+            Ok(_) => {}
+            Err(_) => warn!("event bridge did not finish draining; some updates may be missing"),
+        }
 
         Ok(match outcome {
             Ok(()) if session.was_cancelled() => StopReason::Cancelled,

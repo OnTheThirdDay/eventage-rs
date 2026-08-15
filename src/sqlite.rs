@@ -131,7 +131,7 @@ impl SqliteEventStore {
 
     /// Loads all events in insertion order.
     ///
-    /// Useful with [`EventBus::restore_from`] to rebuild bus state.
+    /// Useful with [`EventBus::restore_from`](crate::EventBus::restore_from) to rebuild bus state.
     pub async fn load_all(&self) -> Result<Vec<Event>, SqliteError> {
         let conn = Arc::clone(&self.conn);
         let rows = tokio::task::spawn_blocking(move || -> Result<Vec<String>, rusqlite::Error> {
@@ -170,7 +170,7 @@ impl SqliteEventStore {
 
     /// Returns the highest row index, or `0` if empty.
     ///
-    /// Bookmark this position for subsequent [`load_since_idx`] calls.
+    /// Bookmark this position for subsequent [`load_since_idx`](Self::load_since_idx) calls.
     pub async fn current_idx(&self) -> Result<i64, SqliteError> {
         let conn = Arc::clone(&self.conn);
         let idx = tokio::task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {

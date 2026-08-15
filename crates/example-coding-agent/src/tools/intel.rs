@@ -644,6 +644,23 @@ impl Tool for LspRename {
 
         // Everything is computed before anything is written, so a failure on
         // the fourth file cannot leave the first three renamed.
+        //
+        // The paths are locked for the whole read-compute-write, because a
+        // rename is exactly the case where a concurrent edit to one of the
+        // files would be overwritten without trace.
+        let touched: Vec<String> = edits_by_uri(&result)?
+            .iter()
+            .filter(|(_, edits)| !edits.is_empty())
+            .map(|(uri, _)| uri_to_path(uri))
+            .filter_map(|abs| {
+                std::path::Path::new(&abs)
+                    .strip_prefix(self.ws.root())
+                    .ok()
+                    .map(|p| p.display().to_string())
+            })
+            .collect();
+        let _guard = self.ws.lock_paths(&touched).await;
+
         let mut pending: Vec<(String, std::path::PathBuf, String, String)> = Vec::new();
         let mut edit_count = 0usize;
         for (uri, edits) in edits_by_uri(&result)? {
@@ -667,7 +684,7 @@ impl Tool for LspRename {
                 .resolve(&relative)
                 .map_err(|e| AgentError::Tool(e.to_string()))?;
 
-            let original = read_source(&self.client, &abs).await?;
+            let original = read_source(&self.ws, &self.client, &relative).await?;
             let updated = apply_text_edits(&original, &edits)?;
             if updated != original {
                 edit_count += edits.len();
@@ -686,7 +703,7 @@ impl Tool for LspRename {
         let mut diffs = Vec::new();
         let mut locations = Vec::new();
         for (relative, abs, original, updated) in &pending {
-            write_source(&self.client, abs, updated).await?;
+            write_source(&self.ws, &self.client, relative, updated).await?;
             self.lsp.notify_changed(abs).await;
 
             let abs_str = abs.display().to_string();

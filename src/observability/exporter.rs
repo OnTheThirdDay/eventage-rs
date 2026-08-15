@@ -2,7 +2,7 @@ use super::error::ObsError;
 use crate::event::Event;
 use async_trait::async_trait;
 
-/// A destination for events emitted by a [`BusObserver`].
+/// A destination for events emitted by a [`BusObserver`](crate::observability::BusObserver).
 ///
 /// Implement this to forward events to custom backends (e.g., databases, tracing systems).
 ///

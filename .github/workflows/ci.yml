@@ -1,0 +1,77 @@
+# The workspace moves fast and by hand; this is the floor everything has to
+# clear. Warnings are denied rather than reported, because a warning nobody
+# is forced to read is a warning that accumulates.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux, os: ubuntu-latest }
+          # The workspace confinement and shell containment take different
+          # paths off Linux, and only a real macOS runner exercises them.
+          - { name: macos, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      # Feature flags are the crate's public surface, and a combination that
+      # does not build is only discovered when somebody depends on it.
+      - name: Build with no default features
+        run: cargo build --no-default-features
+
+      - name: Build with default features
+        run: cargo build
+
+      # Strict now that the workspace's intra-doc links are clean. A broken
+      # link is a documentation defect like any other, and the only way it
+      # stays fixed is if it fails the build.
+      - name: Docs
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  ui:
+    name: studio ui
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/eventage-studio/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/eventage-studio/ui/package-lock.json
+      - run: npm ci
+      - run: npx tsc -b --noEmit
+      - run: npx vitest run
+      # The built assets are embedded in the Rust binary, so a broken build
+      # here is a broken release.
+      - run: npm run build

@@ -23,7 +23,7 @@ pub use docker::DockerExecutor;
 pub use unsandboxed::UnsandboxedExecutor;
 
 #[cfg(target_os = "linux")]
-pub use landlock::LandlockExecutor;
+pub use landlock::{landlock_confine, LandlockExecutor};
 
 #[cfg(feature = "sandbox-wasm")]
 pub use wasm::WasmExecutor;

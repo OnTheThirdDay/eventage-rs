@@ -301,7 +301,7 @@ impl EventBus {
     /// If the event already has `parent_event_id` set (via [`Event::with_parent`]),
     /// that value is preserved. Otherwise the current active-branch tip is used.
     ///
-    /// Registered publish transforms (see [`add_publish_transform`]) are applied
+    /// Registered publish transforms (see [`add_publish_transform`](Self::add_publish_transform)) are applied
     /// to the event before storage and fan-out.
     #[instrument(skip(self, event), fields(kind = %event.kind, id = %event.id))]
     pub async fn publish(&self, mut event: Event) -> Result<(), BusError> {
@@ -350,6 +350,20 @@ impl EventBus {
     /// would hand `restore_from` a log it could not reassemble correctly.
     fn mark_ephemeral(event: Event) -> Event {
         event.with_meta(meta_keys::EPHEMERAL, serde_json::json!(true))
+    }
+
+    /// Drop every subscription, ending each subscriber's receive loop.
+    ///
+    /// What lets an observer be *waited on* rather than merely abandoned: its
+    /// loop runs until the channel closes, so without this a caller holding
+    /// its `JoinHandle` would wait forever instead of learning that everything
+    /// queued had been written.
+    pub fn close(&self) {
+        self.inner
+            .subs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Grants a new subscription channel for future events.

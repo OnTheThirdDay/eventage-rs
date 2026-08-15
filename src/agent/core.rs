@@ -1,4 +1,4 @@
-use super::context::{AssemblyContext, ContextAssembler};
+use super::context::ContextAssembler;
 use super::error::AgentError;
 use super::hook::CycleHook;
 use super::strategy::{AgentContext, ExecutionStrategy};
@@ -63,13 +63,28 @@ impl Agent {
     /// Executes a single reasoning cycle via the configured strategy.
     #[instrument(skip(self), fields(agent_id = %self.agent_id), name = "agent_cycle")]
     pub async fn cycle(&self) -> Result<(), AgentError> {
-        // Quick check: if there is no context to work with, skip the cycle.
+        // No emptiness check here.
+        //
+        // There used to be one, and it assembled the whole context to look at
+        // its length and then threw it away — a full pass over the event log
+        // and a full token count per turn, growing with the conversation,
+        // plus a duplicate `agent.context.assembled` that made the context
+        // panel report twice as many requests as were made. With the
+        // summarizing assembler it could even spend an LLM call before the
+        // turn had formally begun.
+        //
+        // It was redundant. `run_react_step` already refuses to call a
+        // provider with an empty message list and returns `Done`, which is
+        // where that invariant belongs: the strategy is what holds the
+        // assembler and what talks to the model. Asking the same question a
+        // layer up meant duplicating the strategy's work to make a decision
+        // the strategy was already making.
+        //
+        // The visible difference: a turn with nothing to do now publishes
+        // `cycle.start` and `cycle.end` and does nothing between them, rather
+        // than returning before either. A cycle was attempted, and the log
+        // says so.
         let initial_events = self.bus.log().await;
-        let initial_ctx = AssemblyContext::new(&initial_events);
-        let initial_messages = self.context.assemble(&initial_ctx).await;
-        if initial_messages.is_empty() {
-            return Ok(());
-        }
 
         // ── Stuck detection ───────────────────────────────────────────────────
         // Check the recent event log for loop patterns before committing to a

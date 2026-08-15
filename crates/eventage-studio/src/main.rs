@@ -59,6 +59,12 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything else, including argument parsing: a process started
+    // with the sandbox marker is not really this program, it is a trampoline
+    // that confines itself and execs the real command. Never returns when it
+    // matches.
+    eventage_code::shell_sandbox::run_if_helper();
+
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -78,9 +84,20 @@ async fn main() -> Result<()> {
     .display()
     .to_string();
 
+    // A workspace configured for an Anthropic-compatible gateway keeps its
+    // endpoint, credential and routing headers in `.claude/settings.json`.
+    // Read before the model is resolved; existing variables are left alone.
+    let settings = eventage_code::settings::ClaudeSettings::load(&cwd);
+    let applied = settings.apply_env();
+    if !applied.is_empty() {
+        // Names only. Several of these are credentials.
+        tracing::info!(vars = ?applied, "applied .claude/settings.json");
+    }
+    let model_choice = cli.model.or(settings.model);
+
     let backend: Arc<dyn Backend> = match cli.acp {
         Some(command) => Arc::new(AcpBackend::new(command, cwd.clone())?),
-        None => Arc::new(LocalBackend::new(ModelConfig::from_env(cli.model), cwd.clone()).await),
+        None => Arc::new(LocalBackend::new(ModelConfig::from_env(model_choice), cwd.clone()).await),
     };
 
     let info = backend.info();

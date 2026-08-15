@@ -314,11 +314,29 @@ pub async fn execute_tools(
                         None => exec.await,
                     };
                     match outcome {
-                        Ok(r) => json!({
-                            "tool_call_id": tc_id,
-                            "name": tc_name,
-                            "result": cap_result_value(r, max_result_chars)
-                        }),
+                        Ok(r) => {
+                            // The event keeps the whole result; only the copy
+                            // the model is shown is capped.
+                            //
+                            // Truncating before publishing meant the log held
+                            // the short version, which quietly falsified two
+                            // things: that a run can be replayed or audited
+                            // from its events, and that
+                            // `ToolResultClearingAssembler` is lossless when
+                            // it drops a result body "because the full output
+                            // is still in the log".
+                            let capped = cap_result_value(r.clone(), max_result_chars);
+                            let truncated = capped != r;
+                            let mut payload = json!({
+                                "tool_call_id": tc_id,
+                                "name": tc_name,
+                                "result": r,
+                            });
+                            if truncated {
+                                payload["result_for_context"] = capped;
+                            }
+                            payload
+                        }
                         Err(e) => {
                             warn!("tool '{}' returned error: {}", tc_name, e);
                             json!({

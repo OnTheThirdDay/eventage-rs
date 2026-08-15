@@ -259,6 +259,24 @@ impl DynamicHookChain {
             .clear();
     }
 
+    /// Swap the whole chain in one lock acquisition.
+    ///
+    /// `remove_all` followed by `add_*` leaves an interval with no hooks
+    /// installed, and a concurrent tool preflight that lands in it finds
+    /// nothing gating it. Anything replacing a *policy* wants this rather
+    /// than the pair.
+    pub fn replace_all(&self, hooks: Vec<Arc<dyn CycleHook>>) {
+        let mut guard = self.hooks.write().unwrap_or_else(|e| e.into_inner());
+        guard.clear();
+        for hook in hooks {
+            let id = HookId(
+                self.next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            );
+            guard.push((id, hook));
+        }
+    }
+
     /// Returns the current number of registered hooks.
     pub fn len(&self) -> usize {
         self.hooks.read().unwrap_or_else(|e| e.into_inner()).len()

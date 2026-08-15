@@ -113,6 +113,17 @@ impl SandboxExecutor for LandlockExecutor {
     }
 }
 
+/// Apply a Landlock ruleset to the current process (or the forked child).
+///
+/// Public so a host application can confine a process it spawns itself
+/// without adopting the whole executor — the coding agent's `bash` does
+/// exactly that from `pre_exec`. Filesystem only: no network isolation and no
+/// resource limits. Returns `Err` on kernels without Landlock, which callers
+/// generally want to treat as "unavailable" rather than fatal.
+pub fn landlock_confine(readable: &[PathBuf], writable: &[PathBuf]) -> Result<(), String> {
+    apply_landlock(readable, writable)
+}
+
 fn apply_landlock(readable: &[PathBuf], writable: &[PathBuf]) -> Result<(), String> {
     use landlock::{
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,

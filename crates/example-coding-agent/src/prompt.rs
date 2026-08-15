@@ -1,37 +1,42 @@
 //! System prompt construction.
 
-use crate::config::PermissionMode;
-
 /// Build the system prompt for a session.
 ///
 /// Project context (`AGENTS.md`/`CLAUDE.md`) and the skills listing are
 /// appended by the caller so they stay a stable prefix for prompt caching.
-pub fn build_system_prompt(cwd: &str, mode: PermissionMode) -> String {
-    let mode_note = match mode {
-        PermissionMode::Plan => {
-            "CURRENT MODE: PLAN. You are in read-only research mode. Investigate and \
-             produce a concrete plan, but do NOT modify files or run mutating commands. \
-             Present the plan and wait for the user to switch modes."
-        }
-        PermissionMode::Ask => {
-            "CURRENT MODE: ASK. Edits and commands require the user's approval. Batch \
-             related changes so the user reviews coherent units of work."
-        }
-        PermissionMode::Auto => {
-            "CURRENT MODE: AUTO. Reads, searches, and edits inside the workspace run \
-             without prompting; destructive or outbound actions still ask."
-        }
-        PermissionMode::Yolo => {
-            "CURRENT MODE: FULL ACCESS. Nothing is gated. Be correspondingly careful."
-        }
-    };
+/// Build the system prompt for a session.
+///
+/// Project context (`AGENTS.md`/`CLAUDE.md`) and the skills listing are
+/// appended by the caller so they stay a stable prefix for prompt caching.
+///
+/// Deliberately says nothing about *which* mode is in force. It used to name
+/// it, and the sentence stayed in the prompt after the user switched — so the
+/// model was told it was in Plan mode while running under Auto, or the
+/// reverse. Fixing that by regenerating the prompt would have meant rewriting
+/// the cacheable prefix on every mode change, for a fact the model does not
+/// need in advance: hooks enforce the mode regardless of what the prompt
+/// says, and a refusal already arrives with the reason attached ("you are in
+/// PLAN mode: propose this change instead"). Describing how modes behave is
+/// stable and true in all four.
+pub fn build_system_prompt(cwd: &str) -> String {
+    const MODE_NOTE: &str = "\
+## Permissions
+
+This session runs in one of four modes and the user can change it mid-session, \
+so do not assume which is active. Plan is read-only research; Ask approves each \
+edit and command; Auto applies workspace edits and asks for destructive or \
+outbound ones; Full access gates nothing.
+
+You will find out by being refused. A refusal names the mode and says what to \
+do instead — take it at face value and follow it rather than retrying, working \
+around it, or telling the user it succeeded.";
 
     format!(
         "You are eventage-code, a coding agent operating inside the user's editor.
 
 Working directory: {cwd}
 
-{mode_note}
+{MODE_NOTE}
 
 ## Grounding
 
@@ -106,7 +111,7 @@ mod tests {
         //
         // What needs discipline is a claim, whatever surrounds it. Keep this
         // section free of any "when you are doing X" qualifier.
-        let prompt = build_system_prompt("/repo", PermissionMode::Ask);
+        let prompt = build_system_prompt("/repo");
         let grounding = prompt
             .split("## Grounding")
             .nth(1)
@@ -135,7 +140,7 @@ mod tests {
     fn grounding_comes_before_the_task_specific_advice() {
         // It governs everything below it; burying it under "how to edit"
         // is how it came to be read as advice for editing.
-        let prompt = build_system_prompt("/repo", PermissionMode::Ask);
+        let prompt = build_system_prompt("/repo");
         assert!(
             prompt.find("## Grounding") < prompt.find("## How to work"),
             "grounding should lead"
@@ -144,7 +149,7 @@ mod tests {
 
     #[test]
     fn honesty_about_results_is_stated_once() {
-        let prompt = build_system_prompt("/repo", PermissionMode::Ask);
+        let prompt = build_system_prompt("/repo");
         assert_eq!(
             prompt.matches("did not check").count(),
             1,
@@ -154,15 +159,25 @@ mod tests {
 
     #[test]
     fn concision_never_outranks_correctness() {
-        let prompt = build_system_prompt("/repo", PermissionMode::Ask);
+        let prompt = build_system_prompt("/repo");
         assert!(prompt.contains("never at the cost of being right"));
     }
 
     #[test]
-    fn every_mode_states_what_it_permits() {
-        for mode in PermissionMode::ALL {
-            let prompt = build_system_prompt("/repo", mode);
-            assert!(prompt.contains("CURRENT MODE"), "{:?}", mode);
+    fn the_prompt_does_not_name_a_mode_that_can_change_under_it() {
+        // Naming the active mode meant the sentence went stale the moment the
+        // user switched, and the model was told it was somewhere it was not.
+        let prompt = build_system_prompt("/repo");
+        for word in ["CURRENT MODE", "You are in read-only", "Nothing is gated"] {
+            assert!(
+                !prompt.contains(word),
+                "the prompt still pins a mode: {word}"
+            );
+        }
+        // It still explains how to react to being refused.
+        assert!(prompt.contains("refused"), "{prompt}");
+        for mode in crate::config::PermissionMode::ALL {
+            let _ = mode;
             assert!(prompt.contains("/repo"));
         }
     }

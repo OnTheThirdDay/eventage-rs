@@ -150,7 +150,7 @@ impl WorkerSet {
 
 /// Spawns [`EventWorker`]s as background tasks on a shared [`EventBus`].
 ///
-/// Each call to [`add`][Self::add] creates a new subscription and Tokio task.
+/// Each call to [`add_worker`](Self::add_worker) creates a new subscription and Tokio task.
 /// The task runs until the bus closes (all `EventBus` clones dropped).
 ///
 /// `DynamicWorkerHandle` is `Clone` — all clones spawn tasks on the same bus.

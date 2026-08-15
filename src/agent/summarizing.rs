@@ -819,7 +819,7 @@ fn at_task_boundary(events: &[Event]) -> bool {
 
 // ── AGENT_CONTEXT_SUMMARIZED event helper ─────────────────────────────────────
 
-/// Build the payload for an [`AGENT_CONTEXT_SUMMARIZED`](kinds::AGENT_CONTEXT_SUMMARIZED)
+/// Build the payload for an [`kinds::AGENT_CONTEXT_SUMMARIZED`]
 /// event. Callers that have access to the EventBus can publish this after detecting
 /// that summarization occurred.
 pub fn context_summarized_payload(

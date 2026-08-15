@@ -3,7 +3,7 @@
 //! Determines action when a rejected branch exceeds [`crate::BusConfig::max_retained_branches`].
 //!
 //! # Provided Strategies
-//! - [`PruneStrategy`] (core): Deletes immediately. Memory-efficient.
+//! - [`PruneStrategy`](crate::PruneStrategy) (core): Deletes immediately. Memory-efficient.
 //! - [`EpitaphStrategy`]: Uses an LLM to generate a concise summary before deleting.
 //!
 //! # Custom Strategies
@@ -36,7 +36,7 @@ impl EpitaphStrategy {
     /// Creates an `EpitaphStrategy` backed by `llm`.
     ///
     /// Spawns a background task to process evicted branches. The queue is
-    /// bounded to [`EPITAPH_QUEUE_DEPTH`] entries; excess evictions are dropped
+    /// bounded to `EPITAPH_QUEUE_DEPTH` entries; excess evictions are dropped
     /// with a warning rather than growing the queue unboundedly.
     pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
         let (tx, rx) = mpsc::channel::<BranchData>(EPITAPH_QUEUE_DEPTH);

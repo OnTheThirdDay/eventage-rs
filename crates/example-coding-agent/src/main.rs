@@ -38,6 +38,20 @@ struct Cli {
     #[arg(long, global = true)]
     model: Option<String>,
 
+    /// How shell commands are contained: host | confined | strict | container.
+    ///
+    /// `confined` scrubs credentials, isolates the process group, caps
+    /// resources and confines the filesystem where the kernel allows.
+    /// `strict` additionally denies the network and refuses to run at all if
+    /// it cannot confine. `container` runs in a throwaway container — a real
+    /// boundary, but only what the image contains is available.
+    #[arg(long, global = true, default_value = "confined")]
+    sandbox: String,
+
+    /// Image for `--sandbox container`.
+    #[arg(long, global = true)]
+    container_image: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -68,8 +82,29 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything else, including argument parsing: a process started
+    // with the sandbox marker is not really this program, it is a trampoline
+    // that confines itself and execs the real command. Never returns when it
+    // matches.
+    eventage_code::shell_sandbox::run_if_helper();
+
     let cli = Cli::parse();
-    let model = ModelConfig::from_env(cli.model);
+
+    // Read before the model is resolved: this is where a workspace configured
+    // for a gateway keeps its endpoint, credential and routing headers.
+    // Existing environment variables are left alone.
+    let settings =
+        eventage_code::settings::ClaudeSettings::load(std::env::current_dir().unwrap_or_default());
+    let _applied = settings.apply_env();
+    let model = ModelConfig::from_env(cli.model.or(settings.model));
+    let container_image = cli.container_image.clone();
+    let shell = eventage_code::tools::ShellContainment::from_id(&cli.sandbox).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown --sandbox '{}' (expected {})",
+            cli.sandbox,
+            eventage_code::tools::ShellContainment::NAMES
+        )
+    })?;
 
     match cli.command {
         // Logs must never touch stdout: it carries the protocol.
@@ -97,7 +132,7 @@ async fn main() -> Result<()> {
                 )
                 .with_writer(std::io::stderr)
                 .init();
-            run_headless(model, prompt, cwd, mode, json, yes).await
+            run_headless(model, prompt, cwd, mode, json, yes, shell, container_image).await
         }
     }
 }
@@ -177,6 +212,7 @@ fn spawn_headless_approver(bus: EventBus, auto_approve: bool) -> tokio::task::Jo
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_headless(
     model: ModelConfig,
     prompt: String,
@@ -184,9 +220,15 @@ async fn run_headless(
     mode: String,
     as_json: bool,
     auto_approve: bool,
+    shell: eventage_code::tools::ShellContainment,
+    container_image: Option<String>,
 ) -> Result<()> {
     let cwd = std::fs::canonicalize(&cwd)?.display().to_string();
     let mut config = SessionConfig::new(cwd, model);
+    config.shell = shell;
+    if let Some(image) = container_image {
+        config.container_image = image;
+    }
     config.mode = PermissionMode::from_id(&mode)
         .ok_or_else(|| anyhow::anyhow!("unknown mode '{mode}' (plan|ask|auto|yolo)"))?;
 

@@ -112,7 +112,7 @@ Boot up multiple independent agents on the same or separate `EventBus`. Because 
 When an agent decides to compile arbitrary C code or run a shell script, Eventage supports wrapping those tool executions in pluggable execution contexts. Be honest about what each buys you: **`DockerExecutor`** is the option for untrusted code (no network, memory/CPU/pid caps, `--cap-drop=ALL`, `no-new-privileges`, fresh container per call, killed on timeout); **`LandlockExecutor`** is filesystem-only defense-in-depth (no network or resource isolation — a seatbelt, not a boundary); **`WasmExecutor`** runs WASI modules with fuel, memory, and output caps. All executors run with a scrubbed environment so host API keys never reach sandboxed code.
 
 ### 5. Harness Guardrails, On By Default
-The ReAct loop is production-hardened out of the box: per-tool wall-clock timeouts, middle-truncation of oversized tool outputs (the full data stays in the event log), model-visible feedback for malformed tool arguments and policy denials (`HookAction::Deny("reason")`), loop/stuck detection whose hints actually reach the model, and a graceful tool-free wrap-up turn when the step budget runs out. The LLM layer composes `RetryProvider` (exponential backoff on 429/5xx) with `RateLimitedProvider` (request pacing).
+The ReAct loop is production-hardened out of the box: per-tool wall-clock timeouts, middle-truncation of oversized tool outputs for the model, with the full result kept in the event (`result_for_context` carries the shortened copy), model-visible feedback for malformed tool arguments and policy denials (`HookAction::Deny("reason")`), loop/stuck detection whose hints actually reach the model, and a graceful tool-free wrap-up turn when the step budget runs out. The LLM layer composes `RetryProvider` (exponential backoff on 429/5xx) with `RateLimitedProvider` (request pacing).
 
 ### 6. Layered Context Management: Edit the View, Not the History
 Because the event log is the source of truth, context management is *assembly-time editing* — lossless by construction. `ToolResultClearingAssembler` reclaims budget for free by clearing stale tool outputs from the LLM's view — ranked by how much budget each one holds, so a 60 KB file dump goes before a dozen 200-byte search hits, and a monotonic ratchet keeps the edited view prompt-cache friendly. `SummarizingContextAssembler` folds old conversation into an LLM-generated summary only when clearing isn't enough: it waits for a task boundary where it can, decides retention in tokens rather than message counts, cuts only where a turn begins, and compresses to a low-water mark so one pass buys a long stretch instead of a few turns. Reasoning traces from thinking models and cached-token usage are captured on every `assistant.message` event for observability and replay.
@@ -159,13 +159,13 @@ cargo run -p eventage-studio -- --acp eventage-code   # or drive any ACP agent
 
 ## ⚡ Getting Started
 
-The quickest way to get an agent off the ground is using the **Session API** provided by `eventage-provided-impl`, which wraps an internal `EventBus` and `Agent` away behind a clean chat interface.
+The quickest way to get an agent off the ground is the **Session API**, which wraps an internal `EventBus` and `Agent` away behind a clean chat interface.
+
+Eventage is one crate with feature flags, not a family of them — the split into `eventage-core`/`eventage-llm`/`eventage-provided-impl` that earlier versions of this document described no longer exists.
 
 ```toml
 [dependencies]
-eventage-core = "0.1"
-eventage-provided-impl = "0.1"
-eventage-llm = "0.1"
+eventage = { version = "0.2", features = ["observability", "sqlite-bundled", "mcp"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -196,11 +196,12 @@ async fn main() -> anyhow::Result<()> {
 
 For a deep dive into the framework's mechanics — from low-level bus routing, to SQLite DAG persistence, OpenTelemetry exports, and Docker-bound landlocked execution environments — refer to the exhaustive [Developer Guide](docs/DEV-GUIDE.md) and [API Reference](docs/API.md).
 
-You can also explore the `crates/` directory to see production-grade examples built natively with Eventage:
+Full applications live in `crates/`:
 *   `example-coding-agent` — `eventage-code`, an LSP-aware coding agent that speaks the Agent Client Protocol, so it runs inside Zed, JetBrains, or any ACP-capable editor.
 *   `eventage-studio` — a desktop app for that agent: the conversation on one side, a live trace of the event log on the other. See [its README](crates/eventage-studio/README.md).
-*   `example-basic-chat` — Multi-turn standard chat using the Session API.
-*   `example-workflow` — Sequential PRD-writing pipeline with human review.
-*   `example-multi-agent` — Orchestrator-and-Worker routing inside an `AgentSet`.
-*   `example-clang-agent` — Advanced C-programming showcase proving complex OS-level sandboxing interactions.
+*   `example-eventage-claw` — a general-purpose work agent, not a coding one.
+*   `example-clang-agent` — C programming against the sandboxed executors.
+*   `eventage-replay-cli` — replay a recorded event log.
+
+Smaller, single-file examples are in `examples/` and run with `cargo run --example <name>`: `basic_chat`, `tool_use`, `reactive_chat`, `workflow`, `multi_agent`, `planner_critic`, `tutorial_agent`, `prompt_inventory`.
 

@@ -14,6 +14,10 @@ name = "eventage-code"
 path = "src/main.rs"
 
 [dependencies]
+# Capability-based filesystem access: the workspace is confined by an open
+# directory handle (openat2/RESOLVE_BENEATH on Linux), not by path strings.
+cap-std = "3"
+
 eventage           = { path = "../..", features = ["observability", "sqlite-bundled", "mcp", "sandbox"] }
 tokio              = { version = "1", features = ["full"] }
 serde              = { version = "1", features = ["derive"] }
@@ -35,3 +39,8 @@ ignore             = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+
+# `setsid` in the pre-exec of a shell command, so a timeout kills the whole
+# process tree rather than the shell alone.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

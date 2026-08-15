@@ -8,7 +8,7 @@
 //! # Tools
 //! - [`AddTaskTool`]      — add a top-level or nested task
 //! - [`CompleteTaskTool`] — mark a task done by id or title
-//! - [`ListTasksTool`]    — return the current task tree as formatted text
+//! - `ListTasksTool`    — return the current task tree as formatted text
 
 use async_trait::async_trait;
 use eventage::{AgentError, Event, EventBus, Tool, ToolDefinition};

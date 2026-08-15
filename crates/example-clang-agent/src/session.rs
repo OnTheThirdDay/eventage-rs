@@ -17,7 +17,7 @@ pub struct SessionMeta {
 /// Manages the on-disk state for one agent session.
 ///
 /// Layout under `sessions_root/{id}/`:
-/// ```
+/// ```text
 /// session.json    — metadata
 /// events.jsonl    — one serialised Event per line (append-only)
 /// workspace/      — the agent's file sandbox

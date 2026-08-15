@@ -566,6 +566,19 @@ impl Session for LocalSession {
         }
         self.bridge.abort();
         self.feed.close();
+
+        // Wait for the log to be written before saying the session is closed.
+        // Dropping the persistence task instead lost whatever it had not yet
+        // flushed — the last events of the session, which are exactly the
+        // ones a resume needs.
+        let failures = self.session.close().await;
+        if failures > 0 {
+            warn!(
+                failures,
+                session = %self.id,
+                "events failed to reach the log; this session's history is incomplete"
+            );
+        }
     }
 }
 

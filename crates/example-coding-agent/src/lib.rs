@@ -12,5 +12,7 @@ pub mod config;
 pub mod lsp;
 pub mod prompt;
 pub mod repomap;
+pub mod settings;
+pub mod shell_sandbox;
 pub mod tools;
 pub mod workspace;

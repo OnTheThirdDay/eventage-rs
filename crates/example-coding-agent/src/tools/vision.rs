@@ -85,9 +85,13 @@ impl Tool for ViewImage {
             )));
         };
 
-        let meta = tokio::fs::metadata(&abs)
+        // Through the workspace handle, so a symlink pointing out of the
+        // repository cannot be read as an "image".
+        let meta = self
+            .ws
+            .metadata(&path)
             .await
-            .map_err(|e| tool_err(format!("cannot read '{path}': {e}")))?;
+            .map_err(|e| tool_err(format!("{e:#}")))?;
         if meta.len() > MAX_IMAGE_BYTES {
             return Err(tool_err(format!(
                 "'{path}' is {:.1} MB, over the {} MB limit for images",
@@ -96,9 +100,11 @@ impl Tool for ViewImage {
             )));
         }
 
-        let bytes = tokio::fs::read(&abs)
+        let bytes = self
+            .ws
+            .read(&path)
             .await
-            .map_err(|e| tool_err(format!("cannot read '{path}': {e}")))?;
+            .map_err(|e| tool_err(format!("{e:#}")))?;
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         Ok(json!({

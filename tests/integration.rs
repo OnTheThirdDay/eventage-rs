@@ -1047,15 +1047,34 @@ async fn oversized_tool_results_are_middle_truncated() {
 
     let log = bus.log().await;
     let result = log.iter().find(|e| e.kind == kinds::TOOL_RESULT).unwrap();
-    let text = result.payload["result"].as_str().unwrap();
+
+    // The cap applies to the copy the model is shown. This test used to
+    // assert it on `result` itself, which encoded the defect: the event held
+    // the shortened text and the original was unrecoverable, contradicting
+    // both the README and the clearing assembler's claim to be lossless.
+    let for_context = result.payload["result_for_context"].as_str().unwrap();
     assert!(
-        text.len() < 2_000,
-        "result should be capped, got {}",
-        text.len()
+        for_context.len() < 2_000,
+        "the context copy should be capped, got {}",
+        for_context.len()
     );
-    assert!(text.contains("HEAD"), "head must be preserved");
-    assert!(text.contains("TAIL"), "tail must be preserved");
-    assert!(text.contains("elided by the harness"), "marker missing");
+    assert!(for_context.contains("HEAD"), "head must be preserved");
+    assert!(for_context.contains("TAIL"), "tail must be preserved");
+    assert!(
+        for_context.contains("elided by the harness"),
+        "marker missing"
+    );
+
+    // And the event still carries the whole thing.
+    let full = result.payload["result"].as_str().unwrap();
+    assert!(
+        full.len() > for_context.len(),
+        "the log kept only the truncated copy"
+    );
+    assert!(
+        !full.contains("elided by the harness"),
+        "the record was edited"
+    );
 }
 
 #[tokio::test]
@@ -1624,4 +1643,75 @@ async fn interrupted_tool_call_is_reconciled_before_the_next_cycle() {
         .as_deref()
         .unwrap()
         .contains("UNKNOWN whether it took effect"));
+}
+
+#[tokio::test]
+async fn a_turn_assembles_once_per_model_call_and_no_more() {
+    // `cycle` used to assemble the whole context just to look at its length,
+    // then throw it away — a full pass over the log and a full token count
+    // per turn, plus a duplicate assembly record that made the context panel
+    // report twice as many requests as were made. The strategy already
+    // refused to call a provider with nothing, so the check was redundant.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting {
+        inner: eventage::agent::DefaultContextAssembler,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ContextAssembler for Counting {
+        async fn assemble(&self, ctx: &AssemblyContext<'_>) -> Vec<ChatMessage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.assemble(ctx).await
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::with_texts(["done"]))
+        .context(Counting {
+            inner: eventage::agent::DefaultContextAssembler::new("you are a test"),
+            calls: Arc::clone(&calls),
+        })
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({ "text": "go" })))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    // One model call, so one assembly. It was two.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the turn assembled more times than it called the model"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_with_nothing_to_do_is_recorded_rather_than_skipped() {
+    // The visible cost of removing the check: an empty turn now opens and
+    // closes a cycle instead of returning before either. It must still not
+    // reach the model.
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::with_texts(["should never be called"]))
+        .strategy(ReactStrategy::default())
+        .build();
+
+    agent.cycle().await.unwrap();
+
+    let log = bus.log().await;
+    assert!(
+        !log.iter().any(|e| e.kind == kinds::ASSISTANT_MESSAGE),
+        "an empty turn must not produce a reply"
+    );
+    assert!(
+        log.iter().any(|e| e.kind == kinds::AGENT_CYCLE_END),
+        "and the attempt should be in the log"
+    );
 }

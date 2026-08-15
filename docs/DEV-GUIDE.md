@@ -175,7 +175,7 @@ An `ExecutionStrategy` dictates the precise orchestration inside a reasoning cyc
 | Field | Default | Behavior |
 |---|---|---|
 | `tool_timeout` | `300s` | A hung tool produces an error `tool.result` (visible to the model) instead of blocking the cycle forever. |
-| `max_tool_result_chars` | `30_000` | Oversized tool outputs are middle-truncated (head + tail preserved) with an explanatory marker; the full output stays in the event log. |
+| `max_tool_result_chars` | `30_000` | Oversized tool outputs are middle-truncated (head + tail preserved) with an explanatory marker into `result_for_context`; the event's `result` keeps the whole output. |
 | `finalize_on_max_steps` | `true` | On step-budget exhaustion the strategy makes one final *tool-free* LLM call, nudging the model to report progress, remaining work, and blockers — instead of erroring with `MaxStepsReached`. |
 
 Malformed tool arguments (invalid JSON) never reach the tool: the parse error is returned to the model as a tool error so it can self-correct on the next step. Parsed arguments are additionally validated against the tool's JSON Schema (`type` / `required` / `properties` / `items` / `enum`) — violations are phrased for the model (`ToolExecOptions { validate_args: false, .. }` opts out).

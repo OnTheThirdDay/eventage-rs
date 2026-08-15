@@ -7,6 +7,7 @@ use std::path::Path;
 /// Operating mode, surfaced to the editor through ACP `session/set_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u8)]
 pub enum PermissionMode {
     /// Read-only research; edits and commands are refused with an explanation.
     Plan,
@@ -16,6 +17,29 @@ pub enum PermissionMode {
     Auto,
     /// Nothing is gated.
     Yolo,
+}
+
+/// A permission mode readable from anywhere, updated when the user changes it.
+///
+/// Subagents and tools need the mode *now*, not the one that was in force when
+/// they were constructed — a session switched from Auto to Plan mid-run was
+/// still handing new subagents an Auto policy.
+#[derive(Debug)]
+pub struct SharedMode(std::sync::atomic::AtomicU8);
+
+impl SharedMode {
+    pub fn new(mode: PermissionMode) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(mode as u8))
+    }
+
+    pub fn load(&self) -> PermissionMode {
+        PermissionMode::ALL[self.0.load(std::sync::atomic::Ordering::Relaxed) as usize]
+    }
+
+    pub fn store(&self, mode: PermissionMode) {
+        self.0
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl PermissionMode {
@@ -71,8 +95,15 @@ impl PermissionMode {
         "lsp_references",
         "lsp_hover",
         "lsp_symbols",
-        "task",
+        // `task` is *not* here. An isolated run creates a git branch and a
+        // worktree before the child's policy is applied, and creating
+        // repository metadata is mutation whatever the child then does.
+        "task_explore",
         "view_image",
+        "repo_map",
+        "jobs",
+        // Runs only build and test commands, with no shell involved.
+        "verify",
     ];
 
     /// Tools that modify the workspace.
@@ -82,6 +113,8 @@ impl PermissionMode {
         "multi_edit",
         "apply_patch",
         "lsp_rename",
+        // Delegating work that may edit, in a worktree it creates.
+        "task",
     ];
 
     /// Tools that reach outside the workspace or can destroy work.
@@ -130,48 +163,37 @@ impl PermissionMode {
     ///
     /// Subagents used to run with **no policy at all** — a `general` subagent
     /// could write files and run shell commands in any mode, including Plan.
-    /// They inherit the parent's rules now, with two adjustments that follow
-    /// from what a subagent is:
+    /// Then they inherited the parent's rules with every prompt turned into a
+    /// refusal, because a subagent's bus had no UI on the other end and an
+    /// `Ask` would have hung forever.
     ///
-    /// * There is nobody to ask. A subagent's bus has no UI on the other end,
-    ///   so anything the parent would have prompted about is denied instead,
-    ///   with a reason the subagent can put in its report.
-    /// * An **isolated** subagent may still edit, because it edits a throwaway
-    ///   git worktree rather than the user's files, and its diff comes back
-    ///   for review rather than landing.
+    /// Neither is true now. Permission requests are relayed to the parent's
+    /// bus, where the editor is already listening, so a subagent can be asked
+    /// about exactly like the agent that spawned it — which is what lets it
+    /// have a shell at all. It therefore runs under the parent's own policy.
+    ///
+    /// The one adjustment: an **isolated** subagent may edit without asking,
+    /// because it edits a throwaway git worktree rather than the user's files
+    /// and its diff comes back for review rather than landing. Shell commands
+    /// there still ask, because a worktree does not contain them.
     pub fn subagent_policy(&self, isolated: bool) -> PermissionPolicyHook {
-        const NO_ONE_TO_ASK: &str =
-            "this needs the user's approval and a subagent has nobody to ask — \
-             report what you need and let your caller do it";
-
-        let mut policy = PermissionPolicyHook::new();
-        for pattern in Self::READ_ONLY_TOOLS {
-            policy = policy.allow(*pattern);
+        // Editing a disposable checkout is not editing the user's workspace,
+        // and its diff comes back for review rather than landing, so an
+        // isolated subagent does not prompt for every file it touches.
+        if isolated && !matches!(self, PermissionMode::Plan) {
+            let mut policy = PermissionPolicyHook::new();
+            for pattern in Self::READ_ONLY_TOOLS {
+                policy = policy.allow(*pattern);
+            }
+            for pattern in Self::EDIT_TOOLS {
+                policy = policy.allow(*pattern);
+            }
+            for pattern in Self::RISKY_TOOLS {
+                policy = policy.ask(*pattern);
+            }
+            return policy.ask_by_default();
         }
-
-        if matches!(self, PermissionMode::Yolo) {
-            return policy.allow("*");
-        }
-
-        // Editing a disposable checkout is not editing the user's workspace.
-        let edits_allowed = isolated && !matches!(self, PermissionMode::Plan);
-        for pattern in Self::EDIT_TOOLS {
-            policy = if edits_allowed {
-                policy.allow(*pattern)
-            } else if matches!(self, PermissionMode::Plan) {
-                policy.deny(
-                    *pattern,
-                    "you are part of a session in PLAN mode: describe the change, \
-                     do not make it",
-                )
-            } else {
-                policy.deny(*pattern, NO_ONE_TO_ASK)
-            };
-        }
-        for pattern in Self::RISKY_TOOLS {
-            policy = policy.deny(*pattern, NO_ONE_TO_ASK);
-        }
-        policy.deny_by_default(NO_ONE_TO_ASK)
+        self.policy()
     }
 }
 
@@ -184,6 +206,12 @@ pub struct ModelConfig {
     /// Extended-thinking budget (Anthropic) or reasoning effort mapping.
     pub thinking_tokens: Option<u32>,
     pub max_tokens: u32,
+    /// Send the credential as `Authorization: Bearer` — what gateways take.
+    pub bearer_auth: bool,
+    /// Endpoint override, for a gateway sitting in front of the provider.
+    pub base_url: Option<String>,
+    /// Headers a gateway routes on, e.g. `x-portkey-provider`.
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,13 +229,29 @@ impl ModelConfig {
     /// Prefers Anthropic, then the OpenAI Responses API, then any
     /// OpenAI-compatible endpoint (Ollama and friends need no key).
     pub fn from_env(model_override: Option<String>) -> Self {
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        // `ANTHROPIC_AUTH_TOKEN` is what a gateway in front of the Messages
+        // API is given, and it travels as a bearer token rather than as
+        // `x-api-key` — the same split Anthropic's own SDKs make. Checked
+        // first so that a workspace configured for a gateway uses the
+        // gateway, not a stray key left in the environment.
+        let bearer = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        if let Some(key) = bearer
+            .clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        {
             return Self {
                 provider: Provider::Anthropic,
-                model: model_override.unwrap_or_else(|| "claude-sonnet-4-5".into()),
+                model: model_override
+                    .or_else(|| std::env::var("ANTHROPIC_MODEL").ok())
+                    .unwrap_or_else(|| "claude-sonnet-4-5".into()),
                 api_key: key,
                 thinking_tokens: Some(8_000),
                 max_tokens: 32_000,
+                bearer_auth: bearer.is_some(),
+                base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
+                headers: std::env::var("ANTHROPIC_CUSTOM_HEADERS")
+                    .map(|raw| crate::settings::parse_custom_headers(&raw))
+                    .unwrap_or_default(),
             };
         }
         // Qwen first: it needs its own dialect, not OpenAI's.
@@ -218,6 +262,7 @@ impl ModelConfig {
                 api_key: key,
                 thinking_tokens: None,
                 max_tokens: 32_000,
+                ..Self::gatewayless()
             };
         }
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
@@ -227,6 +272,7 @@ impl ModelConfig {
                 api_key: key,
                 thinking_tokens: None,
                 max_tokens: 32_000,
+                ..Self::gatewayless()
             };
         }
         Self {
@@ -235,6 +281,21 @@ impl ModelConfig {
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "ollama".into()),
             thinking_tokens: None,
             max_tokens: 8_000,
+            ..Self::gatewayless()
+        }
+    }
+
+    /// Defaults for the gateway fields, which only Anthropic reads today.
+    fn gatewayless() -> Self {
+        Self {
+            provider: Provider::OpenAiChat,
+            model: String::new(),
+            api_key: String::new(),
+            thinking_tokens: None,
+            max_tokens: 0,
+            bearer_auth: false,
+            base_url: None,
+            headers: Vec::new(),
         }
     }
 
@@ -249,6 +310,28 @@ impl ModelConfig {
             _ => "http://localhost:11434/v1".into(),
         })
     }
+}
+
+/// Eight hex characters identifying a workspace by its canonical path.
+fn workspace_digest(cwd: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let canonical = std::fs::canonicalize(cwd)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| cwd.to_string());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+/// Is this a session identifier we are willing to turn into a file path?
+///
+/// The id arrives from the client — `session/load` over ACP, a resume request
+/// in Studio — and is joined into the state directory to name a database. A
+/// `..` in it walks out of that directory; a `/` puts the file somewhere else
+/// entirely. Ids we mint are UUIDs, so requiring that shape costs nothing and
+/// removes the question.
+pub fn is_valid_session_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok()
 }
 
 /// An MCP server the editor asked us to connect.
@@ -276,6 +359,10 @@ pub struct SessionConfig {
     pub token_budget: u64,
     /// Context window to keep assembled context inside.
     pub context_tokens: usize,
+    /// How shell commands are contained.
+    pub shell: crate::tools::ShellContainment,
+    /// Image for container containment.
+    pub container_image: String,
 }
 
 impl SessionConfig {
@@ -287,22 +374,38 @@ impl SessionConfig {
             mcp_servers: Vec::new(),
             token_budget: 0,
             context_tokens: 160_000,
+            shell: crate::tools::ShellContainment::Confined,
+            container_image: crate::tools::DEFAULT_CONTAINER_IMAGE.to_string(),
         }
     }
 
     /// Directory holding session state and logs for this workspace.
+    ///
+    /// Named for the directory *and* a digest of its canonical path. The name
+    /// alone is not an identity: everybody has more than one checkout called
+    /// `api`, and they were sharing a state directory — one repository's
+    /// sessions listed under another, resumable against the wrong code.
+    ///
+    /// A directory left by the older, name-only scheme is still used if it
+    /// exists, so nobody's history disappears on upgrade.
     pub fn state_dir(&self) -> std::path::PathBuf {
         let base = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("eventage-code");
-        let slug: String = Path::new(&self.cwd)
+
+        let name: String = Path::new(&self.cwd)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("workspace")
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '-' })
             .collect();
-        base.join(slug)
+
+        let legacy = base.join(&name);
+        if legacy.is_dir() {
+            return legacy;
+        }
+        base.join(format!("{name}-{}", workspace_digest(&self.cwd)))
     }
 }
 
@@ -360,9 +463,24 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_cannot_do_what_its_parent_would_have_had_to_ask_about() {
-        // Subagents ran with no policy at all: a `general` one could write
-        // files and run shell commands in every mode, Plan included.
+    fn a_subagent_is_asked_about_exactly_like_its_parent() {
+        // This used to assert the opposite — that nothing may `Ask`, because
+        // a subagent's bus had no UI on the other end and a prompt would hang
+        // forever. Requests are relayed to the parent's bus now, so the
+        // limitation is gone and with it the reason to deny.
+        for mode in [PermissionMode::Ask, PermissionMode::Auto] {
+            let parent = mode.policy();
+            let child = mode.subagent_policy(false);
+            for tool in ["write_file", "edit_file", "bash", "web_fetch", "read_file"] {
+                assert_eq!(
+                    format!("{:?}", child.verdict_for(tool)),
+                    format!("{:?}", parent.verdict_for(tool)),
+                    "{mode:?}/{tool}: a subagent should be governed like its parent"
+                );
+            }
+        }
+
+        // Plan still means plan, for the child as much as the parent.
         let plan = PermissionMode::Plan.subagent_policy(false);
         assert!(matches!(
             plan.verdict_for("write_file"),
@@ -372,51 +490,31 @@ mod tests {
             plan.verdict_for("bash"),
             PermissionVerdict::Deny(_)
         ));
-
-        // Nothing may *ask*, because a subagent has no user attached — a
-        // prompt would hang on a bus with no UI on the other end.
-        for mode in [
-            PermissionMode::Ask,
-            PermissionMode::Auto,
-            PermissionMode::Plan,
-        ] {
-            let policy = mode.subagent_policy(false);
-            for tool in ["write_file", "edit_file", "bash", "web_fetch", "lsp_rename"] {
-                let verdict = policy.verdict_for(tool);
-                assert!(
-                    !matches!(verdict, PermissionVerdict::Ask),
-                    "{mode:?}/{tool} would hang waiting for an answer"
-                );
-            }
-        }
-
-        // Reading is always fine; that is what most subagents are for.
-        assert!(matches!(
-            PermissionMode::Ask
-                .subagent_policy(false)
-                .verdict_for("grep"),
-            PermissionVerdict::Allow
-        ));
     }
 
     #[test]
-    fn an_isolated_subagent_may_still_edit_its_throwaway_checkout() {
-        // Otherwise implementation subagents stop working entirely — and
-        // editing a disposable worktree whose diff comes back for review is
-        // not editing the user's files.
+    fn an_isolated_subagent_edits_its_throwaway_checkout_without_asking() {
+        // Its diff comes back for review rather than landing, so prompting
+        // per file would be noise. The shell is a different matter: a
+        // worktree does not contain it.
         let isolated = PermissionMode::Auto.subagent_policy(true);
         assert!(matches!(
             isolated.verdict_for("edit_file"),
             PermissionVerdict::Allow
         ));
-        // The shell still is not, worktree or no worktree: it reaches
-        // everything outside the checkout.
         assert!(matches!(
             isolated.verdict_for("bash"),
-            PermissionVerdict::Deny(_)
+            PermissionVerdict::Ask
         ));
 
-        // Plan mode means plan, isolated or not.
+        // Even in Ask mode, where the parent would prompt for every edit.
+        let cautious = PermissionMode::Ask.subagent_policy(true);
+        assert!(matches!(
+            cautious.verdict_for("edit_file"),
+            PermissionVerdict::Allow
+        ));
+
+        // Plan means plan, isolated or not.
         assert!(matches!(
             PermissionMode::Plan
                 .subagent_policy(true)

@@ -207,9 +207,13 @@ fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
             }
             kinds::TOOL_RESULT => {
                 if let Some(id) = event.payload.get("tool_call_id").and_then(|v| v.as_str()) {
+                    // `result_for_context` is present only when the full
+                    // result was too large to send; the event still carries
+                    // the whole thing under `result`.
                     let result = event
                         .payload
-                        .get("result")
+                        .get("result_for_context")
+                        .or_else(|| event.payload.get("result"))
                         .map(|v| v.to_string())
                         .or_else(|| event.payload.get("error").map(|e| format!("error: {}", e)))
                         .unwrap_or_default();
@@ -435,7 +439,7 @@ type NegativeContextFormatter = dyn Fn(&[Vec<Event>]) -> String + Send + Sync;
 /// # Customizing the failure summary
 ///
 /// By default the summary uses [`default_negative_context_format`] which
-/// produces plain-language bullet points. Override it with [`with_formatter`]
+/// produces plain-language bullet points. Override it with [`with_formatter`](Self::with_formatter)
 /// to produce JSON blocks, XML tags, or any other format your model responds
 /// to best.
 pub struct NegativeAwareContextAssembler {
@@ -554,7 +558,7 @@ fn truncate(s: &str, max: usize) -> &str {
 /// A [`ContextAssembler`] whose inner assembler can be swapped at runtime.
 ///
 /// All clones of a `DynamicContextAssembler` share the same inner state. Call
-/// [`swap`] to atomically replace the assembler — the agent uses the new one
+/// [`swap`](Self::swap) to atomically replace the assembler — the agent uses the new one
 /// on its next ReAct step.
 #[derive(Clone)]
 pub struct DynamicContextAssembler {

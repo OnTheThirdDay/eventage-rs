@@ -558,34 +558,45 @@ pub struct ApplyPatch {
 /// A file's contents before and after, held until the whole patch validates.
 struct Pending {
     path: String,
+    /// For display, `_locations` and telling the language server. Never
+    /// handed to the filesystem — see [`ApplyPatch::read`].
     absolute: std::path::PathBuf,
     before: Option<String>,
     after: Option<String>,
     move_to: Option<std::path::PathBuf>,
+    /// The rename destination as written in the patch, for the actual write.
+    move_to_rel: Option<String>,
 }
 
 impl ApplyPatch {
-    async fn read(&self, path: &std::path::Path) -> Option<String> {
+    /// Read through the workspace handle, keyed by the path *in the patch*.
+    ///
+    /// The absolute form is only ever used for display and for telling the
+    /// language server what changed; passing it to the filesystem is what
+    /// allowed a symlink to lead out of the repository.
+    async fn read(&self, rel: &str) -> Option<String> {
         if let Some(client) = &self.client {
-            if let Some(text) = client.read(&path.display().to_string()).await {
-                return Some(text);
+            if let Ok(abs) = self.ws.resolve(rel) {
+                if let Some(text) = client.read(&abs.display().to_string()).await {
+                    return Some(text);
+                }
             }
         }
-        tokio::fs::read_to_string(path).await.ok()
+        self.ws.read_to_string(rel).await.ok()
     }
 
-    async fn write(&self, path: &std::path::Path, contents: &str) -> Result<(), AgentError> {
+    async fn write(&self, rel: &str, contents: &str) -> Result<(), AgentError> {
         if let Some(client) = &self.client {
-            if client.write(&path.display().to_string(), contents).await {
-                return Ok(());
+            if let Ok(abs) = self.ws.resolve(rel) {
+                if client.write(&abs.display().to_string(), contents).await {
+                    return Ok(());
+                }
             }
         }
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-        tokio::fs::write(path, contents)
+        self.ws
+            .write(rel, contents)
             .await
-            .map_err(|e| AgentError::Tool(format!("cannot write {}: {e}", path.display())))
+            .map_err(|e| AgentError::Tool(format!("{e:#}")))
     }
 }
 
@@ -632,6 +643,16 @@ impl Tool for ApplyPatch {
         // would leave the tree in a state neither the user nor the model
         // asked for, and finding out which half applied is worse than the
         // original failure.
+        // Locked before anything is read. A patch is all-or-nothing against
+        // what it read; letting another tool write in between would make that
+        // guarantee about a file that no longer exists in that form.
+        let mut touched: Vec<String> = ops.iter().map(|op| op.path().to_string()).collect();
+        touched.extend(ops.iter().filter_map(|op| match op {
+            FileOp::Update { move_to, .. } => move_to.clone(),
+            _ => None,
+        }));
+        let _guard = self.ws.lock_paths(&touched).await;
+
         let mut pending: Vec<Pending> = Vec::new();
         for op in &ops {
             let absolute = self
@@ -641,7 +662,7 @@ impl Tool for ApplyPatch {
 
             match op {
                 FileOp::Add { path, contents } => {
-                    if self.read(&absolute).await.is_some() {
+                    if self.read(path).await.is_some() {
                         return Err(AgentError::Tool(format!(
                             "'{path}' already exists — use *** Update File to change it"
                         )));
@@ -652,10 +673,11 @@ impl Tool for ApplyPatch {
                         before: None,
                         after: Some(contents.clone()),
                         move_to: None,
+                        move_to_rel: None,
                     });
                 }
                 FileOp::Delete { path } => {
-                    let before = self.read(&absolute).await.ok_or_else(|| {
+                    let before = self.read(path).await.ok_or_else(|| {
                         AgentError::Tool(format!("cannot delete '{path}': it does not exist"))
                     })?;
                     pending.push(Pending {
@@ -664,6 +686,7 @@ impl Tool for ApplyPatch {
                         before: Some(before),
                         after: None,
                         move_to: None,
+                        move_to_rel: None,
                     });
                 }
                 FileOp::Update {
@@ -671,7 +694,7 @@ impl Tool for ApplyPatch {
                     move_to,
                     hunks,
                 } => {
-                    let before = self.read(&absolute).await.ok_or_else(|| {
+                    let before = self.read(path).await.ok_or_else(|| {
                         AgentError::Tool(format!(
                             "cannot update '{path}': it does not exist. \
                              Use *** Add File to create it."
@@ -693,6 +716,7 @@ impl Tool for ApplyPatch {
                         before: Some(before),
                         after: Some(after),
                         move_to: destination,
+                        move_to_rel: move_to.clone(),
                     });
                 }
             }
@@ -704,22 +728,27 @@ impl Tool for ApplyPatch {
         for item in &pending {
             match (&item.before, &item.after) {
                 (_, Some(after)) => {
-                    let target = item.move_to.as_ref().unwrap_or(&item.absolute);
+                    let target = item.move_to_rel.as_deref().unwrap_or(&item.path);
                     self.write(target, after).await?;
                     if let Some(dest) = &item.move_to {
-                        tokio::fs::remove_file(&item.absolute).await.ok();
+                        self.ws.remove_file(&item.path).await.ok();
                         self.lsp.notify_changed(dest).await;
                     }
                     self.lsp.notify_changed(&item.absolute).await;
                     diffs.push(json!({
-                        "path": target.display().to_string(),
+                        "path": item
+                            .move_to
+                            .as_ref()
+                            .unwrap_or(&item.absolute)
+                            .display()
+                            .to_string(),
                         "old_text": item.before,
                         "new_text": after,
                     }));
                 }
                 (Some(_), None) => {
-                    tokio::fs::remove_file(&item.absolute).await.map_err(|e| {
-                        AgentError::Tool(format!("cannot delete {}: {e}", item.path))
+                    self.ws.remove_file(&item.path).await.map_err(|e| {
+                        AgentError::Tool(format!("cannot delete {}: {e:#}", item.path))
                     })?;
                     self.lsp.notify_changed(&item.absolute).await;
                 }

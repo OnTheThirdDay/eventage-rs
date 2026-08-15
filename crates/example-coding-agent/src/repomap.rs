@@ -455,6 +455,70 @@ fn declaration_name(line: &str, language: Language) -> Option<String> {
     None
 }
 
+// ── the map as a tool ─────────────────────────────────────────────────────────
+
+use crate::workspace::Workspace;
+use async_trait::async_trait;
+use eventage::agent::{AgentError, Tool};
+use eventage::llm::ToolDefinition;
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+/// Rebuild the repository map on demand.
+///
+/// The map in the system prompt is a snapshot taken when the session opened,
+/// and it is there deliberately: it sits in the stable prefix, which is what
+/// makes it cacheable, and regenerating it every turn would invalidate the
+/// prompt cache on every request for a file listing that rarely changes.
+///
+/// That leaves it wrong after the agent adds, deletes or renames files — in a
+/// long session it can end up reasoning from names that no longer exist. So
+/// the fix is not to move the map into the growing part of the context, it is
+/// to let the agent ask for a fresh one when it has reason to think the
+/// snapshot has aged.
+pub struct RepoMap {
+    pub ws: Arc<Workspace>,
+}
+
+#[async_trait]
+impl Tool for RepoMap {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "repo_map",
+            "Rebuild the map of the repository. The map in your instructions was taken \
+             when this session started; call this after you or anyone else has added, \
+             deleted or renamed files, or whenever a path in it turns out not to exist.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Map only this subtree; omit for the whole repository"
+                    }
+                }
+            }),
+        )
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value, AgentError> {
+        let sub = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let root = self
+            .ws
+            .confined_dir(sub)
+            .await
+            .map_err(|e| AgentError::Tool(format!("{e:#}")))?;
+
+        let map = tokio::task::spawn_blocking(move || build(&root, 3_000))
+            .await
+            .map_err(|e| AgentError::Tool(format!("map task failed: {e}")))?;
+
+        Ok(json!({
+            "map": map,
+            "note": "current as of now; the copy in your instructions is from session start",
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +571,43 @@ mod tests {
             !map.contains("generated"),
             "ignored paths must not appear: {map}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_map_tool_reflects_files_created_since_the_session_opened() {
+        // The staleness this exists for: the snapshot in the system prompt
+        // cannot see anything created after it was taken.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/old.rs"), "pub fn old() {}\n").unwrap();
+
+        let ws = Arc::new(Workspace::open(dir.path()).unwrap());
+        let tool = RepoMap { ws: ws.clone() };
+
+        let before = tool.execute(json!({})).await.unwrap();
+        assert!(before["map"].as_str().unwrap().contains("old.rs"));
+        assert!(!before["map"].as_str().unwrap().contains("added_later.rs"));
+
+        ws.write("src/added_later.rs", "pub fn added() {}\n")
+            .await
+            .unwrap();
+
+        let after = tool.execute(json!({})).await.unwrap();
+        assert!(
+            after["map"].as_str().unwrap().contains("added_later.rs"),
+            "{}",
+            after["map"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_map_tool_cannot_be_pointed_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Arc::new(Workspace::open(dir.path()).unwrap());
+        assert!(RepoMap { ws }
+            .execute(json!({ "path": "../.." }))
+            .await
+            .is_err());
     }
 
     #[test]
