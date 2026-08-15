@@ -8,14 +8,15 @@ pub mod hook;
 pub mod multi;
 pub mod permission;
 pub mod project;
+pub mod prompts;
 pub mod recovery;
 pub mod session;
 pub mod skills;
-pub mod speculate;
 pub mod strategy;
 pub mod stuck;
 pub mod summarizing;
 pub mod tokens;
+pub mod web;
 pub mod tool;
 pub mod worker;
 
@@ -39,10 +40,6 @@ pub use recovery::{
 };
 pub use session::{Session, SessionBuilder};
 pub use skills::{Skill, SkillTool, SkillsLibrary};
-pub use speculate::{
-    beam_search, best_of_n, BeamConfig, BranchScorer, FnScorer, LlmJudgeScorer,
-    SpeculationCandidate, SpeculationOutcome,
-};
 pub use strategy::{
     run_react_step, truncate_middle, AgentContext, ExecutionStrategy, ReactStrategy,
     SingleShotStrategy, StepOutcome, ToolExecOptions, DEFAULT_MAX_CONCURRENT_TOOLS,

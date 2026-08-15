@@ -168,6 +168,14 @@ impl CycleHook for HookChain {
 
 // ── DynamicHookChain ──────────────────────────────────────────────────────────
 
+/// Handle identifying one hook inside a [`DynamicHookChain`], so a single
+/// registration can be withdrawn without disturbing the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HookId(u64);
+
+/// Registered hooks, each paired with the handle that withdraws it.
+type HookSlots = Arc<RwLock<Vec<(HookId, Arc<dyn CycleHook>)>>>;
+
 /// A [`CycleHook`] whose list of inner hooks can be mutated at runtime.
 ///
 /// Changes take effect on the next ReAct step. Clones share the same hook list.
@@ -200,12 +208,13 @@ impl CycleHook for HookChain {
 ///     .strategy(ReactStrategy::default())
 ///     .build();
 ///
-/// handle.add_hook(LogHook);
-/// handle.remove_all();
+/// let id = handle.add_hook(LogHook);
+/// handle.remove(id);
 /// ```
 #[derive(Clone, Default)]
 pub struct DynamicHookChain {
-    hooks: Arc<RwLock<Vec<Arc<dyn CycleHook>>>>,
+    hooks: HookSlots,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DynamicHookChain {
@@ -214,13 +223,32 @@ impl DynamicHookChain {
     }
 
     /// Appends a hook. The agent sees it on the next ReAct step.
-    pub fn add_hook(&self, hook: impl CycleHook + 'static) {
-        self.hooks.write().unwrap_or_else(|e| e.into_inner()).push(Arc::new(hook));
+    ///
+    /// The returned [`HookId`] withdraws exactly this registration via
+    /// [`remove`](Self::remove), leaving other hooks untouched.
+    pub fn add_hook(&self, hook: impl CycleHook + 'static) -> HookId {
+        self.add_arc(Arc::new(hook))
     }
 
     /// Appends a pre-boxed hook.
-    pub fn add_arc(&self, hook: Arc<dyn CycleHook>) {
-        self.hooks.write().unwrap_or_else(|e| e.into_inner()).push(hook);
+    pub fn add_arc(&self, hook: Arc<dyn CycleHook>) -> HookId {
+        let id = HookId(
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        self.hooks
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((id, hook));
+        id
+    }
+
+    /// Withdraw a single hook. Returns `true` if it was still registered.
+    pub fn remove(&self, id: HookId) -> bool {
+        let mut hooks = self.hooks.write().unwrap_or_else(|e| e.into_inner());
+        let before = hooks.len();
+        hooks.retain(|(existing, _)| *existing != id);
+        hooks.len() != before
     }
 
     /// Removes all hooks.
@@ -241,7 +269,13 @@ impl DynamicHookChain {
 #[async_trait]
 impl CycleHook for DynamicHookChain {
     async fn before_step(&self, ctx: &HookContext<'_>) -> HookAction {
-        let hooks: Vec<Arc<dyn CycleHook>> = self.hooks.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let hooks: Vec<Arc<dyn CycleHook>> = self
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
         for hook in &hooks {
             match hook.before_step(ctx).await {
                 HookAction::Continue => {}
@@ -256,7 +290,13 @@ impl CycleHook for DynamicHookChain {
         ctx: &HookContext<'_>,
         messages: &mut Vec<ChatMessage>,
     ) -> HookAction {
-        let hooks: Vec<Arc<dyn CycleHook>> = self.hooks.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let hooks: Vec<Arc<dyn CycleHook>> = self
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
         for hook in &hooks {
             match hook.before_llm(ctx, messages).await {
                 HookAction::Continue => {}
@@ -267,7 +307,13 @@ impl CycleHook for DynamicHookChain {
     }
 
     async fn before_tool(&self, ctx: &HookContext<'_>, name: &str, args: &Value) -> HookAction {
-        let hooks: Vec<Arc<dyn CycleHook>> = self.hooks.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let hooks: Vec<Arc<dyn CycleHook>> = self
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
         for hook in &hooks {
             match hook.before_tool(ctx, name, args).await {
                 HookAction::Continue => {}
@@ -278,7 +324,13 @@ impl CycleHook for DynamicHookChain {
     }
 
     async fn after_tool(&self, ctx: &HookContext<'_>, name: &str, result: &Value) {
-        let hooks: Vec<Arc<dyn CycleHook>> = self.hooks.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let hooks: Vec<Arc<dyn CycleHook>> = self
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
         for hook in &hooks {
             hook.after_tool(ctx, name, result).await;
         }

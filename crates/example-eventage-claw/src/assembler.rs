@@ -421,7 +421,8 @@ impl ContextAssembler for SkillsAssembler {
                 })
                 .collect();
             if matched.len() > MAX_TRIGGERED_SKILLS {
-                matched.sort_by(|a, b| b.1.cmp(&a.1));
+                // Highest score first.
+                matched.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
                 matched.truncate(MAX_TRIGGERED_SKILLS);
             }
             matched.into_iter().map(|(s, _)| s).collect()

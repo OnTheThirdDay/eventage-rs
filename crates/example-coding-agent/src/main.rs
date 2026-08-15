@@ -1,481 +1,213 @@
-//! coding-agent — agentic capabilities with streaming TUI, security gate, and diff tracking.
+//! eventage-code — an ACP agent server.
 //!
-//! # Quick start
+//! Editors speak the [Agent Client Protocol](https://agentclientprotocol.com)
+//! to this binary over stdio, so the agent runs inside Zed, Kiro, JetBrains,
+//! or any ACP-capable client with full streaming, diff review, permission
+//! prompts, and a live task plan.
 //!
 //! ```sh
-//! # With Ollama running locally (TUI mode):
-//! cargo run -p example-coding-agent -- --model qwen3:4b
+//! # As an editor agent (stdio JSON-RPC) — the default.
+//! eventage-code
 //!
-//! # With OpenAI:
-//! cargo run -p example-coding-agent -- \
-//!   --url https://api.openai.com/v1 --api-key sk-... --model gpt-4o
-//!
-//! # REPL fallback (no TUI):
-//! cargo run -p example-coding-agent -- --no-tui --model qwen3:4b
-//!
-//! # Resume a previous session:
-//! cargo run -p example-coding-agent -- --session-file session.jsonl
+//! # Headless, for scripts and CI.
+//! eventage-code run -p "fix the failing test" --cwd /repo --mode auto
 //! ```
+//!
+//! Credentials come from `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`; with
+//! neither set it talks to a local OpenAI-compatible server (`OPENAI_BASE_URL`).
 
-mod agent;
-mod assembler;
-mod error;
-mod hooks;
-mod kinds;
-mod prompt;
-mod streaming;
-mod tools;
-mod tui;
-mod workers;
-mod workspace;
-
-use agent::CodingAgentBuilder;
-use clap::Parser;
-use eventage::event::kinds as core_kinds;
-use eventage::observability::{BusObserver, JsonlExporter};
-use eventage::replay::LiveReplayServer;
-use std::io::{self, BufRead};
-use std::path::{Path, PathBuf};
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use eventage_code::acp::wire::ContentBlock;
+use eventage_code::acp::AcpServer;
+use eventage_code::agent::CodingSession;
+use eventage_code::config::{ModelConfig, PermissionMode, SessionConfig};
+use eventage::event::kinds;
+use eventage::{Event, EventBus};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "coding-agent",
-    about = "Coding Agent — agentic capabilities with streaming TUI, security gate, and diff tracking",
-    long_about = None
-)]
-struct Args {
-    /// LLM base URL (OpenAI-compatible)
-    #[arg(long, default_value = "http://localhost:11434/v1")]
-    url: String,
+#[derive(Parser)]
+#[command(name = "eventage-code", version, about = "LSP-aware coding agent (ACP server)")]
+struct Cli {
+    /// Model override (defaults per provider).
+    #[arg(long, global = true)]
+    model: Option<String>,
 
-    /// API key
-    #[arg(long, default_value = "ollama")]
-    api_key: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-    /// Model name
-    #[arg(long, short, default_value = "qwen3:4b")]
-    model: String,
-
-    /// Custom system prompt prefix
-    #[arg(long)]
-    system_prompt: Option<String>,
-
-    /// Max ReAct steps per cycle
-    #[arg(long, default_value_t = 30)]
-    max_steps: usize,
-
-    /// Approximate token budget for conversation summarization (0 = disabled)
-    #[arg(long, default_value_t = 120_000)]
-    max_tokens: usize,
-
-    /// Path(s) to AGENTS.md memory files
-    #[arg(long = "memory")]
-    memory: Vec<PathBuf>,
-
-    /// Directory(ies) containing SKILL.md skill files
-    #[arg(long = "skills")]
-    skills: Vec<PathBuf>,
-
-    /// Working directory for filesystem tools (default: current directory)
-    #[arg(long)]
-    work_dir: Option<PathBuf>,
-
-    /// Tool names that require human approval (REPL mode only)
-    #[arg(long = "approve")]
-    human_approval: Vec<String>,
-
-    /// Require human approval before executing ANY tool call
-    #[arg(long = "require-approve-all", default_value_t = false)]
-    require_approve_all: bool,
-
-    /// Disable async sub-agent worker
-    #[arg(long, default_value_t = false)]
-    no_async_subagents: bool,
-
-    /// Max LLM requests per minute (0 = unlimited)
-    #[arg(long, default_value_t = 0)]
-    rpm: u32,
-
-    /// Write all bus events to a JSONL file for replay/inspection
-    #[arg(long)]
-    log: Option<PathBuf>,
-
-    /// Save/restore conversation history (JSONL format)
-    #[arg(long)]
-    session_file: Option<PathBuf>,
-
-    /// Start a live replay UI server
-    #[arg(long, default_value_t = false)]
-    replay: bool,
-
-    /// Port for the live replay UI server
-    #[arg(long, default_value_t = 4567)]
-    replay_port: u16,
-
-    /// Use REPL mode instead of the TUI (no streaming, stdin/stdout interaction)
-    #[arg(long, default_value_t = false)]
-    no_tui: bool,
+#[derive(Subcommand)]
+enum Command {
+    /// Serve the Agent Client Protocol over stdio (default).
+    Acp,
+    /// Run a single prompt headlessly and print the result.
+    Run {
+        /// The prompt.
+        #[arg(short = 'p', long)]
+        prompt: String,
+        /// Workspace root.
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        /// Permission mode: plan | ask | auto | yolo.
+        #[arg(long, default_value = "auto")]
+        mode: String,
+        /// Emit the full event log as JSON instead of prose.
+        #[arg(long)]
+        json: bool,
+        /// Approve every gated tool call without prompting (for CI).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let model = ModelConfig::from_env(cli.model);
 
-    let tui_mode = !args.no_tui;
-
-    if tui_mode {
-        // In TUI mode, log to file to keep the terminal clean.
-        setup_file_tracing();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-            )
-            .with_target(false)
-            .init();
-
-        eprintln!(
-            "Coding Agent starting (model: {}, url: {})",
-            args.model, args.url
-        );
-        if args.require_approve_all {
-            eprintln!("Approval required for: all tools (--require-approve-all)");
-        } else if !args.human_approval.is_empty() {
-            eprintln!("Approval required for: {}", args.human_approval.join(", "));
+    match cli.command {
+        // Logs must never touch stdout: it carries the protocol.
+        None | Some(Command::Acp) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("eventage_code=info,eventage=warn")),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            Arc::new(AcpServer::new(model)).run().await
         }
-    }
-
-    let agent = CodingAgentBuilder::new()
-        .model(&args.url, &args.api_key, &args.model)
-        .system_prompt_opt(args.system_prompt)
-        .max_steps(args.max_steps)
-        .max_tokens(args.max_tokens)
-        .memory(args.memory)
-        .skills(args.skills)
-        .work_dir_opt(args.work_dir)
-        .human_approval_for(args.human_approval)
-        .require_approve_all(args.require_approve_all)
-        .async_subagents(!args.no_async_subagents)
-        .requests_per_minute(args.rpm)
-        .tui_mode(tui_mode)
-        .build();
-
-    let bus = agent.bus().clone();
-    let model = agent.model.clone();
-    let session_id = agent.session_id.clone();
-    let cancelled = agent
-        .cancelled
-        .clone()
-        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
-
-    // Restore previous session if --session-file is set
-    if let Some(ref sf) = args.session_file {
-        if sf.exists() {
-            match load_session(&bus, sf).await {
-                Ok(n) => {
-                    if !tui_mode {
-                        eprintln!("Resumed {} events from {}", n, sf.display());
-                    }
-                }
-                Err(e) => eprintln!("Warning: could not load session: {e}"),
-            }
-        } else if !tui_mode {
-            eprintln!("New session — will save to {}", sf.display());
-        }
-    }
-
-    // Start live replay server if requested
-    if args.replay {
-        LiveReplayServer::new(bus.clone())
-            .port(args.replay_port)
-            .serve_background();
-        if !tui_mode {
-            eprintln!("Live replay UI: http://localhost:{}", args.replay_port);
-        }
-    }
-
-    // Start observability exporter if --log was specified
-    if let Some(log_path) = args.log {
-        match JsonlExporter::new(&log_path).await {
-            Ok(exporter) => {
-                let observer = BusObserver::new(bus.clone()).add_exporter(exporter);
-                tokio::spawn(observer.run());
-                if !tui_mode {
-                    eprintln!("Logging events to {}", log_path.display());
-                }
-            }
-            Err(e) => eprintln!("Warning: could not open log file: {e}"),
-        }
-    }
-
-    if tui_mode {
-        // ── TUI mode ─────────────────────────────────────────────────────────
-        tokio::spawn(async move {
-            if let Err(e) = agent.run().await {
-                tracing::error!("agent error: {e}");
-            }
-        });
-
-        tui::run_tui(bus, model, session_id, cancelled).await?;
-    } else if !args.no_async_subagents {
-        // ── Reactive REPL ─────────────────────────────────────────────────────
-        tokio::spawn(async move {
-            if let Err(e) = agent.run().await {
-                eprintln!("agent error: {e}");
-            }
-        });
-        run_reactive_repl(bus, args.session_file).await?;
-    } else {
-        // ── Sync REPL ─────────────────────────────────────────────────────────
-        run_sync_repl(agent, args.session_file).await?;
-    }
-
-    Ok(())
-}
-
-// ── Tracing setup ─────────────────────────────────────────────────────────────
-
-fn setup_file_tracing() {
-    let log_dir = dirs::home_dir()
-        .map(|h| h.join(".coding-agent").join("logs"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/coding-agent-logs"));
-
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log_file = log_dir.join("coding-agent.log");
-
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file)
-    {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
-            .with_writer(move || file.try_clone().expect("log file clone"))
-            .try_init();
-    } else {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new("warn"))
-            .with_writer(std::io::stderr)
-            .try_init();
-    }
-}
-
-// ── Session persistence ───────────────────────────────────────────────────────
-
-async fn load_session(bus: &eventage::EventBus, path: &Path) -> anyhow::Result<usize> {
-    let content = tokio::fs::read_to_string(path).await?;
-    let mut count = 0;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let event: eventage::Event = serde_json::from_str(line)?;
-        bus.publish(event).await?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-async fn save_session(bus: &eventage::EventBus, path: &Path) {
-    let log = bus.log().await;
-    let result = async {
-        let mut content = String::new();
-        for event in &log {
-            if matches!(
-                event.kind.as_str(),
-                core_kinds::USER_MESSAGE | core_kinds::ASSISTANT_MESSAGE | core_kinds::TOOL_RESULT
-            ) {
-                content.push_str(&serde_json::to_string(event)?);
-                content.push('\n');
-            }
-        }
-        tokio::fs::write(path, content).await?;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-
-    if let Err(e) = result {
-        eprintln!("Warning: could not save session: {e}");
-    }
-}
-
-// ── REPL variants ─────────────────────────────────────────────────────────────
-
-/// Reactive REPL: publishes USER_MESSAGE events; background agent processes them.
-async fn run_reactive_repl(
-    bus: eventage::EventBus,
-    session_file: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    use eventage::event::Event;
-    use serde_json::json;
-
-    eprintln!("Ready. Type your message and press Enter. (Ctrl+C to exit)\n");
-
-    loop {
-        // Read one line using rustyline for full readline editing.
-        let line = tokio::task::spawn_blocking(|| {
-            match rustyline::DefaultEditor::new() {
-                Ok(mut rl) => rl.readline("").ok(),
-                Err(_) => {
-                    // Fallback to raw read_line
-                    let mut s = String::new();
-                    match io::stdin().lock().read_line(&mut s) {
-                        Ok(0) => None,
-                        Ok(_) => Some(s),
-                        Err(_) => None,
-                    }
-                }
-            }
-        })
-        .await?;
-
-        let Some(raw) = line else { break };
-        let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Subscribe BEFORE publishing so we catch every event of this cycle.
-        let mut rx = bus.subscribe();
-
-        bus.publish(Event::new(
-            core_kinds::USER_MESSAGE,
-            json!({ "text": trimmed }),
-        ))
-        .await?;
-
-        drain_cycle(&mut rx).await;
-
-        if let Some(ref sf) = session_file {
-            save_session(&bus, sf).await;
-        }
-    }
-
-    Ok(())
-}
-
-/// Synchronous REPL: calls agent.chat() directly for each message.
-async fn run_sync_repl(
-    agent: agent::CodingAgent,
-    session_file: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    let bus = agent.bus().clone();
-
-    eprintln!("Ready. Type your message and press Enter. (Ctrl+C to exit)\n");
-
-    loop {
-        let line = tokio::task::spawn_blocking(|| match rustyline::DefaultEditor::new() {
-            Ok(mut rl) => rl.readline("").ok(),
-            Err(_) => {
-                let mut s = String::new();
-                match io::stdin().lock().read_line(&mut s) {
-                    Ok(0) => None,
-                    Ok(_) => Some(s),
-                    Err(_) => None,
-                }
-            }
-        })
-        .await?;
-
-        let Some(raw) = line else { break };
-        let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Stream intermediate events while chat() runs.
-        let mut rx = bus.subscribe();
-        let display = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                print_event(&event);
-            }
-        });
-
-        match agent.chat(&trimmed).await {
-            Ok(response) => {
-                display.abort();
-                if !response.is_empty() {
-                    eprintln!("\nAssistant: {response}\n");
-                }
-            }
-            Err(e) => {
-                display.abort();
-                eprintln!("error: {e}");
-            }
-        }
-
-        if let Some(ref sf) = session_file {
-            save_session(&bus, sf).await;
-        }
-    }
-
-    Ok(())
-}
-
-// ── Shared helpers ────────────────────────────────────────────────────────────
-
-/// Drain bus events until the ReAct cycle fully completes.
-async fn drain_cycle(rx: &mut eventage::BusReceiver) {
-    let mut cycle_started = false;
-    while let Some(event) = rx.recv().await {
-        if event.kind == core_kinds::AGENT_CYCLE_START {
-            cycle_started = true;
-            continue;
-        }
-        if !cycle_started {
-            continue;
-        }
-        if print_event(&event) {
-            return;
-        }
-        if event.kind == core_kinds::AGENT_CYCLE_END {
-            return;
+        Some(Command::Run {
+            prompt,
+            cwd,
+            mode,
+            json,
+            yes,
+        }) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("eventage_code=info")),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            run_headless(model, prompt, cwd, mode, json, yes).await
         }
     }
 }
 
-/// Print a single bus event to the terminal. Returns true when the cycle is done.
-fn print_event(event: &eventage::Event) -> bool {
-    if event.kind == core_kinds::TOOL_CALL_PROPOSED {
-        let name = event.payload["name"].as_str().unwrap_or("?");
-        let args = &event.payload["arguments"];
-        let args_str = args.to_string();
-        let args_display = if args_str.len() > 120 {
-            format!("{}…", &args_str[..120])
-        } else {
-            args_str
-        };
-        eprintln!("[→ {name}] {args_display}");
-    } else if event.kind == core_kinds::TOOL_RESULT {
-        let name = event.payload["name"].as_str().unwrap_or("?");
-        if let Some(err) = event.payload.get("error") {
-            eprintln!("[← {name} ERR] {err}");
-        } else if let Some(result) = event.payload.get("result") {
-            let s = result.to_string();
-            let preview = if s.len() > 200 {
-                format!("{}…", &s[..200])
+/// Answer `permission.request` events when no editor is attached.
+///
+/// Without this, headless runs in `ask`/`auto` mode stall: the permission
+/// hook publishes a request and waits on the bus for a decision that nobody
+/// is there to give. We resolve it three ways, in order of preference:
+///
+/// - `--yes` approves everything (CI).
+/// - An interactive terminal prompts the operator.
+/// - Otherwise (a pipe, a CI job with no TTY) we **deny immediately** with an
+///   actionable reason instead of hanging until the timeout.
+fn spawn_headless_approver(bus: EventBus, auto_approve: bool) -> tokio::task::JoinHandle<()> {
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal();
+    let mut rx = bus.subscribe();
+
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if event.kind != kinds::PERMISSION_REQUEST {
+                continue;
+            }
+            let request_id = event
+                .payload
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let tool = event
+                .payload
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool")
+                .to_string();
+
+            let (approve, reason) = if auto_approve {
+                (true, None)
+            } else if interactive {
+                let prompt_tool = tool.clone();
+                let answer = tokio::task::spawn_blocking(move || {
+                    use std::io::{stdin, stderr, Write};
+                    let mut err = stderr();
+                    let _ = write!(err, "\nAllow tool '{prompt_tool}'? [y/N]: ");
+                    let _ = err.flush();
+                    let mut line = String::new();
+                    let _ = stdin().read_line(&mut line);
+                    line.trim().eq_ignore_ascii_case("y")
+                })
+                .await
+                .unwrap_or(false);
+                (
+                    answer,
+                    (!answer).then(|| "the operator declined this action".to_string()),
+                )
             } else {
-                s
+                (
+                    false,
+                    Some(format!(
+                        "'{tool}' needs approval but this run is non-interactive;                          re-run with --yes to approve automatically, or --mode yolo"
+                    )),
+                )
             };
-            eprintln!("[← {name}] {preview}");
+
+            let _ = bus
+                .publish(Event::new(
+                    kinds::PERMISSION_DECISION,
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "approve": approve,
+                        "reason": reason,
+                    }),
+                ))
+                .await;
         }
-    } else if event.kind == core_kinds::ASSISTANT_MESSAGE {
-        let content = event.payload["content"].as_str().unwrap_or("");
-        if !content.is_empty() {
-            eprintln!("\nAssistant: {content}\n");
-        }
-        let has_tool_calls = event.payload["tool_calls"]
-            .as_array()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
-        if !has_tool_calls {
-            return true;
-        }
+    })
+}
+
+async fn run_headless(
+    model: ModelConfig,
+    prompt: String,
+    cwd: String,
+    mode: String,
+    as_json: bool,
+    auto_approve: bool,
+) -> Result<()> {
+    let cwd = std::fs::canonicalize(&cwd)?.display().to_string();
+    let mut config = SessionConfig::new(cwd, model);
+    config.mode = PermissionMode::from_id(&mode)
+        .ok_or_else(|| anyhow::anyhow!("unknown mode '{mode}' (plan|ask|auto|yolo)"))?;
+
+    let session = CodingSession::create(uuid::Uuid::new_v4().to_string(), config, None).await?;
+    // No editor is attached, so stand in as the approver.
+    let approver = spawn_headless_approver(session.bus.clone(), auto_approve);
+    session
+        .submit_prompt(&[ContentBlock::text(prompt)])
+        .await?;
+    let outcome = session.run_cycle().await;
+    approver.abort();
+    outcome?;
+
+    let log = session.bus.log().await;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&log)?);
+        return Ok(());
     }
-    false
+
+    let reply = log
+        .iter()
+        .rev()
+        .find(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .and_then(|e| e.payload.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("(no response)");
+    println!("{reply}");
+    Ok(())
 }

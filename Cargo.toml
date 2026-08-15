@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/eventage-replay-cli",
     "crates/example-coding-agent",
+    "crates/eventage-studio",
     "crates/example-clang-agent",
     "crates/example-eventage-claw",
 ]

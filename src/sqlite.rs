@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{debug, error};
+use tracing::debug;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 

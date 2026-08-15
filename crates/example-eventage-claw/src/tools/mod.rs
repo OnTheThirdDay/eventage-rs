@@ -8,7 +8,8 @@ pub mod relay;
 pub mod schedule;
 pub mod shell;
 pub mod tasks;
-pub mod web;
+/// Web access now lives in the framework so the coding agent shares it.
+pub use eventage::agent::web;
 
 pub use browser::BrowserTool;
 pub use docker::DockerRunCommandTool;

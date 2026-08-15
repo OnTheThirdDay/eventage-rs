@@ -112,6 +112,19 @@ fn user_message_from_payload(payload: &serde_json::Value) -> Option<ChatMessage>
 ///
 /// Includes a repair pass: if an `assistant` message declares `tool_calls` but
 /// some of their results are missing (e.g. due to a tool panic), synthetic
+/// The image a tool result is carrying, if any.
+///
+/// Tools advertise it the same way they advertise diffs and locations: an
+/// underscore-prefixed key the harness understands and the model never has to
+/// parse.
+fn image_part(payload: &serde_json::Value) -> Option<ContentPart> {
+    let image = payload.get("result")?.get("_image")?;
+    Some(ContentPart::image_base64(
+        image.get("media_type")?.as_str()?,
+        image.get("data")?.as_str()?,
+    ))
+}
+
 /// `tool` messages with an error are inserted so the history stays valid for
 /// any LLM provider that enforces the "all tool_call_ids must be answered" rule.
 pub fn events_to_messages(events: &[Event]) -> Vec<ChatMessage> {
@@ -201,6 +214,20 @@ fn events_to_messages_raw(events: &[Event]) -> Vec<ChatMessage> {
                         .or_else(|| event.payload.get("error").map(|e| format!("error: {}", e)))
                         .unwrap_or_default();
                     messages.push(ChatMessage::tool_result(id, result));
+
+                    // A tool that produced an image gets it in front of the
+                    // model as an image rather than as base64 in a string.
+                    //
+                    // It arrives as a follow-up user message because a tool
+                    // message is text-only on most providers; only Anthropic
+                    // accepts image blocks inside a tool result, and routing
+                    // it through a user turn works everywhere.
+                    if let Some(part) = image_part(&event.payload) {
+                        messages.push(ChatMessage::user_with_parts(vec![
+                            ContentPart::text("(image returned by the previous tool call)"),
+                            part,
+                        ]));
+                    }
                 }
             }
             kinds::AGENT_MESSAGE => {
@@ -568,6 +595,59 @@ mod tests {
     use super::*;
     use crate::event::kinds;
     use serde_json::json;
+
+    #[test]
+    fn an_image_from_a_tool_reaches_the_model_as_an_image() {
+        // Tool messages are text on most providers, so an image a tool
+        // produced has to arrive as a following user turn or the model only
+        // ever sees a base64 string.
+        let events = vec![
+            Event::new(
+                kinds::ASSISTANT_MESSAGE,
+                json!({ "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "view_image", "arguments": "{}" }
+                }]}),
+            ),
+            Event::new(
+                kinds::TOOL_RESULT,
+                json!({
+                    "tool_call_id": "c1",
+                    "result": {
+                        "path": "mockup.png",
+                        "_image": { "media_type": "image/png", "data": "QUJD" }
+                    }
+                }),
+            ),
+        ];
+        let messages = events_to_messages(&events);
+        let carried = messages
+            .iter()
+            .find(|m| m.is_multimodal())
+            .expect("an image part should have been added");
+        assert!(carried
+            .content_parts()
+            .iter()
+            .any(|p| matches!(p, crate::llm::content::ContentPart::Image { .. })));
+    }
+
+    #[test]
+    fn a_tool_result_without_an_image_is_left_alone() {
+        let events = vec![
+            Event::new(
+                kinds::ASSISTANT_MESSAGE,
+                json!({ "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "read_file", "arguments": "{}" }
+                }]}),
+            ),
+            Event::new(
+                kinds::TOOL_RESULT,
+                json!({ "tool_call_id": "c1", "result": { "content": "hello" } }),
+            ),
+        ];
+        assert!(!events_to_messages(&events).iter().any(|m| m.is_multimodal()));
+    }
 
     #[tokio::test]
     async fn assembles_user_message() {

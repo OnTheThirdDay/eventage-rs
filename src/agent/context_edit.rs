@@ -35,6 +35,7 @@
 //! ```
 
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::debug;
@@ -43,21 +44,35 @@ use super::context::{AssemblyContext, ContextAssembler};
 use super::tokens::TokenCalibration;
 use crate::llm::types::{ChatMessage, Role};
 
-/// Wraps a [`ContextAssembler`] and clears old tool-result content once the
+/// Wraps a [`ContextAssembler`] and clears tool-result content once the
 /// assembled context exceeds a token trigger.
 ///
-/// The most recent [`keep_recent`](Self::keep_recent) tool results are always
-/// kept verbatim; clearing is a monotonic ratchet (a cleared result never
-/// reappears), keeping the context prefix stable for prompt caching.
+/// Results are cleared by how much budget they hold, not by how old they are:
+/// the point of the exercise is to reclaim tokens, and a stale 60 KB file dump
+/// is worth more than a dozen 200-byte search hits put together. Clearing is a
+/// monotonic ratchet — a cleared result never reappears — so the edited view
+/// stays stable across steps.
 pub struct ToolResultClearingAssembler {
     inner: Arc<dyn ContextAssembler>,
     /// Token estimate above which clearing kicks in.
     pub trigger_tokens: usize,
-    /// Number of most-recent tool results always kept verbatim (default 5).
+    /// Number of most-recent tool results never cleared (default 2).
+    ///
+    /// A small hard-protect window: the results the model is actively working
+    /// from. Anything older is judged on size, so a large recent result is not
+    /// shielded merely by its position.
     pub keep_recent: usize,
-    /// Monotonic count of tool results (from the start of the conversation)
-    /// whose content has been cleared.
-    cleared: Mutex<usize>,
+    /// Fraction of `trigger_tokens` a clearing pass reclaims down to
+    /// (default 0.75), so the trigger is not tripped again on the next step.
+    pub target: f64,
+    /// Results smaller than this are never cleared (default 512 bytes).
+    ///
+    /// Below it, clearing frees nothing worth having and still costs the model
+    /// whatever the result said.
+    pub min_clear_bytes: usize,
+    /// Ordinals (counted over tool results from the start of the conversation)
+    /// whose content has been cleared. Grows only.
+    cleared: Mutex<HashSet<usize>>,
     /// Learns the estimator's error from real provider usage.
     calibration: Arc<TokenCalibration>,
 }
@@ -67,15 +82,29 @@ impl ToolResultClearingAssembler {
         Self {
             inner,
             trigger_tokens,
-            keep_recent: 5,
-            cleared: Mutex::new(0),
+            keep_recent: 2,
+            target: 0.75,
+            min_clear_bytes: 512,
+            cleared: Mutex::new(HashSet::new()),
             calibration: Arc::new(TokenCalibration::new()),
         }
     }
 
-    /// Sets how many of the most recent tool results are always kept verbatim.
+    /// Sets how many of the most recent tool results are never cleared.
     pub fn with_keep_recent(mut self, n: usize) -> Self {
         self.keep_recent = n;
+        self
+    }
+
+    /// Sets the fraction of the trigger a clearing pass reclaims down to.
+    pub fn with_target(mut self, fraction: f64) -> Self {
+        self.target = fraction;
+        self
+    }
+
+    /// Sets the size below which a result is left alone.
+    pub fn with_min_clear_bytes(mut self, bytes: usize) -> Self {
+        self.min_clear_bytes = bytes;
         self
     }
 
@@ -100,17 +129,18 @@ impl ToolResultClearingAssembler {
         )
     }
 
-    /// Replace the content of the first `n` tool-result messages.
-    fn apply_clearing(messages: &mut [ChatMessage], n: usize) {
-        let mut seen = 0usize;
+    /// Replace the content of every tool result whose ordinal is in `cleared`.
+    fn apply_clearing(messages: &mut [ChatMessage], cleared: &HashSet<usize>) {
+        let mut ordinal = 0usize;
         for m in messages.iter_mut() {
             if m.role != Role::Tool {
                 continue;
             }
-            if seen >= n {
-                break;
+            let this = ordinal;
+            ordinal += 1;
+            if !cleared.contains(&this) {
+                continue;
             }
-            seen += 1;
             let already_cleared = m
                 .content
                 .as_deref()
@@ -120,6 +150,58 @@ impl ToolResultClearingAssembler {
                 m.content = Some(Self::placeholder(&original));
             }
         }
+    }
+
+    /// Choose which tool results to clear, biggest first, until `need` tokens
+    /// have been reclaimed.
+    ///
+    /// Ranking is by size, nudged by age. Reclaiming budget is the whole point
+    /// of the pass, so what matters about a result is how much of the budget it
+    /// is holding; clearing a 200-byte search hit frees nothing and still takes
+    /// a fact away from the model. Age only separates results of comparable
+    /// size, where the older one is the safer of the two to drop.
+    fn select_for_clearing(
+        &self,
+        messages: &[ChatMessage],
+        cleared: &HashSet<usize>,
+        need: usize,
+    ) -> Vec<usize> {
+        let results: Vec<&ChatMessage> =
+            messages.iter().filter(|m| m.role == Role::Tool).collect();
+        let total = results.len();
+        // The newest few are off limits — the model is still working from them.
+        let open = total.saturating_sub(self.keep_recent);
+
+        // (ordinal, score, tokens reclaimed)
+        let mut candidates: Vec<(usize, f64, usize)> = results
+            .iter()
+            .enumerate()
+            .take(open)
+            .filter(|(i, _)| !cleared.contains(i))
+            .filter_map(|(i, m)| {
+                let bytes = m.content.as_deref().map_or(0, str::len);
+                if bytes < self.min_clear_bytes {
+                    return None;
+                }
+                // 1.0 for the newest clearable result, 2.0 for the oldest.
+                let age = 1.0 + (total - i) as f64 / total.max(1) as f64;
+                let tokens = self.calibration.count(std::slice::from_ref(*m));
+                Some((i, bytes as f64 * age, tokens))
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let mut picked = Vec::new();
+        let mut reclaimed = 0usize;
+        for (ordinal, _, tokens) in candidates {
+            if reclaimed >= need {
+                break;
+            }
+            picked.push(ordinal);
+            reclaimed += tokens;
+        }
+        picked
     }
 }
 
@@ -131,23 +213,28 @@ impl ContextAssembler for ToolResultClearingAssembler {
         // Learn from the provider's real prompt-token counts before deciding.
         self.calibration.observe_events(context.events);
 
-        let total_tool_results = messages.iter().filter(|m| m.role == Role::Tool).count();
         let mut cleared = self.cleared.lock().unwrap_or_else(|e| e.into_inner());
 
         // Always re-apply the ratchet so previously cleared results stay cleared.
-        Self::apply_clearing(&mut messages, *cleared);
+        Self::apply_clearing(&mut messages, &cleared);
 
-        if self.calibration.count(&messages) > self.trigger_tokens {
-            let target = total_tool_results.saturating_sub(self.keep_recent);
-            if target > *cleared {
+        let estimate = self.calibration.count(&messages);
+        if estimate > self.trigger_tokens {
+            // Reclaim past the trigger, not merely to it, so the next few steps
+            // do not each trip another pass.
+            let low_water = (self.trigger_tokens as f64 * self.target) as usize;
+            let need = estimate.saturating_sub(low_water);
+            let picked = self.select_for_clearing(&messages, &cleared, need);
+            if !picked.is_empty() {
                 debug!(
-                    cleared_before = *cleared,
-                    cleared_after = target,
-                    total_tool_results,
-                    "context over trigger — clearing stale tool results"
+                    cleared_before = cleared.len(),
+                    newly_cleared = picked.len(),
+                    tokens = estimate,
+                    need,
+                    "context over trigger — clearing the largest stale tool results"
                 );
-                *cleared = target;
-                Self::apply_clearing(&mut messages, *cleared);
+                cleared.extend(picked);
+                Self::apply_clearing(&mut messages, &cleared);
             }
         }
 
@@ -229,6 +316,101 @@ mod tests {
         let messages = assembler.assemble(&ctx).await;
         let tool_msg = messages.iter().find(|m| m.role == Role::Tool).unwrap();
         assert_eq!(tool_msg.content.as_deref(), Some("\"small result\""));
+    }
+
+    /// A tool turn whose result is `bytes` long.
+    fn sized_turn(id: &str, bytes: usize) -> Vec<Event> {
+        tool_turn(id, &"x".repeat(bytes))
+    }
+
+    #[tokio::test]
+    async fn the_big_results_go_first_whatever_their_age() {
+        // Oldest to newest: tiny, huge, tiny, tiny, huge.
+        let mut events = vec![Event::new(kinds::USER_MESSAGE, json!({"text": "go"}))];
+        events.extend(sized_turn("t0", 600));
+        events.extend(sized_turn("t1", 40_000));
+        events.extend(sized_turn("t2", 600));
+        events.extend(sized_turn("t3", 600));
+        events.extend(sized_turn("t4", 40_000));
+
+        let inner = DefaultContextAssembler::without_system_prompt();
+        let assembler = ToolResultClearingAssembler::new(Arc::new(inner), 2_000)
+            .with_keep_recent(1)
+            .with_min_clear_bytes(1_000);
+
+        let ctx = AssemblyContext::new(&events);
+        let messages = assembler.assemble(&ctx).await;
+
+        let tool_msgs: Vec<&ChatMessage> =
+            messages.iter().filter(|m| m.role == Role::Tool).collect();
+        let is_cleared = |m: &ChatMessage| {
+            m.content
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("[cleared by harness:")
+        };
+
+        assert!(is_cleared(tool_msgs[1]), "the 40 KB dump must be reclaimed");
+        for (i, small) in [0usize, 2, 3].iter().enumerate() {
+            assert!(
+                !is_cleared(tool_msgs[*small]),
+                "small result #{i} frees nothing — clearing it is pure loss"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_recent_result_is_not_shielded_by_its_position() {
+        // The single biggest result is also the newest but one. Under an
+        // age-ordered policy it would be untouchable while small old results
+        // were destroyed around it.
+        let mut events = vec![Event::new(kinds::USER_MESSAGE, json!({"text": "go"}))];
+        events.extend(sized_turn("t0", 600));
+        events.extend(sized_turn("t1", 600));
+        events.extend(sized_turn("t2", 80_000));
+        events.extend(sized_turn("t3", 600));
+
+        let inner = DefaultContextAssembler::without_system_prompt();
+        let assembler = ToolResultClearingAssembler::new(Arc::new(inner), 2_000)
+            .with_keep_recent(1)
+            .with_min_clear_bytes(1_000);
+
+        let ctx = AssemblyContext::new(&events);
+        let messages = assembler.assemble(&ctx).await;
+        let tool_msgs: Vec<&ChatMessage> =
+            messages.iter().filter(|m| m.role == Role::Tool).collect();
+
+        assert!(tool_msgs[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .starts_with("[cleared by harness:"));
+    }
+
+    #[tokio::test]
+    async fn results_under_the_floor_are_left_alone() {
+        // Nothing here is worth clearing: the context is over the trigger only
+        // because there are many small results, and clearing them would cost
+        // the model facts while freeing nothing.
+        let mut events = vec![Event::new(kinds::USER_MESSAGE, json!({"text": "go"}))];
+        for i in 0..30 {
+            events.extend(sized_turn(&format!("s{i}"), 300));
+        }
+
+        let inner = DefaultContextAssembler::without_system_prompt();
+        let assembler = ToolResultClearingAssembler::new(Arc::new(inner), 500)
+            .with_keep_recent(1)
+            .with_min_clear_bytes(1_000);
+
+        let ctx = AssemblyContext::new(&events);
+        let messages = assembler.assemble(&ctx).await;
+        assert!(
+            messages
+                .iter()
+                .filter(|m| m.role == Role::Tool)
+                .all(|m| !m.content.as_deref().unwrap_or("").starts_with("[cleared")),
+            "sub-floor results must survive"
+        );
     }
 
     #[tokio::test]

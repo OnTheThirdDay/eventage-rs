@@ -211,7 +211,7 @@ impl OpenAiResponsesProvider {
 /// their original order) — this is what keeps encrypted reasoning correctly
 /// paired with its function calls. Turns without stored items are derived
 /// from `content` / `tool_calls`.
-fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
+pub(crate) fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
     let mut instructions = String::new();
     let mut in_leading_system = true;
     let mut input: Vec<Value> = Vec::new();
@@ -298,7 +298,7 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
 }
 
 /// Build an [`LlmResponse`] from a complete Responses API response object.
-fn parse_response(parsed: &Value) -> LlmResponse {
+pub(crate) fn parse_response(parsed: &Value) -> LlmResponse {
     let output = parsed
         .get("output")
         .and_then(|o| o.as_array())
@@ -460,7 +460,12 @@ impl LlmProvider for OpenAiResponsesProvider {
         debug!("opening openai responses SSE stream");
         let resp = self.post(&body).await?;
 
+        // Some Responses-compatible gateways never emit `response.completed`,
+        // so we also accumulate finished output items and synthesize the
+        // final response from them if the terminal event never arrives.
         let mut final_response: Option<Value> = None;
+        let mut items: Vec<Value> = Vec::new();
+        let mut usage: Option<Value> = None;
         let mut line_buf = String::new();
         let mut byte_stream = resp.bytes_stream();
 
@@ -471,7 +476,7 @@ impl LlmProvider for OpenAiResponsesProvider {
             while let Some(newline_pos) = line_buf.find('\n') {
                 let line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
                 line_buf.drain(..=newline_pos);
-                let Some(data) = line.strip_prefix("data: ") else {
+                let Some(data) = super::sse_data(&line) else {
                     continue;
                 };
                 if data == "[DONE]" {
@@ -494,7 +499,10 @@ impl LlmProvider for OpenAiResponsesProvider {
                             });
                         }
                     }
-                    Some("response.reasoning_summary_text.delta") => {
+                    // `reasoning_text` is emitted by third-party gateways;
+                    // `reasoning_summary_text` by OpenAI.
+                    Some("response.reasoning_text.delta")
+                    | Some("response.reasoning_summary_text.delta") => {
                         if let Some(t) = event.get("delta").and_then(|v| v.as_str()) {
                             on_delta(StreamDelta {
                                 content: None,
@@ -502,8 +510,20 @@ impl LlmProvider for OpenAiResponsesProvider {
                             });
                         }
                     }
+                    Some("response.output_item.done") => {
+                        if let Some(item) = event.get("item") {
+                            items.push(item.clone());
+                        }
+                    }
                     Some("response.completed") => {
                         final_response = event.get("response").cloned();
+                    }
+                    Some("response.incomplete") => {
+                        // Truncated (e.g. token cap): keep what we have.
+                        final_response = event.get("response").cloned();
+                    }
+                    _ if event.get("usage").is_some() => {
+                        usage = event.get("usage").cloned();
                     }
                     Some("response.failed") | Some("error") => {
                         return Err(LlmError::Api {
@@ -516,7 +536,18 @@ impl LlmProvider for OpenAiResponsesProvider {
             }
         }
 
-        let parsed = final_response.ok_or(LlmError::EmptyResponse)?;
+        let parsed = match final_response {
+            Some(response) => response,
+            // No terminal event: rebuild from the items we saw stream past.
+            None if !items.is_empty() => {
+                let mut synthetic = json!({ "output": items });
+                if let (Some(usage), Some(obj)) = (usage, synthetic.as_object_mut()) {
+                    obj.insert("usage".into(), usage);
+                }
+                synthetic
+            }
+            None => return Err(LlmError::EmptyResponse),
+        };
         Ok(parse_response(&parsed))
     }
 

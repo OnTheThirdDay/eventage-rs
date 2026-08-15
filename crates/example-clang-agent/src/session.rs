@@ -65,7 +65,8 @@ impl Session {
                 }
             }
         }
-        metas.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        // Newest first.
+        metas.sort_by_key(|m| std::cmp::Reverse(m.created_at));
         Ok(metas)
     }
 

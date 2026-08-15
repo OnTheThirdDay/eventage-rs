@@ -154,7 +154,11 @@ impl PermissionPolicyHook {
         self
     }
 
-    fn verdict_for(&self, tool: &str) -> &PermissionVerdict {
+    /// The verdict this policy applies to `tool` (first matching rule wins).
+    ///
+    /// Exposed so callers can preview or test a policy without executing a
+    /// tool call.
+    pub fn verdict_for(&self, tool: &str) -> &PermissionVerdict {
         self.rules
             .iter()
             .find(|r| glob_match(&r.pattern, tool))

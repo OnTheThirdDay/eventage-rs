@@ -1,0 +1,43 @@
+[package]
+name = "eventage-studio"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Eventage Studio — a desktop app for the eventage coding agent, with a live trace of everything it does"
+
+[lib]
+name = "eventage_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eventage-studio"
+path = "src/main.rs"
+
+[dependencies]
+eventage = { path = "../..", features = ["observability", "sqlite-bundled", "mcp", "sandbox"] }
+eventage_code = { package = "example-coding-agent", path = "../example-coding-agent" }
+
+axum               = { version = "0.7", features = ["macros"] }
+tower-http         = { version = "0.6", features = ["cors"] }
+tokio              = { version = "1", features = ["full"] }
+# `rc` lets the event feed hand out `Arc<StudioEvent>` without cloning the
+# payload for every subscriber and every response.
+serde              = { version = "1", features = ["derive", "rc"] }
+serde_json         = "1"
+async-trait        = "0.1"
+futures-util       = "0.3"
+anyhow             = "1"
+clap               = { version = "4", features = ["derive"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid               = { version = "1", features = ["v4"] }
+chrono             = { version = "0.4", features = ["serde"] }
+dirs               = "5"
+rust-embed         = { version = "8", features = ["mime-guess"] }
+mime_guess         = "2"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest  = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+async-trait  = "0.1"

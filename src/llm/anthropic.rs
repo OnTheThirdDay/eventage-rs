@@ -590,7 +590,7 @@ impl LlmProvider for AnthropicProvider {
             while let Some(newline_pos) = line_buf.find('\n') {
                 let line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
                 line_buf.drain(..=newline_pos);
-                let Some(data) = line.strip_prefix("data: ") else {
+                let Some(data) = super::sse_data(&line) else {
                     continue;
                 };
                 let event: Value = match serde_json::from_str(data) {

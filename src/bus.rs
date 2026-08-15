@@ -1,6 +1,6 @@
 use crate::error::BusError;
 use crate::event::kinds;
-use crate::event::{Event, EventId};
+use crate::event::{Event, EventId, meta_keys};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock};
@@ -340,7 +340,16 @@ impl EventBus {
     /// ticks, UI hints. Durable facts belong in [`publish`](Self::publish).
     pub fn broadcast(&self, event: Event) {
         let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
-        Self::fan_out(&mut subs, event);
+        Self::fan_out(&mut subs, Self::mark_ephemeral(event));
+    }
+
+    /// Stamp an event as never having been on the active branch.
+    ///
+    /// Observers cannot otherwise tell a broadcast from a published event —
+    /// both arrive on the same channel — and an exporter that persists both
+    /// would hand `restore_from` a log it could not reassemble correctly.
+    fn mark_ephemeral(event: Event) -> Event {
+        event.with_meta(meta_keys::EPHEMERAL, serde_json::json!(true))
     }
 
     /// Grants a new subscription channel for future events.
@@ -454,25 +463,25 @@ impl EventBus {
             let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
             Self::fan_out(
                 &mut subs,
-                Event::new(
+                Self::mark_ephemeral(Event::new(
                     kinds::BRANCH_SEALED,
                     serde_json::json!({
                         "branch_id": branch_id.to_string(),
                         "checkpoint_event_id": checkpoint_event_id.to_string(),
                         "reason": "rejected_trajectory"
                     }),
-                ),
+                )),
             );
             if evicted_branches > 0 {
                 Self::fan_out(
                     &mut subs,
-                    Event::new(
+                    Self::mark_ephemeral(Event::new(
                         kinds::SYSTEM_PRUNED,
                         serde_json::json!({
                             "evicted_branches": evicted_branches,
                             "evicted_nodes": evicted_nodes,
                         }),
-                    ),
+                    )),
                 );
             }
         }
@@ -542,20 +551,30 @@ impl EventBus {
     /// observability kinds (`system.branch_sealed`, `system.pruned`) that an
     /// exporter may have captured are skipped.
     ///
-    /// Limitation: rejected branches grafted via
-    /// [`adopt_rejected_branch`](Self::adopt_rejected_branch) (speculation
-    /// losers) are in-memory only and are not reconstructed — the active
-    /// path remains correct, but that negative context is lost on restore.
     pub async fn restore_from(&self, events: Vec<Event>) {
         use std::collections::HashSet;
 
         let mut store = self.inner.store.write().await;
         for event in events {
-            // Skip broadcast-only kinds: they were never part of the DAG.
-            if matches!(
-                event.kind.as_str(),
-                kinds::BRANCH_SEALED | kinds::SYSTEM_PRUNED
-            ) {
+            // Events that were only ever fanned out to observers must not be
+            // resurrected onto the active branch. Exporters persist them —
+            // streaming deltas are worth replaying — but rebuilding history
+            // from them would produce a branch made of message fragments with
+            // no user message and no tool results, which is both wrong and
+            // unusable as LLM context.
+            //
+            // The kind list covers logs written before the marker existed.
+            let ephemeral = event
+                .metadata
+                .get(meta_keys::EPHEMERAL)
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            if ephemeral
+                || matches!(
+                    event.kind.as_str(),
+                    kinds::ASSISTANT_DELTA | kinds::BRANCH_SEALED | kinds::SYSTEM_PRUNED
+                )
+            {
                 continue;
             }
 
@@ -609,80 +628,6 @@ impl EventBus {
         }
     }
 
-    // ── Speculation primitives ────────────────────────────────────────────────
-
-    /// Creates an independent bus seeded with a copy of this bus's active branch.
-    ///
-    /// The fork shares **no** subscribers, transforms, or rejected branches with
-    /// the original — it is a sandbox for speculative execution. Event IDs are
-    /// preserved, so events appended on the fork keep valid `parent_event_id`
-    /// links back into the original history and can later be spliced onto the
-    /// original bus (see [`adopt_rejected_branch`](Self::adopt_rejected_branch)
-    /// and [`crate::agent::speculate`]).
-    pub async fn fork(&self) -> EventBus {
-        let events = self.log().await;
-        let forked = EventBus::with_config(self.inner.config.clone());
-        forked.restore_from(events).await;
-        forked
-    }
-
-    /// Grafts an externally produced trajectory onto this bus as a sealed
-    /// rejected branch anchored at `parent_event_id`.
-    ///
-    /// Used by speculative execution to preserve losing candidate trajectories:
-    /// they become visible to [`rejected_branches_from`](Self::rejected_branches_from)
-    /// (and thus to `NegativeAwareContextAssembler`) exactly like branches
-    /// created by [`rollback`](Self::rollback). Broadcasts a
-    /// `system.branch_sealed` observability event; triggers the same eviction
-    /// policy as rollback.
-    pub async fn adopt_rejected_branch(
-        &self,
-        parent_event_id: Option<EventId>,
-        events: Vec<Event>,
-    ) -> BranchId {
-        let branch_id = BranchId::new_v4();
-        let (evicted_branches, evicted_nodes) = {
-            let mut store = self.inner.store.write().await;
-            let event_ids: Vec<EventId> = events.iter().map(|e| e.id).collect();
-            for event in events {
-                store.nodes.insert(event.id, event);
-            }
-            store.rejected_branches.push(RejectedBranch {
-                id: branch_id,
-                parent_event_id,
-                event_ids,
-            });
-            store.evict_excess_branches(
-                self.inner.config.max_retained_branches,
-                self.inner.config.eviction_strategy.as_ref(),
-            )
-        };
-
-        let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
-        Self::fan_out(
-            &mut subs,
-            Event::new(
-                kinds::BRANCH_SEALED,
-                serde_json::json!({
-                    "branch_id": branch_id.to_string(),
-                    "reason": "adopted_rejected_trajectory"
-                }),
-            ),
-        );
-        if evicted_branches > 0 {
-            Self::fan_out(
-                &mut subs,
-                Event::new(
-                    kinds::SYSTEM_PRUNED,
-                    serde_json::json!({
-                        "evicted_branches": evicted_branches,
-                        "evicted_nodes": evicted_nodes,
-                    }),
-                ),
-            );
-        }
-        branch_id
-    }
 
     // ── Utility ───────────────────────────────────────────────────────────────
 
@@ -882,6 +827,59 @@ mod tests {
         assert_eq!(log[1].kind, kinds::SYSTEM_ROLLBACK);
         assert_eq!(log[2].payload["content"], "retry");
         assert_eq!(log[2].parent_event_id, Some(log[1].id));
+    }
+
+    #[tokio::test]
+    async fn streaming_deltas_do_not_come_back_as_history() {
+        // An exporter observes broadcasts as well as publishes, so a
+        // persisted log contains both. Restoring must rebuild only what was
+        // actually on the active branch: a session reopened from a streaming
+        // run would otherwise consist of message fragments with no user
+        // message and no tool results — unusable as context, and silently so.
+        let bus = EventBus::new();
+        let mut observed = bus.subscribe();
+
+        bus.publish(Event::new(kinds::USER_MESSAGE, json!({ "text": "hi" })))
+            .await
+            .unwrap();
+        bus.broadcast(Event::new(kinds::ASSISTANT_DELTA, json!({ "content": "he" })));
+        bus.broadcast(Event::new(kinds::ASSISTANT_DELTA, json!({ "content": "llo" })));
+        bus.publish(Event::new(
+            kinds::ASSISTANT_MESSAGE,
+            json!({ "content": "hello" }),
+        ))
+        .await
+        .unwrap();
+
+        // Everything an exporter would have written down.
+        let mut persisted = Vec::new();
+        for _ in 0..4 {
+            persisted.push(observed.recv().await.expect("observer sees every event"));
+        }
+        assert_eq!(persisted.len(), 4, "observers see broadcasts too");
+
+        let reopened = EventBus::new();
+        reopened.restore_from(persisted).await;
+        let log = reopened.log().await;
+
+        let kinds_restored: Vec<&str> = log.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds_restored,
+            vec![kinds::USER_MESSAGE, kinds::ASSISTANT_MESSAGE],
+            "only durable events belong on the restored branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcasts_are_marked_so_any_consumer_can_tell() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        bus.broadcast(Event::new(kinds::ASSISTANT_DELTA, json!({})));
+        let event = rx.recv().await.unwrap();
+        assert_eq!(
+            event.metadata.get(meta_keys::EPHEMERAL).and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[tokio::test]

@@ -44,6 +44,8 @@
 
 use crate::agent::skills::{SkillTool, SkillsLibrary};
 use crate::agent::tool::ToolRegistry;
+use crate::component::{Component, ComponentContext, ComponentError};
+use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -300,6 +302,78 @@ impl PluginHost {
     }
 }
 
+// ── Plugins as components ─────────────────────────────────────────────────────
+
+/// Adapts a [`Plugin`] to the [`Component`] lifecycle so it can be unloaded.
+///
+/// Everything the plugin contributes — its skills tool and each MCP server's
+/// tools — is registered through the component context, so `unload` removes
+/// all of it and drops the MCP clients (killing their child processes).
+pub struct PluginComponent {
+    plugin: Plugin,
+}
+
+impl PluginComponent {
+    pub fn new(plugin: Plugin) -> Self {
+        Self { plugin }
+    }
+
+    /// The system-prompt fragment this plugin contributes.
+    pub fn prompt_fragment(&self) -> Option<&str> {
+        self.plugin.prompt_fragment.as_deref()
+    }
+}
+
+#[async_trait]
+impl Component for PluginComponent {
+    fn name(&self) -> &str {
+        &self.plugin.name
+    }
+
+    async fn start(&self, ctx: &mut ComponentContext) -> Result<(), ComponentError> {
+        if !self.plugin.skills.is_empty() {
+            ctx.tool(SkillTool::new(self.plugin.skills.clone()));
+        }
+
+        #[cfg(feature = "mcp")]
+        for spec in &self.plugin.mcp_servers {
+            use crate::mcp::{McpClient, McpToolset};
+
+            let client = match (&spec.command, &spec.url) {
+                (Some(command), _) => McpClient::connect_stdio(
+                    command,
+                    spec.args.clone(),
+                    spec.env.clone().into_iter().collect(),
+                )
+                .await
+                .map_err(|e| ComponentError::Start(e.to_string()))?,
+                (None, Some(url)) => McpClient::connect_http(url)
+                    .await
+                    .map_err(|e| ComponentError::Start(e.to_string()))?,
+                _ => {
+                    return Err(ComponentError::Start(format!(
+                        "MCP server '{}' has neither command nor url",
+                        spec.name
+                    )))
+                }
+            };
+
+            let toolset = McpToolset::from_client(client.with_bus(ctx.bus().clone(), &spec.name))
+                .await
+                .map_err(|e| ComponentError::Start(e.to_string()))?
+                .with_prefix(&spec.name);
+
+            // Register each tool through the context so unload withdraws it,
+            // and keep the client alive for exactly this component's lifetime.
+            for tool in toolset.into_tools() {
+                ctx.tool(tool);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +398,32 @@ skills_dir = "skills"
             "---\nname: greeting\ndescription: greet users warmly. Use for hellos.\n---\nSay hello twice.",
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_plugin_can_be_unloaded_completely() {
+        use crate::agent::hook::DynamicHookChain;
+        use crate::bus::EventBus;
+        use crate::component::{ComponentHost, ComponentState};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_plugin(tmp.path());
+        let plugin = Plugin::load(tmp.path()).unwrap();
+
+        let tools = ToolRegistry::new();
+        let host = ComponentHost::new(EventBus::new(), tools.clone(), DynamicHookChain::new());
+
+        host.load(Arc::new(PluginComponent::new(plugin))).await.unwrap();
+        assert_eq!(host.state("demo"), Some(ComponentState::Active));
+        assert!(tools.get("skill").is_some(), "plugin contributed its skill tool");
+
+        // The whole point: unloading takes its tools with it.
+        host.unload("demo").await.unwrap();
+        assert!(
+            tools.get("skill").is_none(),
+            "unloading a plugin must withdraw everything it registered"
+        );
     }
 
     #[tokio::test]

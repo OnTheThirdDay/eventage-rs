@@ -7,16 +7,6 @@
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
-/// An entry returned by [`Workspace::list_files`].
-#[derive(Debug, Clone)]
-pub struct FileEntry {
-    /// Workspace-relative path (e.g. `"src/main.py"`).
-    pub path: String,
-    /// File size in bytes.
-    #[allow(dead_code)]
-    pub size_bytes: u64,
-}
-
 /// A sandboxed working directory for the coding agent.
 #[derive(Debug)]
 pub struct Workspace {
@@ -57,42 +47,6 @@ impl Workspace {
         Ok(normalised)
     }
 
-    /// List all regular files in the workspace recursively.
-    pub fn list_files(&self) -> Result<Vec<FileEntry>> {
-        let mut entries = Vec::new();
-        collect_files(&self.root, &self.root, &mut entries)?;
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(entries)
-    }
-
-    /// Ensure `bin/` directory exists (used by the execute tool).
-    pub fn ensure_bin_dir(&self) -> Result<()> {
-        #![allow(dead_code)]
-        std::fs::create_dir_all(self.root.join("bin"))?;
-        Ok(())
-    }
-}
-
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            collect_files(root, &path, out)?;
-        } else if meta.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            out.push(FileEntry {
-                path: rel,
-                size_bytes: meta.len(),
-            });
-        }
-    }
-    Ok(())
 }
 
 /// Normalise a path without requiring it to exist (no `canonicalize`).

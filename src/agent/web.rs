@@ -1,13 +1,93 @@
-//! Web tools: web_search (DuckDuckGo) and web_fetch.
+//! Web access: `web_search` and `web_fetch`.
+//!
+//! Both live here rather than in one application because every agent that
+//! reads documentation wants them and two copies would drift.
+//!
+//! # Reaching the network is a privilege
+//!
+//! These are the only built-in tools that talk to a host the user did not
+//! name, which makes them the obvious route both for pulling something
+//! hostile in and for pushing something private out. Two defences are built
+//! in rather than left to the caller:
+//!
+//! - Only `http`/`https`. A `file://` URL would turn a fetch into an
+//!   arbitrary read, and `gopher://` and friends into a request smuggler.
+//! - No private or loopback addresses. On a developer's machine those are
+//!   the cloud metadata endpoint, the container network, and whatever is
+//!   listening on localhost — including this agent's own control surface.
+//!
+//! Register them behind a permission policy as well: the checks below stop
+//! an accident, not a determined prompt injection.
 
 use async_trait::async_trait;
-use eventage::{AgentError, Tool, ToolDefinition};
+use crate::agent::error::AgentError;
+use crate::agent::tool::Tool;
+use crate::llm::types::ToolDefinition;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 fn tool_err(msg: impl Into<String>) -> AgentError {
     AgentError::Tool(msg.into())
+}
+
+/// Reject a URL that a fetch tool has no business following.
+///
+/// The failure this prevents is not exotic. A page the agent was asked to
+/// read says "now fetch http://169.254.169.254/latest/meta-data/", or
+/// `file:///etc/passwd`, or `http://localhost:4600/api/...` — and a tool that
+/// simply does what the URL says will oblige. The model is not the last line
+/// of defence here; this is.
+///
+/// Returns the reason for refusal, phrased for the model so it can adapt
+/// rather than retry.
+pub fn refuse_url(url: &str) -> Option<String> {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(e) => return Some(format!("that is not a valid URL: {e}")),
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Some(format!(
+            "only http and https are allowed; '{}' is not a web request",
+            parsed.scheme()
+        ));
+    }
+
+    let Some(host) = parsed.host_str() else {
+        return Some("that URL has no host".into());
+    };
+
+    // Literal addresses are checked directly. Names are not resolved here:
+    // doing so would still race the request's own lookup, and the obvious
+    // local names are worth refusing on sight.
+    let lowered = host.to_ascii_lowercase();
+    if lowered == "localhost" || lowered.ends_with(".localhost") || lowered.ends_with(".internal")
+    {
+        return Some(format!("'{host}' is a local address, which is not fetchable"));
+    }
+
+    if let Ok(ip) = lowered.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+                    || v4.octets()[0] == 0
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00
+            }
+        };
+        if blocked {
+            return Some(format!(
+                "{ip} is a private or loopback address; web tools reach the public internet only"
+            ));
+        }
+    }
+    None
 }
 
 // ── WebSearchTool ─────────────────────────────────────────────────────────────
@@ -452,6 +532,9 @@ impl Tool for WebFetchTool {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| tool_err("missing 'url'"))?;
+        if let Some(reason) = refuse_url(url) {
+            return Err(tool_err(reason));
+        }
         let max_chars = args["max_chars"].as_u64().unwrap_or(5000) as usize;
 
         let resp = self
@@ -492,5 +575,62 @@ impl Tool for WebFetchTool {
             "content": content,
             "truncated": truncated,
         }))
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::refuse_url;
+
+    #[test]
+    fn public_urls_are_allowed() {
+        for url in [
+            "https://docs.rs/serde/latest/serde/",
+            "http://example.com/page?q=1",
+            "https://8.8.8.8/",
+        ] {
+            assert!(refuse_url(url).is_none(), "{url} should be fetchable");
+        }
+    }
+
+    #[test]
+    fn non_web_schemes_cannot_be_smuggled_through_a_fetch_tool() {
+        // `file://` would turn a web fetch into an arbitrary file read.
+        for url in ["file:///etc/passwd", "gopher://x/", "ftp://host/f"] {
+            assert!(refuse_url(url).is_some(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn the_cloud_metadata_endpoint_is_refused() {
+        // The single most valuable target on a machine that has credentials.
+        assert!(refuse_url("http://169.254.169.254/latest/meta-data/").is_some());
+    }
+
+    #[test]
+    fn loopback_and_private_ranges_are_refused() {
+        for url in [
+            "http://127.0.0.1:4600/api/sessions",
+            "http://localhost:8080/",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/admin",
+            "http://172.16.4.4/",
+            "http://[::1]:9222/json",
+            "http://0.0.0.0/",
+        ] {
+            assert!(refuse_url(url).is_some(), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn the_refusal_says_why_so_the_model_can_adapt() {
+        let reason = refuse_url("file:///etc/passwd").unwrap();
+        assert!(reason.contains("http"), "unhelpful refusal: {reason}");
+    }
+
+    #[test]
+    fn malformed_input_is_refused_not_panicked_on() {
+        assert!(refuse_url("").is_some());
+        assert!(refuse_url("not a url").is_some());
     }
 }

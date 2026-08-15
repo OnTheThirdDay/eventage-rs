@@ -31,6 +31,7 @@
 
 pub mod agent;
 pub mod bridge;
+pub mod component;
 pub mod bus;
 pub mod distributed;
 pub mod error;
@@ -70,19 +71,21 @@ pub use error::{BusError, CoreError};
 pub use event::{kinds, meta_keys, Event, EventId};
 
 pub use agent::{
-    best_of_n, detect_stuck, truncate_middle, Agent, AgentBuilder, AgentContext, AgentError,
-    AgentSet, AssemblyContext, BranchScorer, BudgetScope, ContextAssembler, CycleHook,
+    detect_stuck, truncate_middle, Agent, AgentBuilder, AgentContext, AgentError,
+    AgentSet, AssemblyContext, BudgetScope, ContextAssembler, CycleHook,
     DefaultContextAssembler, DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle,
-    EventWorker, ExecutionStrategy, FnScorer, HookAction, HookContext, KeywordToolSelector,
-    LlmJudgeScorer, NegativeAwareContextAssembler, PermissionPolicyHook, PermissionVerdict,
-    ReactStrategy, Session, SessionBuilder, SingleShotStrategy, SpeculationCandidate,
-    SpeculationOutcome, StuckAnalysis, StuckKind, SummarizingContextAssembler, TokenBudgetHook,
+    EventWorker, ExecutionStrategy, HookAction, HookContext, KeywordToolSelector,
+    NegativeAwareContextAssembler, PermissionPolicyHook, PermissionVerdict,
+    ReactStrategy, Session, SessionBuilder, SingleShotStrategy, StuckAnalysis, StuckKind, SummarizingContextAssembler, TokenBudgetHook,
     Tool, ToolExecOptions, ToolRegistry, ToolResultClearingAssembler, ToolSelector, WorkerError,
     WorkerSet, DEFAULT_MAX_CONCURRENT_TOOLS, DEFAULT_MAX_REACT_STEPS,
-    DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,
-};
+    DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,};
+pub use agent::web::{WebFetchTool, WebSearchTool};
 
 pub use bridge::{BusBridge, BRIDGE_HOPS_KEY};
+pub use component::{
+    Component, ComponentContext, ComponentError, ComponentHost, ComponentState, ServiceRegistry,
+};
 pub use distributed::{BusTransport, DistributedBus, TcpTransport};
 pub use eviction::{EpitaphStore, EpitaphStrategy};
 
@@ -91,7 +94,8 @@ pub use observability::{BusObserver, JsonlExporter};
 
 pub use llm::{
     AnthropicProvider, ChatMessage, ContentPart, ImageSource, LlmError, LlmProvider, LlmResponse,
-    OpenAiProvider, OpenAiResponsesProvider, RateLimitedProvider, RetryProvider, StructuredExt,
+    OpenAiProvider, OpenAiResponsesProvider, QwenProvider, RateLimitedProvider, RetryProvider,
+    StructuredExt,
     ToolCall, ToolDefinition,
 };
 pub use plugin::{Plugin, PluginError, PluginHost};

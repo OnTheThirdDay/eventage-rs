@@ -599,8 +599,7 @@ pub enum StepOutcome {
 /// Run a single ReAct step: hooks → assemble → LLM → publish → execute tools.
 ///
 /// This is the primitive the ReAct loop iterates, exposed so alternative
-/// search strategies (see [`beam_search`](super::speculate::beam_search)) can
-/// drive step-by-step exploration over forked buses.
+/// strategies can reuse a single, fully-guarded step.
 pub async fn run_react_step(
     ctx: &AgentContext,
     step: usize,

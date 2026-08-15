@@ -174,3 +174,8 @@ vite.config.ts.timestamp-*
 
 
 crates/example-eventage-claw/whatsapp-bridge/auth
+
+# Studio's front-end build output and dependencies — produced by
+# crates/eventage-studio/ui/build.sh, not source.
+crates/eventage-studio/ui/node_modules/
+crates/eventage-studio/ui/dist/

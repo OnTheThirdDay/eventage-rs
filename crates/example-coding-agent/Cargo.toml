@@ -1,16 +1,20 @@
 [package]
 name  = "example-coding-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
-description = "Coding agent — agentic capabilities with streaming TUI, security gate, and diff tracking"
+description = "eventage-code — an ACP agent server: LSP-aware coding agent for editors"
+
+[lib]
+name = "eventage_code"
+path = "src/lib.rs"
 
 [[bin]]
-name = "coding-agent"
+name = "eventage-code"
 path = "src/main.rs"
 
 [dependencies]
-eventage           = { path = "../..", features = ["observability", "replay"] }
+eventage           = { path = "../..", features = ["observability", "sqlite-bundled", "mcp", "sandbox"] }
 tokio              = { version = "1", features = ["full"] }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
@@ -19,20 +23,15 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid               = { version = "1", features = ["v4"] }
 chrono             = { version = "0.4", features = ["serde"] }
-thiserror          = "2"
 anyhow             = "1"
 clap               = { version = "4", features = ["derive"] }
 dirs               = "5"
-serde_yaml         = "0.9"
 glob               = "0.3"
 regex              = "1"
 walkdir            = "2"
-reqwest            = { version = "0.12", features = ["json", "stream"] }
-futures-util       = "0.3"
-ratatui            = "0.29"
-crossterm          = { version = "0.28", features = ["event-stream"] }
 similar            = { version = "2.6", features = ["text"] }
-diffy              = "0.3"
-sha2               = "0.10"
-hex                = "0.4"
-rustyline          = "14"
+base64             = "0.22"
+ignore             = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

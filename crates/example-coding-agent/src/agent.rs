@@ -1,450 +1,476 @@
-use crate::assembler::{MemoryAssembler, SkillsAssembler, SummarizingAssembler, UserCorrectionsAssembler};
-use crate::error::CodingAgentError;
-use crate::hooks::{HumanApprovalHook, SecurityGateHook};
+//! Session assembly: one bus + one agent per ACP session.
+
+use crate::acp::{prompt_to_payload, wire::ContentBlock, ClientFs};
+use crate::config::{PermissionMode, Provider, SessionConfig};
+use crate::lsp::LspPool;
 use crate::prompt::build_system_prompt;
-use crate::streaming::StreamingOpenAiProvider;
-use crate::tools::{
-    AddTodoTool, ApplyPatchTool, CheckAsyncTaskTool, CompleteTodoTool, EditFileTool, GlobTool,
-    GrepTool, LaunchAsyncTaskTool, ListTodosTool, LsTool, ReadFileTool, RunCommandTool,
-    SubAgentSpec, TaskTool, TodoState, WriteFileTool,
-};
-use crate::workers::{SubAgentWorker, TurnDiffWorker};
+use crate::tools::{self, intel};
 use crate::workspace::Workspace;
-use eventage::{
-    agent::{ContextAssembler, DefaultContextAssembler},
-    event::{kinds, Event},
-    llm::OpenAiProvider,
-    AgentBuilder, EventBus, RateLimitedProvider, ReactStrategy, WorkerSet,
+use anyhow::Result;
+use eventage::agent::recovery::{reconcile_interrupted_tools, ToolRecovery};
+use eventage::agent::{
+    load_project_context_walkup, DefaultContextAssembler, DynamicHookChain, SkillTool,
+    SkillsLibrary, ToolResultClearingAssembler,
 };
-use serde_json::json;
-use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Arc};
-use tracing::info;
-use uuid::Uuid;
+use eventage::event::kinds;
+use eventage::llm::{AnthropicProvider, LlmProvider, OpenAiProvider, OpenAiResponsesProvider};
+use eventage::sqlite::{SqliteEventStore, SqliteExporter};
+use eventage::observability::BusObserver;
+use eventage::{
+    Agent, AgentBuilder, Event, EventBus, ReactStrategy, SummarizingContextAssembler,
+    TokenBudgetHook,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tracing::{info, warn};
 
-// ── CodingAgent ───────────────────────────────────────────────────────────────
+/// How much of the context window the repository map may occupy.
+///
+/// This buys *detail*, not coverage: every file is named whatever the budget,
+/// and the number decides how many of them also get their symbols listed. A
+/// whole multi-crate workspace fits comfortably here — this repository is
+/// about 3,200 tokens complete — and the map sits in the stable system prefix
+/// where a prompt cache reads it back at a fraction of list price.
+///
+/// It was 1,800 once, chosen without measuring, which cut a third of the
+/// files and led an agent to report a capability missing because the file
+/// defining it had been dropped.
+const REPO_MAP_TOKENS: usize = 8_000;
 
-pub struct CodingAgent {
-    agent: eventage::Agent,
-    bus: EventBus,
-    worker_set: Option<WorkerSet>,
-    /// Cancellation flag (only Some in TUI mode, from StreamingOpenAiProvider).
-    pub cancelled: Option<Arc<AtomicBool>>,
-    #[allow(dead_code)]
-    pub workspace: Arc<Workspace>,
-    pub model: String,
-    pub session_id: String,
+/// Connect one MCP server and load its tools.
+///
+/// The bus is handed to the client so server-initiated elicitation surfaces
+/// as `mcp.elicitation.request` events — which the ACP bridge can forward to
+/// the editor like any other approval.
+async fn connect_mcp(
+    spec: &crate::config::McpServerConfig,
+    bus: &EventBus,
+) -> Result<eventage::mcp::McpToolset> {
+    use eventage::mcp::{McpClient, McpToolset};
+
+    let client = if let Some(command) = &spec.command {
+        McpClient::connect_stdio(command, spec.args.clone(), spec.env.clone()).await?
+    } else if let Some(url) = &spec.url {
+        McpClient::connect_http(url).await?
+    } else {
+        anyhow::bail!("MCP server '{}' has neither command nor url", spec.name);
+    };
+
+    Ok(McpToolset::from_client(client.with_bus(bus.clone(), &spec.name))
+        .await?
+        .with_prefix(&spec.name))
 }
 
-impl CodingAgent {
-    pub fn bus(&self) -> &EventBus {
-        &self.bus
-    }
-
-    /// Publish a user message, run one agent cycle, return the assistant's response.
-    pub async fn chat(&self, msg: &str) -> Result<String, CodingAgentError> {
-        self.bus
-            .publish(Event::new(kinds::USER_MESSAGE, json!({ "text": msg })))
-            .await
-            .map_err(|e| CodingAgentError::Tool(e.to_string()))?;
-
-        self.agent.cycle().await?;
-
-        let log = self.bus.log().await;
-        let response = log
-            .iter()
-            .rev()
-            .find(|e| e.kind == kinds::ASSISTANT_MESSAGE)
-            .and_then(|e| e.payload["content"].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(String::new);
-
-        Ok(response)
-    }
-
-    /// Run the agent reactively. Workers run concurrently on the same bus.
-    pub async fn run(self) -> Result<(), CodingAgentError> {
-        let bus = self.bus.clone();
-        let agent = self.agent;
-
-        if let Some(ws) = self.worker_set {
-            tokio::select! {
-                r = agent.run() => r.map_err(CodingAgentError::Agent),
-                r = ws.run_on(bus) => r.map_err(CodingAgentError::Worker),
-            }
-        } else {
-            agent.run().await.map_err(CodingAgentError::Agent)
-        }
-    }
+/// One live coding session.
+pub struct CodingSession {
+    pub id: String,
+    pub bus: EventBus,
+    agent: Agent,
+    hooks: DynamicHookChain,
+    cancelled: Arc<AtomicBool>,
+    config: SessionConfig,
+    /// One checkpoint per turn, newest last — the anchors for `rewind`.
+    checkpoints: tokio::sync::Mutex<Vec<eventage::EventId>>,
+    /// The subagents this session started, kept alive between calls so the
+    /// agent can go back to one instead of briefing a fresh copy. Dropping
+    /// the session drops them, along with any worktrees they hold.
+    subagents: Arc<tools::task::SubagentRegistry>,
+    /// Everything that was ever recorded for this session, as loaded from
+    /// disk — including the events `restore_from` leaves off the branch.
+    history: Vec<Event>,
 }
 
-// ── CodingAgentBuilder ────────────────────────────────────────────────────────
-
-pub struct CodingAgentBuilder {
-    llm_url: String,
-    api_key: String,
-    model: String,
-    system_prompt: Option<String>,
-    max_steps: usize,
-    max_tokens: usize,
-    memory_paths: Vec<PathBuf>,
-    skill_dirs: Vec<PathBuf>,
-    work_dir: Option<PathBuf>,
-    human_approval_tools: Vec<String>,
-    require_approve_all: bool,
-    subagent_specs: Vec<SubAgentSpec>,
-    extra_tools: Vec<Arc<dyn eventage::Tool>>,
-    async_subagents: bool,
-    session_id: String,
-    /// 0 = unlimited
-    requests_per_minute: u32,
-    /// When true, use StreamingOpenAiProvider + SecurityGateHook (TUI mode).
-    /// When false, use OpenAiProvider + HumanApprovalHook (REPL mode).
-    tui_mode: bool,
-}
-
-impl Default for CodingAgentBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[allow(dead_code)]
-impl CodingAgentBuilder {
-    pub fn new() -> Self {
-        Self {
-            llm_url: "http://localhost:11434/v1".into(),
-            api_key: "ollama".into(),
-            model: "qwen3:4b".into(),
-            system_prompt: None,
-            max_steps: 30,
-            max_tokens: 120_000,
-            memory_paths: vec![],
-            skill_dirs: vec![],
-            work_dir: None,
-            human_approval_tools: vec![],
-            require_approve_all: false,
-            subagent_specs: vec![],
-            extra_tools: vec![],
-            async_subagents: true,
-            session_id: Uuid::new_v4().to_string(),
-            requests_per_minute: 0,
-            tui_mode: true,
-        }
+impl CodingSession {
+    /// Build a fresh session rooted at `config.cwd`.
+    ///
+    /// `client` routes file I/O through the editor when it advertised the
+    /// capability; pass `None` for headless runs, which use the disk.
+    pub async fn create(
+        id: String,
+        config: SessionConfig,
+        client: Option<ClientFs>,
+    ) -> Result<Self> {
+        Self::build(id, config, false, client).await
     }
 
-    pub fn ollama(mut self, model: impl Into<String>) -> Self {
-        self.llm_url = "http://localhost:11434/v1".into();
-        self.api_key = "ollama".into();
-        self.model = model.into();
-        self
+    /// Reopen a persisted session, replaying its event log.
+    pub async fn resume(
+        id: &str,
+        config: SessionConfig,
+        client: Option<ClientFs>,
+    ) -> Result<Self> {
+        Self::build(id.to_string(), config, true, client).await
     }
 
-    pub fn openai(mut self, api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        self.llm_url = "https://api.openai.com/v1".into();
-        self.api_key = api_key.into();
-        self.model = model.into();
-        self
-    }
-
-    pub fn model(
-        mut self,
-        url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
-        self.llm_url = url.into();
-        self.api_key = api_key.into();
-        self.model = model.into();
-        self
-    }
-
-    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.system_prompt = Some(prompt.into());
-        self
-    }
-
-    pub fn system_prompt_opt(mut self, prompt: Option<String>) -> Self {
-        self.system_prompt = prompt;
-        self
-    }
-
-    pub fn work_dir_opt(mut self, path: Option<PathBuf>) -> Self {
-        self.work_dir = path;
-        self
-    }
-
-    pub fn max_steps(mut self, n: usize) -> Self {
-        self.max_steps = n;
-        self
-    }
-
-    pub fn max_tokens(mut self, n: usize) -> Self {
-        self.max_tokens = n;
-        self
-    }
-
-    pub fn memory(mut self, paths: Vec<PathBuf>) -> Self {
-        self.memory_paths = paths;
-        self
-    }
-
-    pub fn skills(mut self, dirs: Vec<PathBuf>) -> Self {
-        self.skill_dirs = dirs;
-        self
-    }
-
-    pub fn work_dir(mut self, path: PathBuf) -> Self {
-        self.work_dir = Some(path);
-        self
-    }
-
-    pub fn human_approval_for(mut self, tools: Vec<String>) -> Self {
-        self.human_approval_tools = tools;
-        self
-    }
-
-    pub fn require_approve_all(mut self, enabled: bool) -> Self {
-        self.require_approve_all = enabled;
-        self
-    }
-
-    pub fn subagent(mut self, spec: SubAgentSpec) -> Self {
-        self.subagent_specs.push(spec);
-        self
-    }
-
-    pub fn tool(mut self, tool: impl eventage::Tool + 'static) -> Self {
-        self.extra_tools.push(Arc::new(tool));
-        self
-    }
-
-    pub fn requests_per_minute(mut self, rpm: u32) -> Self {
-        self.requests_per_minute = rpm;
-        self
-    }
-
-    pub fn async_subagents(mut self, enabled: bool) -> Self {
-        self.async_subagents = enabled;
-        self
-    }
-
-    pub fn tui_mode(mut self, enabled: bool) -> Self {
-        self.tui_mode = enabled;
-        self
-    }
-
-    pub fn build(self) -> CodingAgent {
-        let work_dir = self
-            .work_dir
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-        let workspace = Arc::new(
-            Workspace::open(&work_dir)
-                .unwrap_or_else(|_| Workspace::open(".").expect("could not open workspace")),
-        );
-
+    async fn build(
+        id: String,
+        config: SessionConfig,
+        restore: bool,
+        client: Option<ClientFs>,
+    ) -> Result<Self> {
         let bus = EventBus::new();
+        let ws = Arc::new(Workspace::open(&config.cwd)?);
+        let lsp = Arc::new(LspPool::new(&config.cwd));
 
-        // ── LLM provider (branches on tui_mode) ─────────────────────────────
-        let (llm, cancelled): (Arc<dyn eventage::llm::LlmProvider>, Option<Arc<AtomicBool>>) =
-            if self.tui_mode {
-                let streaming = StreamingOpenAiProvider::new(
-                    &self.llm_url,
-                    &self.api_key,
-                    &self.model,
-                    bus.clone(),
-                );
-                let flag = streaming.cancelled.clone();
-                let base: Arc<dyn eventage::llm::LlmProvider> = Arc::new(streaming);
-                let llm = if self.requests_per_minute > 0 {
-                    Arc::new(RateLimitedProvider::from_arc(
-                        base,
-                        self.requests_per_minute,
-                    )) as Arc<dyn eventage::llm::LlmProvider>
-                } else {
-                    base
-                };
-                (llm, Some(flag))
-            } else {
-                let base_llm = OpenAiProvider::new(&self.llm_url, &self.api_key, &self.model);
-                let llm: Arc<dyn eventage::llm::LlmProvider> = if self.requests_per_minute > 0 {
-                    Arc::new(RateLimitedProvider::new(base_llm, self.requests_per_minute))
-                } else {
-                    Arc::new(base_llm)
-                };
-                (llm, None)
-            };
+        // Persistence: one SQLite log per session, so `session/load` works.
+        let state_dir = config.state_dir();
+        tokio::fs::create_dir_all(&state_dir).await.ok();
+        let db = state_dir.join(format!("{id}.db"));
+        let store = SqliteEventStore::new(&db).await?;
 
-        let todo_state = TodoState::new();
-
-        // Build sub-agent spec list
-        let mut specs = vec![SubAgentSpec::general_purpose()];
-        specs.extend(self.subagent_specs);
-
-        let system_prompt = build_system_prompt(self.system_prompt.as_deref());
-
-        // ── Assembler chain ──────────────────────────────────────────────────
-        let base: Arc<dyn ContextAssembler> =
-            Arc::new(DefaultContextAssembler::new(&system_prompt));
-
-        // Use the LLM to classify user follow-up messages as behavioral instructions
-        // and inject them as a sticky system message that survives summarization.
-        let with_corrections: Arc<dyn ContextAssembler> =
-            Arc::new(UserCorrectionsAssembler::new(base, llm.clone()));
-
-        let with_summary: Arc<dyn ContextAssembler> = if self.max_tokens > 0 {
-            Arc::new(SummarizingAssembler::new(
-                with_corrections,
-                llm.clone(),
-                self.max_tokens,
-                &self.session_id,
-            ))
+        // Kept whole, separately from what goes back onto the bus.
+        //
+        // `restore_from` rebuilds the *conversation*, and deliberately drops
+        // events that were only ever fanned out to observers — streaming
+        // deltas, context assemblies — because replaying them onto the active
+        // branch would produce nonsense history. But those are exactly what a
+        // trace is for, so the record of them has to survive somewhere: this.
+        let history = if restore {
+            let saved = store.load_all().await?;
+            info!(events = saved.len(), "restoring session");
+            bus.restore_from(saved.clone()).await;
+            saved
         } else {
-            with_corrections
+            Vec::new()
         };
 
-        let with_skills: Arc<dyn ContextAssembler> = if self.skill_dirs.is_empty() {
-            with_summary
-        } else {
-            Arc::new(SkillsAssembler::new(with_summary, &self.skill_dirs))
+        let exporter = SqliteExporter::new(&db).await?;
+        tokio::spawn(BusObserver::new(bus.clone()).add_exporter(exporter).run());
+
+        // ── Model ────────────────────────────────────────────────────────────
+        let llm: Arc<dyn LlmProvider> = match config.model.provider {
+            Provider::Anthropic => {
+                let mut p = AnthropicProvider::new(&config.model.api_key, &config.model.model)
+                    .with_max_tokens(config.model.max_tokens);
+                if let Some(budget) = config.model.thinking_tokens {
+                    p = p.with_thinking(budget);
+                }
+                Arc::new(eventage::RetryProvider::new(p))
+            }
+            Provider::OpenAiResponses => Arc::new(eventage::RetryProvider::new(
+                OpenAiResponsesProvider::new(&config.model.api_key, &config.model.model)
+                    .with_base_url(config.model.base_url())
+                    .with_reasoning_effort("high"),
+            )),
+            Provider::Qwen => Arc::new(eventage::RetryProvider::new(
+                eventage::llm::QwenProvider::new(&config.model.api_key, &config.model.model)
+                    .with_base_url(config.model.base_url())
+                    .with_thinking(true),
+            )),
+            Provider::OpenAiChat => Arc::new(eventage::RetryProvider::new(OpenAiProvider::new(
+                config.model.base_url(),
+                &config.model.api_key,
+                &config.model.model,
+            ))),
         };
 
-        let final_assembler: Arc<dyn ContextAssembler> = if self.memory_paths.is_empty() {
-            with_skills
-        } else {
-            Arc::new(MemoryAssembler::new(with_skills, &self.memory_paths))
-        };
+        // ── Context: project instructions + skills, then editing + summarizing ──
+        let mut system_prompt = build_system_prompt(&config.cwd, config.mode);
 
-        // ── Build AgentBuilder ───────────────────────────────────────────────
+        // A map of the workspace, so the first question the agent has to
+        // answer is "which file" rather than "where do I even start". Built
+        // on a blocking thread: it walks the tree and reads source files, and
+        // it must not stall the runtime while it does.
+        let map_root = std::path::PathBuf::from(&config.cwd);
+        let map = tokio::task::spawn_blocking(move || {
+            crate::repomap::build(&map_root, REPO_MAP_TOKENS)
+        })
+        .await
+        .unwrap_or_default();
+        if !map.is_empty() {
+            info!(bytes = map.len(), "repository map built");
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&map);
+        }
+
+        for ctx in load_project_context_walkup(&config.cwd) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&ctx.system_prompt_section());
+        }
+
+        let mut skills = SkillsLibrary::new();
+        skills.add_dir(std::path::Path::new(&config.cwd).join(".eventage/skills"))?;
+        skills.add_dir(std::path::Path::new(&config.cwd).join(".claude/skills"))?;
+        if !skills.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&skills.system_prompt_section());
+        }
+
+        let base = DefaultContextAssembler::new(system_prompt);
+        let clearing = ToolResultClearingAssembler::new(
+            Arc::new(base),
+            (config.context_tokens as f64 * 0.6) as usize,
+        );
+        let assembler = SummarizingContextAssembler::new(
+            Arc::new(clearing),
+            Arc::clone(&llm),
+            config.context_tokens,
+            id.clone(),
+        )
+        // Compaction goes on the log: it survives reopening the session, the
+        // trace shows what was folded away, and a summary that lost something
+        // can be replaced without restarting.
+        .with_bus(bus.clone());
+
+        // ── Tools ────────────────────────────────────────────────────────────
+        let jobs = Arc::new(tools::BackgroundJobs::default());
+        let plan_state = Arc::new(intel::PlanState::default());
+        // Held by the session so its subagents die when it does.
+        let subagents = Arc::new(tools::task::SubagentRegistry::new());
+        let hooks = DynamicHookChain::new();
+        hooks.add_arc(Arc::new(config.mode.policy()));
+        if config.token_budget > 0 {
+            hooks.add_hook(TokenBudgetHook::new(config.token_budget));
+        }
+
         let mut builder = AgentBuilder::new()
+            .agent_id(format!("code-{id}"))
             .bus(bus.clone())
-            .llm_arc(llm.clone())
-            .context(ArcAssembler(final_assembler))
+            .llm_arc(Arc::clone(&llm))
+            .context(assembler)
+            .hook(hooks.clone())
             .strategy(ReactStrategy {
-                max_steps: self.max_steps,
+                max_steps: 100,
                 max_concurrent_tools: 4,
+                stream: true,
                 ..Default::default()
+            })
+            .tool(tools::ReadFile {
+                ws: ws.clone(),
+                client: client.clone(),
+            })
+            .tool(tools::WriteFile {
+                ws: ws.clone(),
+                client: client.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(tools::EditFile {
+                ws: ws.clone(),
+                client: client.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(tools::patch::ApplyPatch {
+                ws: ws.clone(),
+                client: client.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(tools::MultiEdit {
+                ws: ws.clone(),
+                client: client.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(tools::Glob { ws: ws.clone() })
+            .tool(tools::Grep { ws: ws.clone() })
+            .tool(tools::ListDirectory { ws: ws.clone() })
+            .tool(tools::Bash {
+                ws: ws.clone(),
+                jobs,
+            })
+            .tool(intel::LspDiagnostics {
+                ws: ws.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(intel::LspDefinition {
+                ws: ws.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(intel::LspReferences {
+                ws: ws.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(intel::LspRename {
+                ws: ws.clone(),
+                lsp: lsp.clone(),
+                client: client.clone(),
+            })
+            .tool(intel::LspHover {
+                ws: ws.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(intel::LspSymbols {
+                ws: ws.clone(),
+                lsp: lsp.clone(),
+            })
+            .tool(tools::vision::ViewImage { ws: ws.clone() })
+            .tool(intel::Plan {
+                state: plan_state.clone(),
+            })
+            // Reaching the network is gated by `RISKY_TOOLS`, and the tool
+            // itself refuses loopback and private addresses.
+            //
+            // No `web_search`: the only keyless option is scraping a search
+            // engine's HTML, which already returns one result and an empty
+            // snippet here. A search tool the model trusts and that quietly
+            // returns nothing is worse than no search tool, because the model
+            // reads the empty result as "nothing exists".
+            .tool(eventage::agent::web::WebFetchTool::new())
+            .tool(tools::git::Git { ws: ws.clone() })
+            .tool(tools::git::CreatePullRequest { ws: ws.clone() })
+            .tool(tools::task::Task {
+                ws: ws.clone(),
+                llm: Arc::clone(&llm),
+                depth: 0,
+                active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                mode: config.mode,
+                bus: bus.clone(),
+                // Owned by the session, so the subagents it started die with
+                // it — which is what makes keeping them alive safe.
+                registry: subagents.clone(),
             });
 
-        // ── Register standard tools ──────────────────────────────────────────
-        builder = builder
-            .tool(LsTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(ReadFileTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(WriteFileTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(EditFileTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(ApplyPatchTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(GlobTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(GrepTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(RunCommandTool {
-                work_dir: work_dir.clone(),
-            })
-            .tool(AddTodoTool {
-                state: todo_state.clone(),
-            })
-            .tool(CompleteTodoTool {
-                state: todo_state.clone(),
-            })
-            .tool(ListTodosTool { state: todo_state });
-
-        // ── Sync task tool ───────────────────────────────────────────────────
-        builder = builder.tool(TaskTool {
-            llm: llm.clone(),
-            base_system_prompt: system_prompt.clone(),
-            specs: specs.clone(),
-            max_steps: self.max_steps / 2,
-            work_dir: work_dir.clone(),
-        });
-
-        // ── Async task tools (if enabled) ────────────────────────────────────
-        if self.async_subagents {
-            builder = builder
-                .tool(LaunchAsyncTaskTool {
-                    bus: bus.clone(),
-                    specs: specs.clone(),
-                })
-                .tool(CheckAsyncTaskTool { bus: bus.clone() });
+        if !skills.is_empty() {
+            builder = builder.tool(SkillTool::new(skills));
         }
 
-        // ── Extra user-supplied tools ────────────────────────────────────────
-        for tool in self.extra_tools {
-            builder = builder.tool_arc(tool);
-        }
-
-        // ── Hook ─────────────────────────────────────────────────────────────
-        // Same flags control both modes; only the UI implementation differs:
-        // TUI uses an event-driven overlay, REPL uses a stdin prompt.
-        if self.tui_mode {
-            if self.require_approve_all {
-                builder = builder.hook(SecurityGateHook::all_tools(bus.clone()));
-            } else if !self.human_approval_tools.is_empty() {
-                builder = builder.hook(SecurityGateHook::watched(bus.clone(), self.human_approval_tools));
-            }
-        } else if self.require_approve_all {
-            builder = builder.hook(HumanApprovalHook::all_tools());
-        } else if !self.human_approval_tools.is_empty() {
-            builder = builder.hook(HumanApprovalHook::new(self.human_approval_tools));
-        }
-
+        let registry = builder.tool_registry();
         let agent = builder.build();
 
-        // ── Worker set ───────────────────────────────────────────────────────
-        let mut ws = WorkerSet::new().add_worker(TurnDiffWorker::new(workspace.clone()));
-
-        if self.async_subagents {
-            ws = ws.add_worker(SubAgentWorker {
-                llm: llm.clone(),
-                specs,
-                base_system_prompt: system_prompt,
-                max_steps: self.max_steps / 2,
-                work_dir: work_dir.clone(),
-            });
+        // MCP servers the editor configured: their tools join the registry
+        // name-prefixed, so two servers exposing `search` cannot collide.
+        for spec in &config.mcp_servers {
+            match connect_mcp(spec, &bus).await {
+                Ok(toolset) => {
+                    toolset.add_to_registry(&registry);
+                    info!(server = %spec.name, tools = toolset.len(), "MCP server connected");
+                }
+                // A broken MCP server must not stop the session from starting.
+                Err(e) => warn!(server = %spec.name, "MCP server unavailable: {e}"),
+            }
         }
 
-        info!(
-            model = %self.model,
-            work_dir = %work_dir.display(),
-            tui_mode = self.tui_mode,
-            async_subagents = self.async_subagents,
-            "coding agent ready"
-        );
+        // Rewind anchors live in the log, so rebuild them when reopening —
+        // otherwise a resumed session reports no turns to undo even though
+        // its history is right there.
+        let mut checkpoints: Vec<eventage::EventId> = Vec::new();
+        if restore {
+            checkpoints = bus
+                .log()
+                .await
+                .iter()
+                .filter(|e| e.kind == kinds::CHECKPOINT)
+                .map(|e| e.id)
+                .collect();
+            info!(anchors = checkpoints.len(), "restored rewind anchors");
+        }
 
-        CodingAgent {
-            agent,
+        // A crash mid-tool leaves an orphaned call; resolve it before resuming.
+        if restore {
+            let policy = ToolRecovery::new()
+                .replay("read_file")
+                .replay("grep")
+                .replay("glob")
+                .replay("lsp_*");
+            reconcile_interrupted_tools(&bus, &policy, Some(&registry)).await?;
+        }
+
+        Ok(Self {
+            id,
             bus,
-            worker_set: Some(ws),
-            cancelled,
-            workspace,
-            model: self.model,
-            session_id: self.session_id,
-        }
+            agent,
+            hooks,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            config,
+            checkpoints: tokio::sync::Mutex::new(checkpoints),
+            subagents,
+            history,
+        })
     }
-}
 
-// ── ArcAssembler ─────────────────────────────────────────────────────────────
+    /// Swap the permission policy for a new mode.
+    pub async fn set_mode(&self, mode: PermissionMode) {
+        self.hooks.remove_all();
+        self.hooks.add_arc(Arc::new(mode.policy()));
+        if self.config.token_budget > 0 {
+            self.hooks
+                .add_hook(TokenBudgetHook::new(self.config.token_budget));
+        }
+        info!(mode = mode.id(), "permission mode changed");
+    }
 
-/// Newtype so Arc<dyn ContextAssembler> can be passed to AgentBuilder::context().
-struct ArcAssembler(Arc<dyn ContextAssembler>);
+    /// Publish the user's prompt (text and images) onto the bus.
+    ///
+    /// Each turn opens with a DAG checkpoint, which is what makes
+    /// [`rewind`](Self::rewind) possible: undoing a turn is a graph operation,
+    /// not a hand-rolled message-array edit.
+    pub async fn submit_prompt(&self, blocks: &[ContentBlock]) -> Result<()> {
+        self.cancelled.store(false, Ordering::SeqCst);
+        let checkpoint = self.bus.checkpoint().await?;
+        self.checkpoints.lock().await.push(checkpoint);
+        self.bus
+            .publish(Event::new(kinds::USER_MESSAGE, prompt_to_payload(blocks)))
+            .await?;
+        Ok(())
+    }
 
-#[async_trait::async_trait]
-impl ContextAssembler for ArcAssembler {
-    async fn assemble(
-        &self,
-        context: &eventage::agent::AssemblyContext<'_>,
-    ) -> Vec<eventage::llm::ChatMessage> {
-        self.0.assemble(context).await
+    /// Roll the conversation back by `turns` (default 1).
+    ///
+    /// The discarded trajectory is sealed as a rejected branch rather than
+    /// deleted, so the agent can still be told "you tried that and it did not
+    /// work" on the next attempt.
+    pub async fn rewind(&self, turns: usize) -> Result<usize> {
+        let turns = turns.max(1);
+        let mut checkpoints = self.checkpoints.lock().await;
+        if checkpoints.is_empty() {
+            anyhow::bail!("nothing to rewind: this session has no completed turns");
+        }
+        let keep = checkpoints.len().saturating_sub(turns);
+        let target = checkpoints[keep];
+        self.bus.rollback(target).await?;
+        checkpoints.truncate(keep);
+        info!(turns, "rewound session");
+        Ok(checkpoints.len())
+    }
+
+    /// Roll back to a specific checkpoint.
+    ///
+    /// Counting turns backwards is fine for "undo that", but a session with
+    /// ten turns is easier to navigate by pointing at the moment you want to
+    /// return to — which is what the timeline's checkpoint flags are.
+    pub async fn rewind_to(&self, checkpoint: eventage::EventId) -> Result<usize> {
+        let mut checkpoints = self.checkpoints.lock().await;
+        let position = checkpoints
+            .iter()
+            .position(|&id| id == checkpoint)
+            .ok_or_else(|| anyhow::anyhow!("that checkpoint is not part of this session"))?;
+        self.bus.rollback(checkpoint).await?;
+        checkpoints.truncate(position);
+        info!(remaining = checkpoints.len(), "rewound to checkpoint");
+        Ok(checkpoints.len())
+    }
+
+    /// The checkpoints this session can rewind to, oldest first.
+    pub async fn checkpoints(&self) -> Vec<eventage::EventId> {
+        self.checkpoints.lock().await.clone()
+    }
+
+    /// Everything ever recorded for this session, as it was loaded.
+    ///
+    /// Use this and not `bus.log()` to seed a trace: the bus holds the
+    /// conversation, which is a strict subset — a resumed session's bus has
+    /// no streaming deltas and no context assemblies in it.
+    pub fn history(&self) -> &[Event] {
+        &self.history
+    }
+
+    /// The subagents this session has running.
+    ///
+    /// They live as long as the session and no longer, so this is also what
+    /// bounds their worktrees.
+    pub fn subagents(&self) -> &Arc<tools::task::SubagentRegistry> {
+        &self.subagents
+    }
+
+    /// Run one reasoning cycle to completion.
+    pub async fn run_cycle(&self) -> Result<()> {
+        self.agent.cycle().await?;
+        Ok(())
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn was_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
     }
 }

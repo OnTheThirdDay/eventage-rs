@@ -12,7 +12,7 @@ The central philosophy of Eventage is simple: **everything that happens in the s
 
 Human inputs, LLM generated contents, tool executions, and inter-agent routing are all emitted as events over an append-only, Directed Acyclic Graph (DAG) log called the `EventBus`.
 
-This design inherently decouples the system. It enables precise reproducibility, fault tolerance, live observability, speculative branching (DAG rollback), and effortless multi-agent concurrency.
+This design inherently decouples the system. It enables precise reproducibility, fault tolerance, live observability, checkpoint/rollback, and effortless multi-agent concurrency.
 
 ### The Agent Loop
 
@@ -76,6 +76,7 @@ The framework is strictly separated into the core abstraction layer (`eventage-a
 *   **`eventage-agent`**: The core traits defining what an agent *is*. It provides traits like `Agent`, `Tool`, `CycleHook`, `ContextAssembler`, and `ExecutionStrategy`.
 *   **`eventage-provided-impl`**: The "batteries included" facade. Provides concrete, ready-to-use implementations of the traits from `eventage-agent` (like `Session`, `AgentSet`, `WorkerSet`, strategies, and context assemblers).
 *   **Auxiliary Crates**: Capabilities separated strictly by dependency domain (`eventage-llm`, `eventage-sandbox`, `eventage-mcp`, `eventage-sqlite`, `eventage-observability`).
+*   **Applications**: `example-coding-agent` builds `eventage-code`, an ACP agent server for editors; `eventage-studio` is a desktop app that either hosts it in-process or drives any ACP agent, and renders the event log as a live trace beside the conversation. Both are worth reading as worked examples of composing the framework — see [the Studio README](../crates/eventage-studio/README.md).
 
 ---
 
@@ -95,8 +96,8 @@ The `EventBus` is an append-only DAG log and a live broadcast channel.
 Every component in Eventage takes a `Clone` of the same bus. When they publish, the event is appended to the active branch. When they subscribe, they listen live.
 
 ### 2.3 DAG Checkpointing & Rollback
-Because the bus is a DAG instead of a flat list, Eventage natively supports speculative execution.
-You can create a checkpoint, try a risky operation (like executing uncertain LLM code), and if it fails, you `rollback()` to the checkpoint. The failed events are cleanly snipped off the active branch and stored as a "rejected branch," which can later be used to teach an agent what *not* to do.
+Because the bus is a DAG instead of a flat list, a turn can be undone rather than edited away.
+You create a checkpoint, try a risky operation (like executing uncertain LLM code), and if it fails, you `rollback()` to the checkpoint. The failed events are cleanly snipped off the active branch and stored as a "rejected branch," which can later be used to teach an agent what *not* to do.
 
 ---
 
@@ -132,8 +133,13 @@ The assembler's job is to read the raw DAG of events and format them into an arr
 1.  **`DefaultContextAssembler`**: The standard chronological parser. It maps `"user.message"` to User, `"assistant.message"` to Assistant, etc.
 2.  **`NegativeAwareContextAssembler`**: Uses the DAG's rejected branches. If a rollback occurs, this assembler gathers the rejected trajectory and inserts it into the prompt with instructions like *"You previously attempted X, which failed with error Y."*
 3.  **`DynamicContextAssembler`**: A Thread-safe Mutex-backed assembler that lets you hot-swap the internal context logic perfectly mid-flight without pausing the agent.
-4.  **`ToolResultClearingAssembler`** *(context editing)*: The cheap first line of context management. Once the assembled context crosses a token trigger, the *content* of the oldest tool results is replaced with a short placeholder — zero LLM calls, and lossless because the full output still lives in the event log. Clearing is a monotonic ratchet, so the edited prefix stays stable for provider prompt caches.
-5.  **`SummarizingContextAssembler`**: The heavyweight fallback. When the context still exceeds a token budget, the oldest conversation messages are folded into an LLM-generated summary (optionally archived to disk). Compose it *around* the clearing assembler so summarization only fires when clearing alone cannot reclaim enough:
+4.  **`ToolResultClearingAssembler`** *(context editing)*: The cheap first line of context management. Once the assembled context crosses a token trigger, tool-result *content* is replaced with a short placeholder — zero LLM calls, and lossless because the full output still lives in the event log. Results are picked by how much of the budget they hold rather than by age, since reclaiming tokens is the whole point: a stale 60 KB file dump is worth more than a dozen 200-byte search hits, and clearing those small results would cost the model facts while freeing nothing (`min_clear_bytes` puts a floor under it). Only the newest `keep_recent` results are off limits, so a large recent result is not shielded merely by its position. Clearing is a monotonic ratchet, so the edited view stays stable for provider prompt caches, and each pass reclaims past the trigger (`target`) rather than merely to it.
+5.  **`SummarizingContextAssembler`**: The heavyweight fallback. When the context still exceeds a token budget, the oldest conversation messages are folded into an LLM-generated summary (optionally archived to disk). Three things govern *when* and *how much*:
+    *   **When** — summarization prefers a task boundary (no unmatched `agent.cycle.start`). Mid-task it holds off until `hard_threshold`, because a summary discards exactly the details the agent is currently working from — the file it just read, the error it is chasing — and it cannot ask for them back.
+    *   **Where** — retention is measured in tokens, not messages: twenty messages can be five thousand tokens of chat or a hundred and fifty thousand tokens of file dumps, and only one of those fits. The resulting cut is then snapped to a turn boundary, so a tool result is never separated from the call that produced it (`keep_recent` remains as a floor).
+    *   **How much** — a pass costs an LLM call and invalidates every cached prompt token after the cut, so it compresses down to a low-water mark (`target`, default 50% of the budget) instead of landing just under the trigger and tripping again a few turns later.
+
+    Compose it *around* the clearing assembler so summarization only fires when clearing alone cannot reclaim enough:
 
 ```rust
 let base = DefaultContextAssembler::new("You are helpful.");
@@ -265,35 +271,6 @@ Hooks return a `HookAction`:
     ```
 
 *   **`TokenBudgetHook`** — enforces a token ceiling computed from usage metadata in the event log (session-wide by default, `agent_scoped()` optional). At 80% it publishes `budget.warning` and injects a wrap-up note into the prompt; at 100% it publishes `budget.exhausted` and aborts the cycle. Accounting is derived from the bus, so it survives restore-from-SQLite restarts.
-
----
-
-## 7.5 Speculative Best-of-N Execution
-
-`eventage::agent::speculate::best_of_n` runs N candidate agents **in parallel forks of the bus**, scores their trajectories, splices the winner onto the main log, and seals every loser as a rejected branch (feeding `NegativeAwareContextAssembler`).
-
-```rust
-use eventage::agent::speculate::{best_of_n, SpeculationCandidate, LlmJudgeScorer};
-
-let outcome = best_of_n(&bus, vec![
-    SpeculationCandidate::new("temp-0.2", |fork| build_agent(fork, 0.2)),
-    SpeculationCandidate::new("temp-0.9", |fork| build_agent(fork, 0.9)),
-], &LlmJudgeScorer::new(judge, "correctness and brevity")).await?;
-```
-
-Scorers implement `BranchScorer`: use `FnScorer` for heuristics (tests pass? shortest diff?) or `LlmJudgeScorer` for LLM-as-judge on a 0–10 scale. The round is recorded as a durable `speculation.completed` event.
-
-### Provided Implementation (`eventage-provided-impl`):
-*   **`DynamicHookChain`**: Allows for hooks to be safely swapped, updated, or manipulated at runtime on a live agent system.
-
-```rust
-// Attaching multiple hooks to an agent
-let agent = AgentBuilder::new()
-    .hook(RequestLoggerHook) // Logs every incoming user message
-    .hook(CostLimiterHook::new(5.00)) // Aborts cycle if OpenAI bill exceeds $5
-    .hook(StdinApprovalGate) // Manually approve tools dropping DB tables
-    .build();
-```
 
 ---
 
@@ -430,22 +407,6 @@ explicit per tool: `ReportInterrupted` (default, **at-most-once** — tells the
 model the outcome is unknown), `Replay` (**at-least-once**, idempotent tools
 only), or `Fail`. Reconciliation also repairs the history so providers stop
 rejecting the next request.
-
-### Beam search (per-step speculation)
-
-Where `best_of_n` speculates over whole cycles, `beam_search` speculates at
-every ReAct step — exploring *actions*, not just wordings:
-
-```rust
-let config = BeamConfig { candidates_per_step: 3, beam_width: 1, ..Default::default() };
-let outcome = beam_search(&bus, &config, &scorer, |fork, candidate| {
-    build_agent(fork, temperature_for(candidate))
-}).await?;
-```
-
-Every pruned trajectory is sealed as a rejected branch, feeding
-`NegativeAwareContextAssembler`. Cost scales with
-`beam_width × candidates_per_step` per step — use a cheap model to explore.
 
 ### Distributed bus
 

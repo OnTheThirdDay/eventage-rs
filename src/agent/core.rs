@@ -126,30 +126,6 @@ impl Agent {
         result
     }
 
-    /// Execute a **single** reasoning step (assemble → LLM → tools) rather
-    /// than a whole cycle.
-    ///
-    /// This is the primitive used by step-level search strategies such as
-    /// [`beam_search`](super::speculate::beam_search); ordinary agents should
-    /// use [`cycle`](Self::cycle).
-    pub async fn step(
-        &self,
-        step: usize,
-        opts: &super::strategy::ToolExecOptions,
-    ) -> Result<super::strategy::StepOutcome, AgentError> {
-        let agent_ctx = AgentContext {
-            agent_id: self.agent_id.clone(),
-            trace_id: Uuid::new_v4().to_string(),
-            bus: self.bus.clone(),
-            llm: self.llm.clone(),
-            assembler: self.context.clone(),
-            tools: self.tools.clone(),
-            tool_selector: self.tool_selector.clone(),
-            hooks: self.hooks.clone(),
-        };
-        super::strategy::run_react_step(&agent_ctx, step, opts, false).await
-    }
-
     /// Continuously listens and reacts to incoming events.
     pub async fn run(&self) -> Result<(), AgentError> {
         // Subscribe before inspecting the log so we cannot miss events published

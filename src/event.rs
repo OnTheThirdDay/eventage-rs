@@ -102,6 +102,17 @@ pub mod kinds {
     /// old conversation history is summarized to keep the context window bounded.
     /// Payload includes `"summary_len"`, `"summarized_events"`, and `"retained_events"`.
     pub const AGENT_CONTEXT_SUMMARIZED: &str = "agent.context.summarized";
+    /// What was actually sent to the model, and what each part came from.
+    ///
+    /// Payload: `{ "messages", "total_tokens", "system_tokens",
+    /// "verbatim_messages", "summarized_messages", "summary_tokens",
+    /// "compacted", "budget" }`.
+    ///
+    /// Broadcast rather than published: it describes a request rather than
+    /// being a fact the model needs back. Exporters still record it, so "what
+    /// did we send at step 7, and how much of it was a summary rather than
+    /// real conversation" stays answerable afterwards.
+    pub const CONTEXT_ASSEMBLED: &str = "agent.context.assembled";
 
     // ── Streaming (ephemeral — broadcast only, never stored in the DAG) ──────
     /// Incremental completion text emitted while an LLM response streams.
@@ -142,10 +153,6 @@ pub mod kinds {
     /// a restart. Payload: `{ "interrupted_tool_calls", "replayed", "reported" }`.
     pub const SYSTEM_RECOVERED: &str = "system.recovered";
 
-    // ── Speculation ───────────────────────────────────────────────────────────
-    /// Emitted after a speculative best-of-N round completes.
-    /// Payload: `{ "candidates", "winner_index", "scores" }`.
-    pub const SPECULATION_COMPLETED: &str = "speculation.completed";
 }
 
 /// Standard metadata keys for [`Event::metadata`].
@@ -169,6 +176,15 @@ pub mod meta_keys {
     /// [`TokenCalibration`](crate::agent::tokens::TokenCalibration) learn the
     /// estimator's error online.
     pub const LLM_ESTIMATED_INPUT_TOKENS: &str = "llm_estimated_input_tokens";
+
+    /// Marks an event that was fanned out to observers only and never entered
+    /// the DAG.
+    ///
+    /// Set by [`EventBus::broadcast`](crate::EventBus::broadcast). Exporters
+    /// still persist these — streaming deltas are worth replaying — so
+    /// [`EventBus::restore_from`](crate::EventBus::restore_from) reads the
+    /// marker to keep them off the active branch when a session is reopened.
+    pub const EPHEMERAL: &str = "ephemeral";
 }
 
 #[cfg(test)]
