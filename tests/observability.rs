@@ -1,6 +1,6 @@
 #![cfg(feature = "observability")]
-use eventage::{kinds, Event, EventBus};
 use eventage::observability::{BusObserver, JsonlExporter};
+use eventage::{kinds, Event, EventBus};
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 

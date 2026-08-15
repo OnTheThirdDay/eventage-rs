@@ -18,10 +18,10 @@
 //! `OPENAI_BASE_URL`.
 
 use anyhow::{Context, Result};
-use eventage_studio::backend::{acp::AcpBackend, local::LocalBackend, Backend};
-use eventage_studio::server;
 use clap::Parser;
 use eventage_code::config::ModelConfig;
+use eventage_studio::backend::{acp::AcpBackend, local::LocalBackend, Backend};
+use eventage_studio::server;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
@@ -70,8 +70,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cwd = match &cli.cwd {
-        Some(dir) => std::fs::canonicalize(dir)
-            .with_context(|| format!("cannot open workspace '{dir}'"))?,
+        Some(dir) => {
+            std::fs::canonicalize(dir).with_context(|| format!("cannot open workspace '{dir}'"))?
+        }
         None => std::env::current_dir()?,
     }
     .display()
@@ -132,7 +133,10 @@ async fn main() -> Result<()> {
 fn open_window(url: &str) {
     #[cfg(target_os = "macos")]
     let candidates: [(&str, &[&str]); 2] = [
-        ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", &[]),
+        (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            &[],
+        ),
         ("open", &[]),
     ];
     #[cfg(target_os = "windows")]

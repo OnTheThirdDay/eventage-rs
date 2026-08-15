@@ -388,7 +388,10 @@ impl ComponentHost {
     }
 
     /// Register a component and start it if its dependencies are met.
-    pub async fn load(&self, component: Arc<dyn Component>) -> Result<ComponentState, ComponentError> {
+    pub async fn load(
+        &self,
+        component: Arc<dyn Component>,
+    ) -> Result<ComponentState, ComponentError> {
         let name = component.name().to_string();
         {
             let components = self.components.lock().unwrap_or_else(|e| e.into_inner());
@@ -458,7 +461,10 @@ impl ComponentHost {
         // half-registered tool set behind.
         if let Err(e) = component.start(&mut ctx).await {
             let reverted = ctx.dispose();
-            warn!(component = name, reverted, "start failed; partial effects reverted");
+            warn!(
+                component = name,
+                reverted, "start failed; partial effects reverted"
+            );
             return Err(e);
         }
 
@@ -620,7 +626,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn host() -> ComponentHost {
-        ComponentHost::new(EventBus::new(), ToolRegistry::new(), DynamicHookChain::new())
+        ComponentHost::new(
+            EventBus::new(),
+            ToolRegistry::new(),
+            DynamicHookChain::new(),
+        )
     }
 
     struct NoopTool(String);
@@ -694,9 +704,16 @@ mod tests {
         host.unload("kitchen").await.unwrap();
 
         // Registrations gone.
-        assert!(host.tools.get("kitchen_tool").is_none(), "tool must be removed");
+        assert!(
+            host.tools.get("kitchen_tool").is_none(),
+            "tool must be removed"
+        );
         assert_eq!(host.hooks.len(), 0, "hook must be withdrawn");
-        assert_eq!(disposed.load(Ordering::SeqCst), 1, "custom undo step must run");
+        assert_eq!(
+            disposed.load(Ordering::SeqCst),
+            1,
+            "custom undo step must run"
+        );
 
         // Task really stopped: the counter must stop advancing.
         let before = ticks.load(Ordering::SeqCst);
@@ -729,7 +746,9 @@ mod tests {
     async fn registrations_are_undone_in_reverse_order() {
         let host = host();
         let log = Arc::new(Mutex::new(Vec::new()));
-        host.load(Arc::new(Ordered(Arc::clone(&log)))).await.unwrap();
+        host.load(Arc::new(Ordered(Arc::clone(&log))))
+            .await
+            .unwrap();
         host.unload("ordered").await.unwrap();
         assert_eq!(*log.lock().unwrap(), vec![3, 2, 1]);
     }
@@ -837,7 +856,11 @@ mod tests {
         assert!(host.tools.get("consumer_tool").is_some());
         // Exactly one registration survives a reload — no duplicates.
         assert_eq!(
-            host.tools.names().iter().filter(|n| *n == "consumer_tool").count(),
+            host.tools
+                .names()
+                .iter()
+                .filter(|n| *n == "consumer_tool")
+                .count(),
             1
         );
     }

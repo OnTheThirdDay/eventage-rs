@@ -199,8 +199,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Observability ─────────────────────────────────────────────────────────
     // Attach exporter + replay to EVERY bus (shared + all per-group) so that
     // conversation events appear alongside heartbeats and IPC events.
-    let group_bus_list: Vec<eventage::EventBus> =
-        group_buses.values().cloned().collect();
+    let group_bus_list: Vec<eventage::EventBus> = group_buses.values().cloned().collect();
 
     // Aggregation bus: dynamically-spawned sub-agent buses forward their events
     // here so the live replay UI can observe them without knowing about the buses
@@ -229,12 +228,10 @@ async fn main() -> anyhow::Result<()> {
                 // all events to spawn_agg_bus so the replay UI sees them too.
                 let exporter_for_hook = exporter.clone();
                 let agg_for_hook = spawn_agg_bus.clone();
-                *claw.spawner_bus_hook.lock().unwrap() = Some(std::sync::Arc::new(
-                    move |bus: eventage::EventBus| {
+                *claw.spawner_bus_hook.lock().unwrap() =
+                    Some(std::sync::Arc::new(move |bus: eventage::EventBus| {
                         let exp = exporter_for_hook.clone();
-                        tokio::spawn(
-                            BusObserver::new(bus.clone()).add_exporter_arc(exp).run(),
-                        );
+                        tokio::spawn(BusObserver::new(bus.clone()).add_exporter_arc(exp).run());
                         let agg = agg_for_hook.clone();
                         tokio::spawn(async move {
                             let mut rx = bus.subscribe();
@@ -242,8 +239,7 @@ async fn main() -> anyhow::Result<()> {
                                 let _ = agg.publish(event).await;
                             }
                         });
-                    },
-                ));
+                    }));
                 if !tui_mode {
                     eprintln!("Logging events to {}", log_path.display());
                 }
@@ -253,8 +249,8 @@ async fn main() -> anyhow::Result<()> {
     } else if args.replay {
         // --replay without --log: still forward spawned buses to the aggregation bus.
         let agg_for_hook = spawn_agg_bus.clone();
-        *claw.spawner_bus_hook.lock().unwrap() = Some(std::sync::Arc::new(
-            move |bus: eventage::EventBus| {
+        *claw.spawner_bus_hook.lock().unwrap() =
+            Some(std::sync::Arc::new(move |bus: eventage::EventBus| {
                 let agg = agg_for_hook.clone();
                 tokio::spawn(async move {
                     let mut rx = bus.subscribe();
@@ -262,8 +258,7 @@ async fn main() -> anyhow::Result<()> {
                         let _ = agg.publish(event).await;
                     }
                 });
-            },
-        ));
+            }));
     }
 
     if args.replay {

@@ -18,17 +18,21 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use eventage::event::kinds;
+use eventage::{Event, EventBus};
 use eventage_code::acp::wire::ContentBlock;
 use eventage_code::acp::AcpServer;
 use eventage_code::agent::CodingSession;
 use eventage_code::config::{ModelConfig, PermissionMode, SessionConfig};
-use eventage::event::kinds;
-use eventage::{Event, EventBus};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "eventage-code", version, about = "LSP-aware coding agent (ACP server)")]
+#[command(
+    name = "eventage-code",
+    version,
+    about = "LSP-aware coding agent (ACP server)"
+)]
 struct Cli {
     /// Model override (defaults per provider).
     #[arg(long, global = true)]
@@ -136,7 +140,7 @@ fn spawn_headless_approver(bus: EventBus, auto_approve: bool) -> tokio::task::Jo
             } else if interactive {
                 let prompt_tool = tool.clone();
                 let answer = tokio::task::spawn_blocking(move || {
-                    use std::io::{stdin, stderr, Write};
+                    use std::io::{stderr, stdin, Write};
                     let mut err = stderr();
                     let _ = write!(err, "\nAllow tool '{prompt_tool}'? [y/N]: ");
                     let _ = err.flush();
@@ -189,9 +193,7 @@ async fn run_headless(
     let session = CodingSession::create(uuid::Uuid::new_v4().to_string(), config, None).await?;
     // No editor is attached, so stand in as the approver.
     let approver = spawn_headless_approver(session.bus.clone(), auto_approve);
-    session
-        .submit_prompt(&[ContentBlock::text(prompt)])
-        .await?;
+    session.submit_prompt(&[ContentBlock::text(prompt)]).await?;
     let outcome = session.run_cycle().await;
     approver.abort();
     outcome?;

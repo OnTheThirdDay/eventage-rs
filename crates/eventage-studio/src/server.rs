@@ -65,7 +65,13 @@ impl AppState {
     /// Close every session. Called on shutdown so no child process, LSP
     /// server or background turn outlives the app.
     pub async fn shutdown(&self) {
-        let sessions: Vec<_> = self.sessions.write().await.drain().map(|(_, s)| s).collect();
+        let sessions: Vec<_> = self
+            .sessions
+            .write()
+            .await
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
         for session in sessions {
             session.shutdown().await;
         }
@@ -332,9 +338,7 @@ async fn stream_events(
             Err(RecvError::Closed) => None,
         }
     })
-    .filter_map(move |event| async move {
-        event.filter(|e| e.seq == 0 || e.seq > last_sent)
-    });
+    .filter_map(move |event| async move { event.filter(|e| e.seq == 0 || e.seq > last_sent) });
 
     // Announced before anything else, so a client resuming into a feed that
     // was rebuilt since it last connected can tell — its sequence numbers

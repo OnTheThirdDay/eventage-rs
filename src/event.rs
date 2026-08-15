@@ -152,7 +152,6 @@ pub mod kinds {
     /// Emitted after a resume reconciles tool calls that were interrupted by
     /// a restart. Payload: `{ "interrupted_tool_calls", "replayed", "reported" }`.
     pub const SYSTEM_RECOVERED: &str = "system.recovered";
-
 }
 
 /// Standard metadata keys for [`Event::metadata`].

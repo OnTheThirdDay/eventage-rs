@@ -22,8 +22,8 @@
 //! ```
 
 use eventage::llm::OpenAiProvider;
-use eventage::{BusObserver, JsonlExporter, Session};
 use eventage::replay::LiveReplayServer;
+use eventage::{BusObserver, JsonlExporter, Session};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 const EVENTS_LOG: &str = "/tmp/basic-chat-events.jsonl";

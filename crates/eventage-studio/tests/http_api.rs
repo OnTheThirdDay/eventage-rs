@@ -170,7 +170,9 @@ impl Studio {
         });
         let token = "test-token".to_string();
         let state = AppState::new(backend, token.clone());
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, router(state)).await.ok();
@@ -220,7 +222,12 @@ impl Studio {
 
     /// Open a session and return its id.
     async fn open_session(&self) -> String {
-        let info: SessionInfoOwned = self.post("/api/sessions", json!({})).await.json().await.unwrap();
+        let info: SessionInfoOwned = self
+            .post("/api/sessions", json!({}))
+            .await
+            .json()
+            .await
+            .unwrap();
         info.id
     }
 }
@@ -306,7 +313,10 @@ async fn an_empty_prompt_is_refused_rather_than_sent() {
     let studio = Studio::start().await;
     let id = studio.open_session().await;
     let response = studio
-        .post(&format!("/api/sessions/{id}/prompt"), json!({ "blocks": [] }))
+        .post(
+            &format!("/api/sessions/{id}/prompt"),
+            json!({ "blocks": [] }),
+        )
         .await;
     assert_eq!(response.status(), 400);
     assert!(studio.session.prompts.lock().await.is_empty());
@@ -334,7 +344,10 @@ async fn a_rejected_mode_surfaces_the_reason_to_the_user() {
 
     assert_eq!(
         studio
-            .post(&format!("/api/sessions/{id}/mode"), json!({ "mode": "ask" }))
+            .post(
+                &format!("/api/sessions/{id}/mode"),
+                json!({ "mode": "ask" })
+            )
             .await
             .status(),
         204
@@ -378,7 +391,9 @@ async fn the_stream_states_which_numbering_it_is_serving() {
     // for a different slice than it thinks; this is how it finds out.
     let studio = Studio::start().await;
     let id = studio.open_session().await;
-    let body = studio.stream_text(&format!("/api/sessions/{id}/stream?after=0")).await;
+    let body = studio
+        .stream_text(&format!("/api/sessions/{id}/stream?after=0"))
+        .await;
 
     let hello = body
         .lines()
@@ -387,7 +402,9 @@ async fn the_stream_states_which_numbering_it_is_serving() {
         .find(|e| e["kind"] == "studio.stream.hello")
         .expect("the stream should open with its generation");
     assert!(
-        hello["payload"]["generation"].as_str().is_some_and(|g| !g.is_empty()),
+        hello["payload"]["generation"]
+            .as_str()
+            .is_some_and(|g| !g.is_empty()),
         "{hello}"
     );
 }
@@ -397,7 +414,10 @@ async fn a_session_can_be_branched() {
     let studio = Studio::start().await;
     let id = studio.open_session().await;
     let response = studio
-        .post(&format!("/api/sessions/{id}/branch"), json!({ "from_seq": 3 }))
+        .post(
+            &format!("/api/sessions/{id}/branch"),
+            json!({ "from_seq": 3 }),
+        )
         .await;
     assert!(response.status().is_success(), "got {}", response.status());
     let info: Value = response.json().await.unwrap();
@@ -409,7 +429,10 @@ async fn branching_before_anything_happened_is_refused() {
     let studio = Studio::start().await;
     let id = studio.open_session().await;
     let response = studio
-        .post(&format!("/api/sessions/{id}/branch"), json!({ "from_seq": 0 }))
+        .post(
+            &format!("/api/sessions/{id}/branch"),
+            json!({ "from_seq": 0 }),
+        )
         .await;
     assert_eq!(response.status(), 400);
 }

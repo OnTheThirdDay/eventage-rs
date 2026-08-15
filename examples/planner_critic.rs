@@ -15,8 +15,8 @@
 //! ```
 
 use async_trait::async_trait;
-use eventage::{kinds, Event, EventBus};
 use eventage::llm::{types::ChatMessage, MockLlmProvider};
+use eventage::{kinds, Event, EventBus};
 use eventage::{
     AgentBuilder, AssemblyContext, ContextAssembler, EventWorker, ReactStrategy, WorkerError,
     WorkerSet,

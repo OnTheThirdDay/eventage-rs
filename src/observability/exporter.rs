@@ -1,6 +1,6 @@
 use super::error::ObsError;
-use async_trait::async_trait;
 use crate::event::Event;
+use async_trait::async_trait;
 
 /// A destination for events emitted by a [`BusObserver`].
 ///

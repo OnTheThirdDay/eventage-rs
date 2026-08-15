@@ -4,10 +4,10 @@
 //! it is far too slow for the normal suite and useless where the server is
 //! not installed. Run it with `--ignored` when touching the rename path.
 
+use eventage::agent::Tool;
 use eventage_code::lsp::LspPool;
 use eventage_code::tools::intel::{LspReferences, LspRename};
 use eventage_code::workspace::Workspace;
-use eventage::agent::Tool;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -16,7 +16,11 @@ use std::sync::Arc;
 async fn rust_analyzer_renames_across_files_and_leaves_lookalikes_alone() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
     std::fs::create_dir(root.join("src")).unwrap();
 
     // `width` is defined in one file, used in another, and — crucially —
@@ -35,7 +39,11 @@ async fn rust_analyzer_renames_across_files_and_leaves_lookalikes_alone() {
     let ws = Arc::new(Workspace::open(root).unwrap());
     let lsp = Arc::new(LspPool::new(root));
     let (ws2, lsp2) = (ws.clone(), lsp.clone());
-    let tool = LspRename { ws, lsp, client: None };
+    let tool = LspRename {
+        ws,
+        lsp,
+        client: None,
+    };
 
     // rust-analyzer answers position queries with "no references" until it
     // has loaded the crate graph, so poll rather than guess a sleep.
@@ -71,12 +79,24 @@ async fn rust_analyzer_renames_across_files_and_leaves_lookalikes_alone() {
     assert!(shape.contains("pub span: u32"), "{shape}");
     assert!(shape.contains("self.span * 1"), "{shape}");
     // The comment says "width" and must still say it.
-    assert!(shape.contains("// width times one"), "comment was rewritten:\n{shape}");
+    assert!(
+        shape.contains("// width times one"),
+        "comment was rewritten:\n{shape}"
+    );
 
-    assert!(main.contains("Rect { span: width }") || main.contains("span: width"), "{main}");
+    assert!(
+        main.contains("Rect { span: width }") || main.contains("span: width"),
+        "{main}"
+    );
     // The unrelated local binding keeps its name...
-    assert!(main.contains("let width = 7;"), "local was renamed:\n{main}");
+    assert!(
+        main.contains("let width = 7;"),
+        "local was renamed:\n{main}"
+    );
     // ...and so does the string literal.
-    assert!(main.contains("\"width {}\""), "string was rewritten:\n{main}");
+    assert!(
+        main.contains("\"width {}\""),
+        "string was rewritten:\n{main}"
+    );
     assert!(main.contains("r.span"), "{main}");
 }

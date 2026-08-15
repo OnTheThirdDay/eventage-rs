@@ -6,9 +6,9 @@
 //!
 //! See [`Session`] for detailed examples.
 
-use super::core::Agent;
 use super::builder::AgentBuilder;
 use super::context::DefaultContextAssembler;
+use super::core::Agent;
 use super::error::AgentError;
 use super::strategy::ReactStrategy;
 use super::tool::{Tool, ToolRegistry};

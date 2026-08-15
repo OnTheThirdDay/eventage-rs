@@ -6,7 +6,6 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use uuid::Uuid;
 use eventage::{
     agent::worker::{EventWorker, WorkerError},
     event::{kinds, Event},
@@ -17,6 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 /// Shared, live map of group name → per-group EventBus.
 ///
@@ -34,7 +34,13 @@ use crate::tools::schedule::{advance_schedule, ScheduleState};
 /// to 64 chars — the safe subset accepted by all OpenAI-compatible providers.
 fn sanitize_name(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(64)
         .collect()
 }
@@ -103,7 +109,13 @@ impl EventWorker for SchedulerWorker {
         drop(state);
 
         for task in to_fire {
-            let FiringTask { id: task_id, name, description, target_group, reply_group } = task;
+            let FiringTask {
+                id: task_id,
+                name,
+                description,
+                target_group,
+                reply_group,
+            } = task;
             info!(task_id = %task_id, name = %name, "SchedulerWorker: firing task");
 
             // Publish the fire event on the shared bus (observable in TUI/log)
@@ -499,8 +511,14 @@ impl EventWorker for DelegationReplyWorker {
                 if event.payload.get("via").and_then(|v| v.as_str()) != Some("relay") {
                     return Ok(());
                 }
-                let source = event.payload["source_group"].as_str().unwrap_or("").to_string();
-                let msg_id = event.payload["message_id"].as_str().unwrap_or("").to_string();
+                let source = event.payload["source_group"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let msg_id = event.payload["message_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 let caller_awaits = event.payload["caller_awaits"].as_bool().unwrap_or(true);
                 if !msg_id.is_empty() {
                     debug!(
@@ -552,7 +570,15 @@ impl EventWorker for DelegationReplyWorker {
                         .map(|r| (r, state.last_content.take().unwrap_or_default()))
                 };
 
-                let Some((PendingReply { source_group, message_id, caller_awaits }, content)) = reply_data else {
+                let Some((
+                    PendingReply {
+                        source_group,
+                        message_id,
+                        caller_awaits,
+                    },
+                    content,
+                )) = reply_data
+                else {
                     return Ok(());
                 };
 

@@ -199,7 +199,10 @@ fn load_skill(path: &Path) -> Option<SkillMetadata> {
             .description
             .unwrap_or_else(|| "No description.".into()),
         instructions,
-        triggers: front.triggers.map(StringOrVec::into_trigger_vec).unwrap_or_default(),
+        triggers: front
+            .triggers
+            .map(StringOrVec::into_trigger_vec)
+            .unwrap_or_default(),
     })
 }
 
@@ -405,7 +408,11 @@ impl ContextAssembler for SkillsAssembler {
 
             triggered
                 .into_iter()
-                .filter(|s| selected_names.iter().any(|n| n.eq_ignore_ascii_case(&s.name)))
+                .filter(|s| {
+                    selected_names
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(&s.name))
+                })
                 .collect()
         } else {
             // ── Keyword density path (fallback) ───────────────────────────────
@@ -417,7 +424,11 @@ impl ContextAssembler for SkillsAssembler {
                         .iter()
                         .map(|t| recent_text.matches(t.as_str()).count())
                         .sum();
-                    if score > 0 { Some((skill, score)) } else { None }
+                    if score > 0 {
+                        Some((skill, score))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             if matched.len() > MAX_TRIGGERED_SKILLS {
@@ -428,10 +439,8 @@ impl ContextAssembler for SkillsAssembler {
             matched.into_iter().map(|(s, _)| s).collect()
         };
 
-        let selected_skills: Vec<&SkillMetadata> = always_on
-            .into_iter()
-            .chain(resolved_triggered)
-            .collect();
+        let selected_skills: Vec<&SkillMetadata> =
+            always_on.into_iter().chain(resolved_triggered).collect();
 
         if selected_skills.is_empty() {
             return messages;

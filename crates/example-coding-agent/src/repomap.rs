@@ -41,8 +41,15 @@ const AGENT_IGNORE: &str = ".agentignore";
 
 /// Directories that are noise even when they are committed.
 const VENDORED: &[&str] = &[
-    "/vendor/", "/third_party/", "/thirdparty/", "/node_modules/",
-    "/.venv/", "/site-packages/", "/Pods/", "/gen/", "/generated/",
+    "/vendor/",
+    "/third_party/",
+    "/thirdparty/",
+    "/node_modules/",
+    "/.venv/",
+    "/site-packages/",
+    "/Pods/",
+    "/gen/",
+    "/generated/",
 ];
 
 /// Markers that tools put at the top of files they wrote.
@@ -109,7 +116,14 @@ fn reincluded_roots(root: &Path) -> Vec<PathBuf> {
     };
     text.lines()
         .filter_map(|line| line.trim().strip_prefix('!'))
-        .map(|pattern| pattern.trim_matches('/').split('*').next().unwrap_or("").trim_matches('/'))
+        .map(|pattern| {
+            pattern
+                .trim_matches('/')
+                .split('*')
+                .next()
+                .unwrap_or("")
+                .trim_matches('/')
+        })
         .filter(|pattern| !pattern.is_empty())
         .map(|pattern| root.join(pattern))
         .filter(|path| path.is_dir())
@@ -246,7 +260,11 @@ workspace. Open a file before claiming what it does.\n\n";
     queues.sort_by(|a, b| a.0.cmp(b.0));
 
     fn name_of(entry: &FileEntry) -> &str {
-        entry.path.rsplit_once('/').map(|(_, f)| f).unwrap_or(&entry.path)
+        entry
+            .path
+            .rsplit_once('/')
+            .map(|(_, f)| f)
+            .unwrap_or(&entry.path)
     }
 
     // Floor: one heading per directory, one bare filename per file.
@@ -368,7 +386,10 @@ fn declarations(text: &str, language: Language) -> Vec<String> {
     let mut found = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with('#') && language != Language::Python {
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#') && language != Language::Python
+        {
             continue;
         }
         // Only top-level and one level of nesting: deeper is implementation.
@@ -388,18 +409,33 @@ fn declarations(text: &str, language: Language) -> Vec<String> {
 fn declaration_name(line: &str, language: Language) -> Option<String> {
     let keywords: &[&str] = match language {
         Language::Rust => &[
-            "pub fn ", "pub async fn ", "pub struct ", "pub enum ", "pub trait ",
-            "pub type ", "impl ", "macro_rules! ",
+            "pub fn ",
+            "pub async fn ",
+            "pub struct ",
+            "pub enum ",
+            "pub trait ",
+            "pub type ",
+            "impl ",
+            "macro_rules! ",
         ],
         Language::TypeScript => &[
-            "export function ", "export async function ", "export class ",
-            "export interface ", "export type ", "export const ", "export enum ",
+            "export function ",
+            "export async function ",
+            "export class ",
+            "export interface ",
+            "export type ",
+            "export const ",
+            "export enum ",
         ],
         Language::Python => &["def ", "class ", "async def "],
         Language::Go => &["func ", "type "],
         Language::Java => &[
-            "public class ", "public interface ", "public enum ", "class ",
-            "interface ", "fun ",
+            "public class ",
+            "public interface ",
+            "public enum ",
+            "class ",
+            "interface ",
+            "fun ",
         ],
         Language::C => &["struct ", "typedef struct ", "enum "],
         Language::Ruby => &["def ", "class ", "module "],
@@ -467,7 +503,10 @@ mod tests {
         ]);
         let map = build(dir.path(), 4000);
         assert!(map.contains("main.rs"));
-        assert!(!map.contains("generated"), "ignored paths must not appear: {map}");
+        assert!(
+            !map.contains("generated"),
+            "ignored paths must not appear: {map}"
+        );
     }
 
     #[test]
@@ -544,14 +583,19 @@ mod tests {
                     .collect(),
             ));
         }
-        let refs: Vec<(&str, &str)> =
-            files.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect();
         let dir = workspace(&refs);
 
         // A budget far too small for the symbols, ample for the paths.
         let map = build(dir.path(), 400);
         for i in 0..60 {
-            assert!(map.contains(&format!("mod{i}.rs")), "mod{i}.rs vanished:\n{map}");
+            assert!(
+                map.contains(&format!("mod{i}.rs")),
+                "mod{i}.rs vanished:\n{map}"
+            );
         }
         // And it spent what it had on detail for the best-ranked files.
         assert!(map.contains("a_fairly_long_symbol_name"), "{map}");
@@ -581,8 +625,10 @@ mod tests {
                 ));
             }
         }
-        let refs: Vec<(&str, &str)> =
-            files.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_str()))
+            .collect();
         let dir = workspace(&refs);
 
         let map = build(dir.path(), 300);
@@ -608,7 +654,10 @@ mod tests {
     #[test]
     fn reads_the_common_languages() {
         let dir = workspace(&[
-            ("a.ts", "export function hello() {}\nexport class Thing {}\n"),
+            (
+                "a.ts",
+                "export function hello() {}\nexport class Thing {}\n",
+            ),
             ("b.py", "def compute():\n    pass\nclass Model:\n    pass\n"),
             ("c.go", "func Handler() {}\ntype Config struct{}\n"),
         ]);

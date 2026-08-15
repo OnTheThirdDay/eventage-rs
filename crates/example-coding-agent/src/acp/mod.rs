@@ -183,7 +183,11 @@ async fn handle_event(peer: &Arc<Peer>, session_id: &str, event: &Event) -> bool
                 )
                 .await;
             }
-            if let Some(text) = event.payload.get("reasoning_content").and_then(|v| v.as_str()) {
+            if let Some(text) = event
+                .payload
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+            {
                 peer.update(
                     session_id,
                     SessionUpdate::AgentThoughtChunk {
@@ -277,7 +281,10 @@ async fn handle_event(peer: &Arc<Peer>, session_id: &str, event: &Event) -> bool
             .await;
 
             // The plan tool drives the editor's task checklist.
-            if let Some(entries) = result.and_then(|r| r.get("_plan")).and_then(|p| p.as_array()) {
+            if let Some(entries) = result
+                .and_then(|r| r.get("_plan"))
+                .and_then(|p| p.as_array())
+            {
                 let plan: Vec<PlanEntry> = entries
                     .iter()
                     .filter_map(|e| serde_json::from_value(e.clone()).ok())
@@ -334,7 +341,14 @@ async fn forward_permission(peer: &Arc<Peer>, session_id: &str, event: &Event) {
             Ok(result) => match result.outcome {
                 PermissionOutcome::Selected { option_id } => {
                     let allow = option_id.starts_with("allow");
-                    (allow, if allow { None } else { Some("the user rejected this action".to_string()) })
+                    (
+                        allow,
+                        if allow {
+                            None
+                        } else {
+                            Some("the user rejected this action".to_string())
+                        },
+                    )
                 }
                 PermissionOutcome::Cancelled => {
                     (false, Some("the user cancelled the request".to_string()))
@@ -585,9 +599,7 @@ impl AcpServer {
                 let client = req
                     .client_info
                     .as_ref()
-                    .map(|i| {
-                        format!("{} {}", i.name, i.version.as_deref().unwrap_or("?"))
-                    })
+                    .map(|i| format!("{} {}", i.name, i.version.as_deref().unwrap_or("?")))
                     .unwrap_or_else(|| "unknown client".into());
                 info!(
                     client = %client,
@@ -624,10 +636,7 @@ impl AcpServer {
                     .get("sessionId")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("missing sessionId"))?;
-                let turns = params
-                    .get("turns")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
+                let turns = params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
                 let session = self
                     .sessions
                     .lock()
@@ -650,8 +659,9 @@ impl AcpServer {
                     session_id.clone(),
                     self.client_caps.lock().await.fs,
                 );
-                let session =
-                    Arc::new(CodingSession::create(session_id.clone(), config, Some(client)).await?);
+                let session = Arc::new(
+                    CodingSession::create(session_id.clone(), config, Some(client)).await?,
+                );
 
                 CURRENT_BUS
                     .lock()
@@ -847,10 +857,9 @@ pub fn prompt_to_payload(blocks: &[ContentBlock]) -> Value {
             ContentBlock::Image { data, mime_type } => {
                 Some(ContentPart::image_base64(mime_type, data))
             }
-            ContentBlock::Resource { resource } => resource
-                .text
-                .as_ref()
-                .map(|t| ContentPart::text(format!("<{}>\n{t}\n</{}>", resource.uri, resource.uri))),
+            ContentBlock::Resource { resource } => resource.text.as_ref().map(|t| {
+                ContentPart::text(format!("<{}>\n{t}\n</{}>", resource.uri, resource.uri))
+            }),
             ContentBlock::ResourceLink { uri, .. } => {
                 Some(ContentPart::text(format!("(attached: {uri})")))
             }
@@ -869,9 +878,8 @@ mod tests {
     fn a_multi_file_change_gets_a_card_per_file() {
         // Before this, a rename touching six files showed one diff and the
         // other five landed silently.
-        let file = |path: &str| {
-            serde_json::json!({ "path": path, "old_text": "a", "new_text": "b" })
-        };
+        let file =
+            |path: &str| serde_json::json!({ "path": path, "old_text": "a", "new_text": "b" });
         let result = serde_json::json!({
             "_diff": file("/one.rs"),
             "_diffs": [file("/one.rs"), file("/two.rs"), file("/three.rs")],
@@ -898,7 +906,10 @@ mod tests {
             "name": "read_file",
             "arguments": "{\"path\":\"src/main.rs\"}"
         });
-        assert_eq!(describe_call("read_file", &payload), "read_file: src/main.rs");
+        assert_eq!(
+            describe_call("read_file", &payload),
+            "read_file: src/main.rs"
+        );
 
         let bare = json!({ "name": "plan" });
         assert_eq!(describe_call("plan", &bare), "plan");

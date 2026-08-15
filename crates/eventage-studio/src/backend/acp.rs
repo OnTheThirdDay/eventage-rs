@@ -262,10 +262,7 @@ impl AcpSession {
         .await?;
 
         let opened = peer
-            .request(
-                "session/new",
-                json!({ "cwd": cwd, "mcpServers": [] }),
-            )
+            .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
             .await?;
         let remote_id = opened
             .get("sessionId")
@@ -601,8 +598,10 @@ impl Session for AcpSession {
         self.peer
             .notify("session/cancel", json!({ "sessionId": self.remote_id }))
             .await?;
-        self.feed
-            .push(StudioEvent::studio(studio_kinds::TURN_INTERRUPTED, json!({})));
+        self.feed.push(StudioEvent::studio(
+            studio_kinds::TURN_INTERRUPTED,
+            json!({}),
+        ));
         Ok(())
     }
 

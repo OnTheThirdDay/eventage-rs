@@ -18,7 +18,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Agree on a version with the client: the highest we both understand.
 pub fn negotiate_version(client_version: Option<u32>) -> u32 {
-    client_version.unwrap_or(PROTOCOL_VERSION).min(PROTOCOL_VERSION)
+    client_version
+        .unwrap_or(PROTOCOL_VERSION)
+        .min(PROTOCOL_VERSION)
 }
 
 // ── JSON-RPC envelope ─────────────────────────────────────────────────────────
@@ -313,11 +315,7 @@ pub struct EmbeddedResource {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
-    #[serde(
-        default,
-        rename = "mimeType",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
 
@@ -537,7 +535,9 @@ pub struct RequestPermissionResult {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PermissionOutcome {
     #[serde(rename_all = "camelCase")]
-    Selected { option_id: String },
+    Selected {
+        option_id: String,
+    },
     Cancelled,
 }
 
@@ -629,11 +629,10 @@ mod tests {
 
     #[test]
     fn permission_outcome_parses_both_shapes() {
-        let selected: RequestPermissionResult =
-            serde_json::from_value(serde_json::json!({
-                "outcome": { "outcome": "selected", "optionId": "allow_once" }
-            }))
-            .unwrap();
+        let selected: RequestPermissionResult = serde_json::from_value(serde_json::json!({
+            "outcome": { "outcome": "selected", "optionId": "allow_once" }
+        }))
+        .unwrap();
         assert!(matches!(
             selected.outcome,
             PermissionOutcome::Selected { ref option_id } if option_id == "allow_once"

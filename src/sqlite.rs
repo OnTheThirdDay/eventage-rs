@@ -44,9 +44,9 @@
 //! # }
 //! ```
 
-use async_trait::async_trait;
 use crate::event::Event;
 use crate::observability::{ObsError, ObservabilityExporter};
+use async_trait::async_trait;
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -227,8 +227,8 @@ impl ObservabilityExporter for SqliteExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{kinds, Event};
     use crate::bus::EventBus;
+    use crate::event::{kinds, Event};
     use serde_json::json;
     use tempfile::tempdir;
 

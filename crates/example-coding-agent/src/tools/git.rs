@@ -32,8 +32,7 @@ pub async fn git(ws: &Workspace, args: &[&str]) -> Result<String, AgentError> {
 
 /// Conventional-commit prefixes we accept without complaint.
 const CONVENTIONAL_PREFIXES: &[&str] = &[
-    "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore",
-    "revert",
+    "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert",
 ];
 
 /// `true` when `subject` looks like `type(scope)!: description`.
@@ -151,7 +150,9 @@ impl Tool for Git {
                     git(&self.ws, &["checkout", "-b", name]).await?;
                     Ok(json!({ "created": name }))
                 }
-                None => Ok(json!({ "current": git(&self.ws, &["branch", "--show-current"]).await?.trim() })),
+                None => Ok(
+                    json!({ "current": git(&self.ws, &["branch", "--show-current"]).await?.trim() }),
+                ),
             },
 
             "add" => {
@@ -162,7 +163,9 @@ impl Tool for Git {
                 let mut owned: Vec<&str> = argv;
                 owned.extend(paths.iter().map(String::as_str));
                 git(&self.ws, &owned).await?;
-                Ok(json!({ "staged": if paths.is_empty() { vec!["<all>".to_string()] } else { paths } }))
+                Ok(
+                    json!({ "staged": if paths.is_empty() { vec!["<all>".to_string()] } else { paths } }),
+                )
             }
 
             "commit" => {
@@ -181,9 +184,7 @@ impl Tool for Git {
                 // Refuse an empty commit rather than producing a confusing error.
                 let staged = git(&self.ws, &["diff", "--cached", "--name-only"]).await?;
                 if staged.trim().is_empty() {
-                    return Err(AgentError::Tool(
-                        "nothing staged; run git add first".into(),
-                    ));
+                    return Err(AgentError::Tool("nothing staged; run git add first".into()));
                 }
                 git(&self.ws, &["commit", "-m", message]).await?;
                 let sha = git(&self.ws, &["rev-parse", "--short", "HEAD"]).await?;

@@ -85,8 +85,7 @@ impl PermissionMode {
     ];
 
     /// Tools that reach outside the workspace or can destroy work.
-    pub const RISKY_TOOLS: &'static [&'static str] =
-        &["bash", "git", "web_fetch"];
+    pub const RISKY_TOOLS: &'static [&'static str] = &["bash", "git", "web_fetch"];
 
     /// Build the permission policy for this mode.
     ///
@@ -246,14 +245,10 @@ impl ModelConfig {
     pub fn base_url(&self) -> String {
         std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| match self.provider {
             Provider::OpenAiResponses => "https://api.openai.com/v1".into(),
-            Provider::Qwen => {
-                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into()
-            }
+            Provider::Qwen => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into(),
             _ => "http://localhost:11434/v1".into(),
         })
     }
-
-
 }
 
 /// An MCP server the editor asked us to connect.
@@ -369,12 +364,22 @@ mod tests {
         // Subagents ran with no policy at all: a `general` one could write
         // files and run shell commands in every mode, Plan included.
         let plan = PermissionMode::Plan.subagent_policy(false);
-        assert!(matches!(plan.verdict_for("write_file"), PermissionVerdict::Deny(_)));
-        assert!(matches!(plan.verdict_for("bash"), PermissionVerdict::Deny(_)));
+        assert!(matches!(
+            plan.verdict_for("write_file"),
+            PermissionVerdict::Deny(_)
+        ));
+        assert!(matches!(
+            plan.verdict_for("bash"),
+            PermissionVerdict::Deny(_)
+        ));
 
         // Nothing may *ask*, because a subagent has no user attached — a
         // prompt would hang on a bus with no UI on the other end.
-        for mode in [PermissionMode::Ask, PermissionMode::Auto, PermissionMode::Plan] {
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::Auto,
+            PermissionMode::Plan,
+        ] {
             let policy = mode.subagent_policy(false);
             for tool in ["write_file", "edit_file", "bash", "web_fetch", "lsp_rename"] {
                 let verdict = policy.verdict_for(tool);
@@ -387,7 +392,9 @@ mod tests {
 
         // Reading is always fine; that is what most subagents are for.
         assert!(matches!(
-            PermissionMode::Ask.subagent_policy(false).verdict_for("grep"),
+            PermissionMode::Ask
+                .subagent_policy(false)
+                .verdict_for("grep"),
             PermissionVerdict::Allow
         ));
     }
@@ -398,14 +405,22 @@ mod tests {
         // editing a disposable worktree whose diff comes back for review is
         // not editing the user's files.
         let isolated = PermissionMode::Auto.subagent_policy(true);
-        assert!(matches!(isolated.verdict_for("edit_file"), PermissionVerdict::Allow));
+        assert!(matches!(
+            isolated.verdict_for("edit_file"),
+            PermissionVerdict::Allow
+        ));
         // The shell still is not, worktree or no worktree: it reaches
         // everything outside the checkout.
-        assert!(matches!(isolated.verdict_for("bash"), PermissionVerdict::Deny(_)));
+        assert!(matches!(
+            isolated.verdict_for("bash"),
+            PermissionVerdict::Deny(_)
+        ));
 
         // Plan mode means plan, isolated or not.
         assert!(matches!(
-            PermissionMode::Plan.subagent_policy(true).verdict_for("edit_file"),
+            PermissionMode::Plan
+                .subagent_policy(true)
+                .verdict_for("edit_file"),
             PermissionVerdict::Deny(_)
         ));
     }
@@ -417,10 +432,7 @@ mod tests {
             policy.verdict_for("edit_file"),
             PermissionVerdict::Allow
         ));
-        assert!(matches!(
-            policy.verdict_for("bash"),
-            PermissionVerdict::Ask
-        ));
+        assert!(matches!(policy.verdict_for("bash"), PermissionVerdict::Ask));
     }
 
     #[test]

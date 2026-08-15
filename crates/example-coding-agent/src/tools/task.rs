@@ -121,10 +121,7 @@ impl Worktree {
     /// Diff of everything the subagent changed in the worktree.
     async fn diff(&self) -> String {
         let mut out = String::new();
-        for args in [
-            vec!["add", "-A"],
-            vec!["diff", "--cached", "--no-color"],
-        ] {
+        for args in [vec!["add", "-A"], vec!["diff", "--cached", "--no-color"]] {
             if let Ok(o) = tokio::process::Command::new("git")
                 .args(&args)
                 .current_dir(&self.path)
@@ -136,7 +133,6 @@ impl Worktree {
         }
         out
     }
-
 }
 
 impl Drop for Worktree {
@@ -374,7 +370,10 @@ impl Tool for Task {
                         .into(),
                 )
             })?;
-        let isolated = args.get("isolated").and_then(|v| v.as_bool()).unwrap_or(false)
+        let isolated = args
+            .get("isolated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
             && kind.can_edit();
 
         // Isolated runs get their own checkout so concurrent edits cannot collide.
@@ -388,9 +387,7 @@ impl Tool for Task {
             .map(|w| w.path.clone())
             .unwrap_or_else(|| self.ws.root().to_path_buf());
 
-        let ws = Arc::new(
-            Workspace::open(&root).map_err(|e| AgentError::Tool(e.to_string()))?,
-        );
+        let ws = Arc::new(Workspace::open(&root).map_err(|e| AgentError::Tool(e.to_string()))?);
         let lsp = Arc::new(LspPool::new(&root));
         let bus = EventBus::new();
 
@@ -645,7 +642,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("explore-1"), "should name what is available: {err}");
+        assert!(
+            err.contains("explore-1"),
+            "should name what is available: {err}"
+        );
     }
 
     #[tokio::test]
@@ -699,7 +699,10 @@ mod tests {
         assert!(!SubagentKind::Explore.can_edit());
         assert!(!SubagentKind::Plan.can_edit());
         assert!(SubagentKind::General.can_edit());
-        assert_eq!(SubagentKind::from_str("explore"), Some(SubagentKind::Explore));
+        assert_eq!(
+            SubagentKind::from_str("explore"),
+            Some(SubagentKind::Explore)
+        );
         assert_eq!(SubagentKind::from_str("nope"), None);
     }
 
@@ -720,8 +723,14 @@ mod tests {
             .execute(json!({ "prompt": "go", "subagent_type": "wizard" }))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("explore, plan, or general"), "{err}");
-        assert!(err.to_string().contains("subagent_id"), "and how to continue: {err}");
+        assert!(
+            err.to_string().contains("explore, plan, or general"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("subagent_id"),
+            "and how to continue: {err}"
+        );
     }
 
     #[tokio::test]

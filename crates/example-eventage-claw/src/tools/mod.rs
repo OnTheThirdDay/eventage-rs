@@ -23,5 +23,5 @@ pub use schedule::{
     load_tasks, CancelTaskTool, ListTasksTool, PauseTaskTool, ScheduleState, ScheduleTaskTool,
     UpdateTaskTool,
 };
-pub use tasks::{AddTaskTool, CompleteTaskTool, ListSessionTasksTool, TaskState, new_task_state};
+pub use tasks::{new_task_state, AddTaskTool, CompleteTaskTool, ListSessionTasksTool, TaskState};
 pub use web::{WebFetchTool, WebSearchTool};

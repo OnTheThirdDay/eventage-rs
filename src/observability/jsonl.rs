@@ -1,7 +1,7 @@
 use super::error::ObsError;
 use super::exporter::ObservabilityExporter;
-use async_trait::async_trait;
 use crate::event::Event;
+use async_trait::async_trait;
 use std::path::Path;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;

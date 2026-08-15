@@ -19,10 +19,10 @@
 //! Live replay UI: `http://localhost:4568`
 //! Event log: `/tmp/reactive-chat-events.jsonl`
 
-use eventage::{kinds, Event};
 use eventage::llm::OpenAiProvider;
-use eventage::{BusObserver, JsonlExporter, Session};
 use eventage::replay::LiveReplayServer;
+use eventage::{kinds, Event};
+use eventage::{BusObserver, JsonlExporter, Session};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -44,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
     // ── Observability ──────────────────────────────────────────────────────────
     // Live replay streams events to the browser in real-time; JsonlExporter
     // persists them for post-hoc replay.
-    LiveReplayServer::new(session.bus().clone()).port(4568).serve_background();
+    LiveReplayServer::new(session.bus().clone())
+        .port(4568)
+        .serve_background();
     let exporter = JsonlExporter::new(EVENTS_LOG).await?;
     let observer = BusObserver::new(session.bus().clone()).add_exporter(exporter);
     tokio::spawn(async move { observer.run().await });

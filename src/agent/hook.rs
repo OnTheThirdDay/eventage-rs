@@ -3,9 +3,9 @@
 //! Extend agent behavior (e.g., approvals, rate limits) by implementing
 //! [`CycleHook`] and registering via [`crate::AgentBuilder::hook`].
 
-use async_trait::async_trait;
 use crate::bus::EventBus;
 use crate::llm::types::ChatMessage;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::{Arc, RwLock};
 
@@ -253,7 +253,10 @@ impl DynamicHookChain {
 
     /// Removes all hooks.
     pub fn remove_all(&self) {
-        self.hooks.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.hooks
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Returns the current number of registered hooks.
@@ -262,7 +265,10 @@ impl DynamicHookChain {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hooks.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 }
 

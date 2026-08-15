@@ -173,10 +173,9 @@ impl Backend for LocalBackend {
         // Written to the new session's own log, then opened as a resume: the
         // branch is a real session from birth, with a history it can replay,
         // rather than a live copy that would vanish on restart.
-        let store = eventage::sqlite::SqliteEventStore::new(
-            self.state_dir.join(format!("{id}.db")),
-        )
-        .await?;
+        let store =
+            eventage::sqlite::SqliteEventStore::new(self.state_dir.join(format!("{id}.db")))
+                .await?;
         for event in &kept {
             store.append(&to_event(event)?).await?;
         }
@@ -262,10 +261,7 @@ impl Backend for LocalBackend {
 fn to_event(studio: &StudioEvent) -> Result<Event> {
     Ok(Event {
         id: studio.id.parse().unwrap_or_else(|_| uuid::Uuid::new_v4()),
-        timestamp: studio
-            .ts
-            .parse()
-            .unwrap_or_else(|_| chrono::Utc::now()),
+        timestamp: studio.ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
         kind: studio.kind.clone(),
         payload: studio.payload.clone(),
         parent_event_id: None,
@@ -314,8 +310,7 @@ impl LocalSession {
             [] => session.bus.log().await,
             history => history.to_vec(),
         };
-        let mut pending_duplicates: HashSet<uuid::Uuid> =
-            restored.iter().map(|e| e.id).collect();
+        let mut pending_duplicates: HashSet<uuid::Uuid> = restored.iter().map(|e| e.id).collect();
         for event in &restored {
             feed.push(StudioEvent::from(event));
         }
@@ -474,7 +469,10 @@ impl Session for LocalSession {
         // the next turn assembles context.
         match reconcile_interrupted_tools(&self.session.bus, &ToolRecovery::new(), None).await {
             Ok(report) if !report.is_empty() => {
-                info!(resolved = report.total(), "closed out interrupted tool calls");
+                info!(
+                    resolved = report.total(),
+                    "closed out interrupted tool calls"
+                );
             }
             Ok(_) => {}
             Err(e) => warn!("could not reconcile interrupted tools: {e}"),
@@ -490,8 +488,10 @@ impl Session for LocalSession {
             ))
             .await?;
 
-        self.feed
-            .push(StudioEvent::studio(studio_kinds::TURN_INTERRUPTED, json!({})));
+        self.feed.push(StudioEvent::studio(
+            studio_kinds::TURN_INTERRUPTED,
+            json!({}),
+        ));
         Ok(())
     }
 

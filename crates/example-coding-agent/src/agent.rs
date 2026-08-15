@@ -14,8 +14,8 @@ use eventage::agent::{
 };
 use eventage::event::kinds;
 use eventage::llm::{AnthropicProvider, LlmProvider, OpenAiProvider, OpenAiResponsesProvider};
-use eventage::sqlite::{SqliteEventStore, SqliteExporter};
 use eventage::observability::BusObserver;
+use eventage::sqlite::{SqliteEventStore, SqliteExporter};
 use eventage::{
     Agent, AgentBuilder, Event, EventBus, ReactStrategy, SummarizingContextAssembler,
     TokenBudgetHook,
@@ -56,9 +56,11 @@ async fn connect_mcp(
         anyhow::bail!("MCP server '{}' has neither command nor url", spec.name);
     };
 
-    Ok(McpToolset::from_client(client.with_bus(bus.clone(), &spec.name))
-        .await?
-        .with_prefix(&spec.name))
+    Ok(
+        McpToolset::from_client(client.with_bus(bus.clone(), &spec.name))
+            .await?
+            .with_prefix(&spec.name),
+    )
 }
 
 /// One live coding session.
@@ -94,11 +96,7 @@ impl CodingSession {
     }
 
     /// Reopen a persisted session, replaying its event log.
-    pub async fn resume(
-        id: &str,
-        config: SessionConfig,
-        client: Option<ClientFs>,
-    ) -> Result<Self> {
+    pub async fn resume(id: &str, config: SessionConfig, client: Option<ClientFs>) -> Result<Self> {
         Self::build(id.to_string(), config, true, client).await
     }
 
@@ -172,11 +170,10 @@ impl CodingSession {
         // on a blocking thread: it walks the tree and reads source files, and
         // it must not stall the runtime while it does.
         let map_root = std::path::PathBuf::from(&config.cwd);
-        let map = tokio::task::spawn_blocking(move || {
-            crate::repomap::build(&map_root, REPO_MAP_TOKENS)
-        })
-        .await
-        .unwrap_or_default();
+        let map =
+            tokio::task::spawn_blocking(move || crate::repomap::build(&map_root, REPO_MAP_TOKENS))
+                .await
+                .unwrap_or_default();
         if !map.is_empty() {
             info!(bytes = map.len(), "repository map built");
             system_prompt.push_str("\n\n");

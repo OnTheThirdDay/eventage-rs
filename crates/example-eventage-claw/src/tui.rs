@@ -308,7 +308,10 @@ fn render(frame: &mut Frame, state: &AppState) {
 
     let token_hint = if state.session_tokens_total > 0 {
         let display = if state.session_tokens_total >= 1000 {
-            format!("  tokens: {:.1}k", state.session_tokens_total as f64 / 1000.0)
+            format!(
+                "  tokens: {:.1}k",
+                state.session_tokens_total as f64 / 1000.0
+            )
         } else {
             format!("  tokens: {}", state.session_tokens_total)
         };
@@ -601,10 +604,18 @@ fn handle_bus_event(state: &mut AppState, event: &Event) {
 
         k if k == core_kinds::ASSISTANT_MESSAGE => {
             // Accumulate token counts from event metadata.
-            if let Some(v) = event.metadata.get(meta_keys::LLM_INPUT_TOKENS).and_then(|v| v.as_u64()) {
+            if let Some(v) = event
+                .metadata
+                .get(meta_keys::LLM_INPUT_TOKENS)
+                .and_then(|v| v.as_u64())
+            {
                 state.session_tokens_total += v;
             }
-            if let Some(v) = event.metadata.get(meta_keys::LLM_OUTPUT_TOKENS).and_then(|v| v.as_u64()) {
+            if let Some(v) = event
+                .metadata
+                .get(meta_keys::LLM_OUTPUT_TOKENS)
+                .and_then(|v| v.as_u64())
+            {
                 state.session_tokens_total += v;
             }
 

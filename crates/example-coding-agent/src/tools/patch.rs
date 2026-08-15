@@ -131,7 +131,10 @@ pub fn parse(patch: &str) -> Result<Vec<FileOp>, PatchError> {
             }
             let (hunks, next) = parse_hunks(&lines, cursor, end)?;
             if hunks.is_empty() {
-                return err(format!("'{}' has no hunks; use *** Add File to create a file", path.trim()));
+                return err(format!(
+                    "'{}' has no hunks; use *** Add File to create a file",
+                    path.trim()
+                ));
             }
             ops.push(FileOp::Update {
                 path: path.trim().to_string(),
@@ -188,7 +191,10 @@ fn parse_hunks(lines: &[&str], mut i: usize, end: usize) -> Result<(Vec<Hunk>, u
                 i += 1;
                 continue;
             }
-            return err(format!("expected a hunk starting with '@@', found: {}", lines[i]));
+            return err(format!(
+                "expected a hunk starting with '@@', found: {}",
+                lines[i]
+            ));
         }
 
         let mut selectors = Vec::new();
@@ -671,9 +677,8 @@ impl Tool for ApplyPatch {
                              Use *** Add File to create it."
                         ))
                     })?;
-                    let after = apply_hunks(&before, hunks).map_err(|e| {
-                        AgentError::Tool(format!("{path}: {e}"))
-                    })?;
+                    let after = apply_hunks(&before, hunks)
+                        .map_err(|e| AgentError::Tool(format!("{path}: {e}")))?;
                     let destination = match move_to {
                         Some(dest) => Some(
                             self.ws
@@ -746,7 +751,14 @@ mod tool_tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = Arc::new(Workspace::open(dir.path().to_str().unwrap()).unwrap());
         let lsp = Arc::new(LspPool::new(dir.path()));
-        (dir, ApplyPatch { ws, client: None, lsp })
+        (
+            dir,
+            ApplyPatch {
+                ws,
+                client: None,
+                lsp,
+            },
+        )
     }
 
     #[tokio::test]
@@ -773,9 +785,16 @@ mod tool_tests {
             .unwrap();
 
         assert_eq!(out["files_changed"], 3);
-        assert!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap().contains("new()"));
-        assert!(std::fs::read_to_string(dir.path().join("b.rs")).unwrap().contains("new()"));
-        assert_eq!(std::fs::read_to_string(dir.path().join("c.rs")).unwrap(), "fn c() {}\n");
+        assert!(std::fs::read_to_string(dir.path().join("a.rs"))
+            .unwrap()
+            .contains("new()"));
+        assert!(std::fs::read_to_string(dir.path().join("b.rs"))
+            .unwrap()
+            .contains("new()"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("c.rs")).unwrap(),
+            "fn c() {}\n"
+        );
     }
 
     #[tokio::test]
@@ -802,7 +821,10 @@ mod tool_tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("b.rs"), "the error should name the file: {err}");
+        assert!(
+            err.contains("b.rs"),
+            "the error should name the file: {err}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
             "fn a() {\n    old();\n}\n",
@@ -847,7 +869,10 @@ mod tool_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"), "{err}");
-        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "existing\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "existing\n"
+        );
     }
 
     #[tokio::test]

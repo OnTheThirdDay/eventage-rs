@@ -19,10 +19,10 @@
 //! Register them behind a permission policy as well: the checks below stop
 //! an accident, not a determined prompt injection.
 
-use async_trait::async_trait;
 use crate::agent::error::AgentError;
 use crate::agent::tool::Tool;
 use crate::llm::types::ToolDefinition;
+use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -62,9 +62,10 @@ pub fn refuse_url(url: &str) -> Option<String> {
     // doing so would still race the request's own lookup, and the obvious
     // local names are worth refusing on sight.
     let lowered = host.to_ascii_lowercase();
-    if lowered == "localhost" || lowered.ends_with(".localhost") || lowered.ends_with(".internal")
-    {
-        return Some(format!("'{host}' is a local address, which is not fetchable"));
+    if lowered == "localhost" || lowered.ends_with(".localhost") || lowered.ends_with(".internal") {
+        return Some(format!(
+            "'{host}' is a local address, which is not fetchable"
+        ));
     }
 
     if let Ok(ip) = lowered.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
@@ -440,12 +441,15 @@ fn strip_html_tags(html: &str) -> String {
     let mut i = 0;
 
     while i < chars.len() {
-        if !in_tag && !in_script && i + 7 <= lower_chars.len()
+        if !in_tag
+            && !in_script
+            && i + 7 <= lower_chars.len()
             && lower_chars[i..i + 7] == ['<', 's', 'c', 'r', 'i', 'p', 't'][..]
         {
             in_script = true;
             in_tag = true;
-        } else if in_script && i + 9 <= lower_chars.len()
+        } else if in_script
+            && i + 9 <= lower_chars.len()
             && lower_chars[i..i + 9] == ['<', '/', 's', 'c', 'r', 'i', 'p', 't', '>'][..]
         {
             in_script = false;

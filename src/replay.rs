@@ -30,6 +30,8 @@
 //! # }
 //! ```
 
+use crate::bus::EventBus;
+use crate::event::Event;
 use axum::{
     extract::State,
     response::{
@@ -39,8 +41,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use crate::bus::EventBus;
-use crate::event::Event;
 use futures_util::stream;
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc;
@@ -75,7 +75,10 @@ struct LiveState {
 impl LiveReplayServer {
     /// Create a new server attached to `bus`.
     pub fn new(bus: EventBus) -> Self {
-        Self { buses: vec![bus], port: 4567 }
+        Self {
+            buses: vec![bus],
+            port: 4567,
+        }
     }
 
     /// Attach additional buses so all their events appear in the replay UI.

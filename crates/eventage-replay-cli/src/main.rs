@@ -17,8 +17,8 @@
 //! For live replay within an app, embed [`eventage::replay::LiveReplayServer`].
 
 use axum::{extract::State, response::Html, routing::get, Json, Router};
-use eventage::Event;
 use eventage::replay::UI_HTML;
+use eventage::Event;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::fs;
 use tower_http::cors::CorsLayer;

@@ -38,8 +38,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::agent::context::{AssemblyContext, ContextAssembler};
-use crate::llm::content::{ContentPart, ImageSource};
 use crate::event::{kinds, Event};
+use crate::llm::content::{ContentPart, ImageSource};
 use crate::llm::types::{ChatMessage, Role};
 use crate::llm::LlmProvider;
 
@@ -735,7 +735,11 @@ fn choose_cutoff(
     let turn_start = |i: usize| conv.get(i).is_some_and(|m| m.role == Role::User);
     (raw..=ceiling)
         .find(|&i| turn_start(i))
-        .or_else(|| (already..=raw).rev().find(|&i| i > already && turn_start(i)))
+        .or_else(|| {
+            (already..=raw)
+                .rev()
+                .find(|&i| i > already && turn_start(i))
+        })
         .or_else(|| (raw..=ceiling).find(|&i| starts_clean(conv, i)))
         .or_else(|| (already..=raw).rev().find(|&i| starts_clean(conv, i)))
         .unwrap_or(already)
@@ -878,7 +882,9 @@ mod tests {
         // The reason prompts are a registry rather than string literals: this
         // instruction should be changeable without forking this file.
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let llm = Arc::new(Recorder { seen: Arc::clone(&seen) });
+        let llm = Arc::new(Recorder {
+            seen: Arc::clone(&seen),
+        });
 
         let mut events = vec![Event::new(kinds::USER_MESSAGE, json!({ "text": "go" }))];
         for i in 0..40 {
@@ -949,7 +955,9 @@ mod tests {
         // history it had already compacted. Putting it on the log fixes both.
         let bus = EventBus::new();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let llm = Arc::new(Recorder { seen: Arc::clone(&seen) });
+        let llm = Arc::new(Recorder {
+            seen: Arc::clone(&seen),
+        });
 
         for event in wordy_session() {
             bus.publish(event).await.unwrap();
@@ -995,16 +1003,21 @@ mod tests {
         let events = bus.log().await;
         assembler.assemble(&AssemblyContext::new(&events)).await;
 
-        override_summary(&bus, "The user's deploy key is in .secrets/, do not touch it.", 30)
-            .await
-            .unwrap();
+        override_summary(
+            &bus,
+            "The user's deploy key is in .secrets/, do not touch it.",
+            30,
+        )
+        .await
+        .unwrap();
 
         let events = bus.log().await;
         let messages = assembler.assemble(&AssemblyContext::new(&events)).await;
         assert!(
-            messages
-                .iter()
-                .any(|m| m.content.as_deref().is_some_and(|c| c.contains("deploy key"))),
+            messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("deploy key"))),
             "the override should be what the model sees"
         );
     }
@@ -1117,8 +1130,14 @@ mod tests {
         ];
 
         let (text, truncated) = recorded_text(&m);
-        assert!(text.contains("what is wrong with this screenshot?"), "{text}");
-        assert!(text.contains("image/png"), "the image should be named: {text}");
+        assert!(
+            text.contains("what is wrong with this screenshot?"),
+            "{text}"
+        );
+        assert!(
+            text.contains("image/png"),
+            "the image should be named: {text}"
+        );
         assert!(!text.contains("AAAA"), "but not dumped: {text}");
         assert_eq!(truncated, None);
     }
@@ -1150,7 +1169,10 @@ mod tests {
         );
         let (text, _) = recorded_text(&m);
         assert!(text.contains("Let me look."));
-        assert!(text.contains(r#"read_file({"path":"src/bus.rs"})"#), "{text}");
+        assert!(
+            text.contains(r#"read_file({"path":"src/bus.rs"})"#),
+            "{text}"
+        );
     }
 
     #[test]

@@ -646,7 +646,9 @@ mod tests {
                 json!({ "tool_call_id": "c1", "result": { "content": "hello" } }),
             ),
         ];
-        assert!(!events_to_messages(&events).iter().any(|m| m.is_multimodal()));
+        assert!(!events_to_messages(&events)
+            .iter()
+            .any(|m| m.is_multimodal()));
     }
 
     #[tokio::test]

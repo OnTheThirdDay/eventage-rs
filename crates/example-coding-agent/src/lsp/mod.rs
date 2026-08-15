@@ -375,7 +375,10 @@ impl LspPool {
         let started = match LspClient::start(spec, &self.root).await {
             Ok(client) => Some(Arc::new(client)),
             Err(e) => {
-                debug!(language = spec.language_id, "language server unavailable: {e}");
+                debug!(
+                    language = spec.language_id,
+                    "language server unavailable: {e}"
+                );
                 None
             }
         };
@@ -463,7 +466,10 @@ mod tests {
             server_for(Path::new("/a/b.tsx")).unwrap().language_id,
             "typescript"
         );
-        assert_eq!(server_for(Path::new("/a/b.py")).unwrap().language_id, "python");
+        assert_eq!(
+            server_for(Path::new("/a/b.py")).unwrap().language_id,
+            "python"
+        );
         assert!(server_for(Path::new("/a/README.md")).is_none());
         assert!(server_for(Path::new("/a/noext")).is_none());
     }
@@ -483,7 +489,10 @@ mod tests {
             "range": { "start": { "line": 9, "character": 4 } },
             "message": "cannot find value `x`"
         });
-        assert_eq!(format_diagnostic(&diag), "error [10:5] cannot find value `x`");
+        assert_eq!(
+            format_diagnostic(&diag),
+            "error [10:5] cannot find value `x`"
+        );
     }
 
     #[test]
@@ -492,10 +501,7 @@ mod tests {
             "uri": "file:///repo/src/lib.rs",
             "range": { "start": { "line": 41, "character": 7 } }
         });
-        assert_eq!(
-            format_location(&location).unwrap(),
-            "/repo/src/lib.rs:42:8"
-        );
+        assert_eq!(format_location(&location).unwrap(), "/repo/src/lib.rs:42:8");
 
         let link = json!({
             "targetUri": "file:///repo/src/lib.rs",

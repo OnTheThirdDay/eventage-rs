@@ -218,7 +218,10 @@ mod tests {
         let first = feed.push(event.clone());
         let second = feed.push(event);
 
-        assert_eq!(first.seq, second.seq, "the second push must not get a new seq");
+        assert_eq!(
+            first.seq, second.seq,
+            "the second push must not get a new seq"
+        );
         assert_eq!(feed.since(0).len(), 1, "and must not be stored again");
     }
 
@@ -307,6 +310,9 @@ mod tests {
             kinds::USER_MESSAGE,
             json!({ "text": "and now the other one" }),
         ));
-        assert_eq!(feed.first_user_text().as_deref(), Some("fix the failing test"));
+        assert_eq!(
+            feed.first_user_text().as_deref(),
+            Some("fix the failing test")
+        );
     }
 }

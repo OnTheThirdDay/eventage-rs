@@ -94,7 +94,11 @@ pub fn detect_stuck(events: &[Event], window: usize) -> Option<StuckAnalysis> {
         .collect();
     if result_errors.len() >= 3 {
         let last = *result_errors.last().unwrap();
-        let run = result_errors.iter().rev().take_while(|&&e| e == last).count();
+        let run = result_errors
+            .iter()
+            .rev()
+            .take_while(|&&e| e == last)
+            .count();
         if run >= 3 {
             return Some(StuckAnalysis {
                 kind: StuckKind::RepeatingError,
@@ -131,7 +135,10 @@ mod tests {
     use serde_json::json;
 
     fn tool_call(name: &str, args: &str) -> Event {
-        Event::new(kinds::TOOL_CALL_PROPOSED, json!({ "name": name, "arguments": args }))
+        Event::new(
+            kinds::TOOL_CALL_PROPOSED,
+            json!({ "name": name, "arguments": args }),
+        )
     }
 
     fn tool_error(msg: &str) -> Event {
@@ -139,7 +146,10 @@ mod tests {
     }
 
     fn assistant_msg() -> Event {
-        Event::new(kinds::ASSISTANT_MESSAGE, json!({ "content": "thinking..." }))
+        Event::new(
+            kinds::ASSISTANT_MESSAGE,
+            json!({ "content": "thinking..." }),
+        )
     }
 
     #[test]

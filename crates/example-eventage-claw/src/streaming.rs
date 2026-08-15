@@ -226,11 +226,19 @@ impl LlmProvider for StreamingOpenAiProvider {
                 if let Some(tc_deltas) = delta.tool_calls {
                     for d in tc_deltas {
                         let acc = tool_acc.entry(d.index).or_default();
-                        if let Some(id) = d.id { acc.id = id; }
-                        if let Some(kind) = d.kind { acc.kind = kind; }
+                        if let Some(id) = d.id {
+                            acc.id = id;
+                        }
+                        if let Some(kind) = d.kind {
+                            acc.kind = kind;
+                        }
                         if let Some(func) = d.function {
-                            if let Some(name) = func.name { acc.name.push_str(&name); }
-                            if let Some(args) = func.arguments { acc.arguments.push_str(&args); }
+                            if let Some(name) = func.name {
+                                acc.name.push_str(&name);
+                            }
+                            if let Some(args) = func.arguments {
+                                acc.arguments.push_str(&args);
+                            }
                         }
                     }
                 }
@@ -246,7 +254,11 @@ impl LlmProvider for StreamingOpenAiProvider {
                 let acc = tool_acc.remove(&i)?;
                 Some(ToolCall {
                     id: acc.id,
-                    kind: if acc.kind.is_empty() { "function".to_string() } else { acc.kind },
+                    kind: if acc.kind.is_empty() {
+                        "function".to_string()
+                    } else {
+                        acc.kind
+                    },
                     function: FunctionCall {
                         name: acc.name,
                         arguments: acc.arguments,
@@ -257,7 +269,11 @@ impl LlmProvider for StreamingOpenAiProvider {
             .collect();
 
         Ok(LlmResponse {
-            content: if content.is_empty() { None } else { Some(content) },
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
             tool_calls,
             finish_reason,
             ..Default::default()

@@ -138,7 +138,8 @@ async fn tool_call_executes_and_loops() {
     assert_eq!(tool_result.payload["result"]["echoed"], "ping");
 
     let final_msg = log
-        .iter().rfind(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .iter()
+        .rfind(|e| e.kind == kinds::ASSISTANT_MESSAGE)
         .expect("no final assistant.message");
     assert_eq!(
         final_msg.payload["content"].as_str().unwrap(),
@@ -473,7 +474,8 @@ async fn agent_cycle_continues_normally_after_rollback() {
 
     let log = bus.log().await;
     let final_msg = log
-        .iter().rfind(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .iter()
+        .rfind(|e| e.kind == kinds::ASSISTANT_MESSAGE)
         .expect("no final assistant.message");
     assert_eq!(
         final_msg.payload["content"].as_str().unwrap(),
@@ -1086,7 +1088,8 @@ async fn max_steps_finalizes_with_wrapup_instead_of_error() {
 
     let log = bus.log().await;
     let final_msg = log
-        .iter().rfind(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .iter()
+        .rfind(|e| e.kind == kinds::ASSISTANT_MESSAGE)
         .unwrap();
     assert_eq!(final_msg.payload["finalized_due_to"], "max_steps");
     assert_eq!(

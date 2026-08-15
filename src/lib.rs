@@ -31,8 +31,8 @@
 
 pub mod agent;
 pub mod bridge;
-pub mod component;
 pub mod bus;
+pub mod component;
 pub mod distributed;
 pub mod error;
 pub mod event;
@@ -70,17 +70,18 @@ pub use bus::{
 pub use error::{BusError, CoreError};
 pub use event::{kinds, meta_keys, Event, EventId};
 
+pub use agent::web::{WebFetchTool, WebSearchTool};
 pub use agent::{
-    detect_stuck, truncate_middle, Agent, AgentBuilder, AgentContext, AgentError,
-    AgentSet, AssemblyContext, BudgetScope, ContextAssembler, CycleHook,
-    DefaultContextAssembler, DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle,
-    EventWorker, ExecutionStrategy, HookAction, HookContext, KeywordToolSelector,
-    NegativeAwareContextAssembler, PermissionPolicyHook, PermissionVerdict,
-    ReactStrategy, Session, SessionBuilder, SingleShotStrategy, StuckAnalysis, StuckKind, SummarizingContextAssembler, TokenBudgetHook,
+    detect_stuck, truncate_middle, Agent, AgentBuilder, AgentContext, AgentError, AgentSet,
+    AssemblyContext, BudgetScope, ContextAssembler, CycleHook, DefaultContextAssembler,
+    DynamicContextAssembler, DynamicHookChain, DynamicWorkerHandle, EventWorker, ExecutionStrategy,
+    HookAction, HookContext, KeywordToolSelector, NegativeAwareContextAssembler,
+    PermissionPolicyHook, PermissionVerdict, ReactStrategy, Session, SessionBuilder,
+    SingleShotStrategy, StuckAnalysis, StuckKind, SummarizingContextAssembler, TokenBudgetHook,
     Tool, ToolExecOptions, ToolRegistry, ToolResultClearingAssembler, ToolSelector, WorkerError,
     WorkerSet, DEFAULT_MAX_CONCURRENT_TOOLS, DEFAULT_MAX_REACT_STEPS,
-    DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,};
-pub use agent::web::{WebFetchTool, WebSearchTool};
+    DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,
+};
 
 pub use bridge::{BusBridge, BRIDGE_HOPS_KEY};
 pub use component::{
@@ -95,7 +96,6 @@ pub use observability::{BusObserver, JsonlExporter};
 pub use llm::{
     AnthropicProvider, ChatMessage, ContentPart, ImageSource, LlmError, LlmProvider, LlmResponse,
     OpenAiProvider, OpenAiResponsesProvider, QwenProvider, RateLimitedProvider, RetryProvider,
-    StructuredExt,
-    ToolCall, ToolDefinition,
+    StructuredExt, ToolCall, ToolDefinition,
 };
 pub use plugin::{Plugin, PluginError, PluginHost};

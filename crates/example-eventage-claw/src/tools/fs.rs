@@ -41,9 +41,7 @@ pub fn safe_resolve(work_dir: &Path, input: &str) -> Result<PathBuf, AgentError>
     let candidate = work_dir.join(input);
     let normalised = normalize_path(&candidate);
     if !normalised.starts_with(work_dir) {
-        return Err(AgentError::Tool(format!(
-            "path escape detected: {input}"
-        )));
+        return Err(AgentError::Tool(format!("path escape detected: {input}")));
     }
     Ok(normalised)
 }

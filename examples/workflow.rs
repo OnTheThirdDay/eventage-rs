@@ -14,8 +14,8 @@
 //! ```
 
 use async_trait::async_trait;
-use eventage::{kinds, meta_keys, Event, EventBus};
 use eventage::llm::{types::ChatMessage, LlmProvider, OpenAiProvider};
+use eventage::{kinds, meta_keys, Event, EventBus};
 use eventage::{
     AgentBuilder, AgentSet, AssemblyContext, ContextAssembler, EventWorker, SingleShotStrategy,
     WorkerError, WorkerSet,

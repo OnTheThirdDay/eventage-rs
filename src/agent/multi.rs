@@ -88,7 +88,9 @@ impl AgentSet {
                         let mut rx = agent.bus().subscribe();
                         while let Some(event) = rx.recv().await {
                             let wake = match event.kind.as_str() {
-                                kinds::USER_MESSAGE | kinds::SYSTEM_HEARTBEAT | kinds::SYSTEM_MESSAGE => true,
+                                kinds::USER_MESSAGE
+                                | kinds::SYSTEM_HEARTBEAT
+                                | kinds::SYSTEM_MESSAGE => true,
                                 kinds::AGENT_MESSAGE => event
                                     .metadata
                                     .get(meta_keys::TO_AGENT_ID)
@@ -98,7 +100,8 @@ impl AgentSet {
                             };
                             if wake {
                                 // `_permit` keeps the semaphore slot held while the cycle runs.
-                                let _permit = s.acquire().await.expect("concurrency semaphore closed");
+                                let _permit =
+                                    s.acquire().await.expect("concurrency semaphore closed");
                                 agent.cycle().await?;
                             }
                         }

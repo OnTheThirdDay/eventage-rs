@@ -14,22 +14,18 @@ use tokio::sync::Mutex;
 ///
 /// `active_group_bus` is a shared reference to the currently active group's
 /// EventBus. The caller can update the pointer when the user switches groups.
-pub async fn run_terminal_channel(
-    active_group_bus: Arc<Mutex<EventBus>>,
-) -> anyhow::Result<()> {
+pub async fn run_terminal_channel(active_group_bus: Arc<Mutex<EventBus>>) -> anyhow::Result<()> {
     eprintln!("Ready. Type your message and press Enter. (Ctrl+C to exit)\n");
 
     loop {
-        let line = tokio::task::spawn_blocking(|| {
-            match rustyline::DefaultEditor::new() {
-                Ok(mut rl) => rl.readline("").ok(),
-                Err(_) => {
-                    let mut s = String::new();
-                    match io::stdin().lock().read_line(&mut s) {
-                        Ok(0) => None,
-                        Ok(_) => Some(s),
-                        Err(_) => None,
-                    }
+        let line = tokio::task::spawn_blocking(|| match rustyline::DefaultEditor::new() {
+            Ok(mut rl) => rl.readline("").ok(),
+            Err(_) => {
+                let mut s = String::new();
+                match io::stdin().lock().read_line(&mut s) {
+                    Ok(0) => None,
+                    Ok(_) => Some(s),
+                    Err(_) => None,
                 }
             }
         })

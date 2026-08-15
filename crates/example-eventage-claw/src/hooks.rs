@@ -27,11 +27,19 @@ pub struct SecurityGateHook {
 
 impl SecurityGateHook {
     pub fn all_tools(bus: EventBus) -> Self {
-        Self { bus, timeout: Duration::from_secs(300), watched: vec![] }
+        Self {
+            bus,
+            timeout: Duration::from_secs(300),
+            watched: vec![],
+        }
     }
 
     pub fn watched(bus: EventBus, tools: Vec<String>) -> Self {
-        Self { bus, timeout: Duration::from_secs(300), watched: tools }
+        Self {
+            bus,
+            timeout: Duration::from_secs(300),
+            watched: tools,
+        }
     }
 
     #[allow(dead_code)]
@@ -100,12 +108,7 @@ impl HumanApprovalHook {
 
 #[async_trait]
 impl CycleHook for HumanApprovalHook {
-    async fn before_tool(
-        &self,
-        _ctx: &HookContext<'_>,
-        name: &str,
-        _args: &Value,
-    ) -> HookAction {
+    async fn before_tool(&self, _ctx: &HookContext<'_>, name: &str, _args: &Value) -> HookAction {
         if !self.tools.is_empty() && !self.tools.iter().any(|t| t == name) {
             return HookAction::Continue;
         }

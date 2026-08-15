@@ -46,7 +46,6 @@ impl Workspace {
 
         Ok(normalised)
     }
-
 }
 
 /// Normalise a path without requiring it to exist (no `canonicalize`).

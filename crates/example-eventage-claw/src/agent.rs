@@ -4,18 +4,20 @@
 //! `EventBus`. A shared bus carries IPC events, heartbeats, and schedule events.
 //! The `WorkerSet` on the shared bus runs `RelayWorker` and `SchedulerWorker`.
 
-use crate::assembler::{GroupMemoryAssembler, SkillsAssembler, SummarizingAssembler, UserCorrectionsAssembler};
+use crate::assembler::{
+    GroupMemoryAssembler, SkillsAssembler, SummarizingAssembler, UserCorrectionsAssembler,
+};
 use crate::config::{ClawConfig, GroupConfig};
 use crate::error::ClawError;
 use crate::hooks::{HumanApprovalHook, SecurityGateHook};
 use crate::prompt::build_system_prompt;
 use crate::streaming::StreamingOpenAiProvider;
 use crate::tools::{
-    AddTaskTool, AgentSpawner, BrowserTool, CancelTaskTool, CompleteTaskTool,
-    DockerRunCommandTool, EditFileTool, GlobTool, GrepTool, GroupRegistry, ListGroupsTool,
-    ListSessionTasksTool, ListTasksTool, LsTool, MessageGroupTool, PauseTaskTool, ReadFileTool,
-    RegisterGroupTool, ScheduleState, ScheduleTaskTool, SpawnGroupTool, TaskState, UpdateTaskTool,
-    WebFetchTool, WebSearchTool, WriteFileTool, load_tasks, new_group_registry, new_task_state,
+    load_tasks, new_group_registry, new_task_state, AddTaskTool, AgentSpawner, BrowserTool,
+    CancelTaskTool, CompleteTaskTool, DockerRunCommandTool, EditFileTool, GlobTool, GrepTool,
+    GroupRegistry, ListGroupsTool, ListSessionTasksTool, ListTasksTool, LsTool, MessageGroupTool,
+    PauseTaskTool, ReadFileTool, RegisterGroupTool, ScheduleState, ScheduleTaskTool,
+    SpawnGroupTool, TaskState, UpdateTaskTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::workers::{
     ChannelOutputWorker, DelegationReplyWorker, GroupBuses, RelayWorker, SchedulerWorker,
@@ -73,7 +75,10 @@ pub struct ClawAgent {
 #[allow(dead_code)]
 impl ClawAgent {
     fn active_group_name(&self) -> String {
-        self.active_group.try_lock().map(|g| g.clone()).unwrap_or_default()
+        self.active_group
+            .try_lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Returns a reference to the active group's bus (for TUI subscription).
@@ -187,7 +192,10 @@ impl ClawAgentBuilder {
         let tasks_path = config.tasks_path();
         let persisted_tasks = load_tasks(&tasks_path);
         if !persisted_tasks.is_empty() {
-            info!(count = persisted_tasks.len(), "ClawAgentBuilder: restored scheduled tasks from disk");
+            info!(
+                count = persisted_tasks.len(),
+                "ClawAgentBuilder: restored scheduled tasks from disk"
+            );
         }
         let schedule_state = Arc::new(tokio::sync::Mutex::new(persisted_tasks));
 
@@ -195,7 +203,8 @@ impl ClawAgentBuilder {
         let group_registry: GroupRegistry = new_group_registry(group_names.clone());
 
         // Collect main-group names for IPC authorization.
-        let main_groups: Vec<String> = config.groups
+        let main_groups: Vec<String> = config
+            .groups
             .iter()
             .filter(|g| g.is_main)
             .map(|g| g.name.clone())
@@ -203,7 +212,8 @@ impl ClawAgentBuilder {
 
         // Build per-group buses into a plain map first — no lock needed during init.
         // EventBus is Arc-backed so cloning into group_buses shares the same bus.
-        let bus_map: HashMap<String, EventBus> = config.groups
+        let bus_map: HashMap<String, EventBus> = config
+            .groups
             .iter()
             .map(|g| (g.name.clone(), EventBus::new()))
             .collect();
@@ -211,7 +221,10 @@ impl ClawAgentBuilder {
         // Wrap in Arc<RwLock<>> for runtime routing (dynamically spawned groups
         // can be inserted without restarting).
         let group_buses: GroupBuses = Arc::new(RwLock::new(
-            bus_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            bus_map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         ));
 
         // Build shared workers
@@ -233,7 +246,8 @@ impl ClawAgentBuilder {
 
         // The first main group is the default target for scheduled tasks created
         // by sub-agents (they can't reach the user directly).
-        let main_group_name = main_groups.first()
+        let main_group_name = main_groups
+            .first()
             .or_else(|| group_names.first())
             .cloned()
             .unwrap_or_default();
@@ -254,7 +268,11 @@ impl ClawAgentBuilder {
 
         // Build each group agent
         let mut groups: HashMap<String, GroupAgent> = HashMap::new();
-        let active_group_name = config.groups.first().map(|g| g.name.clone()).unwrap_or_default();
+        let active_group_name = config
+            .groups
+            .first()
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
 
         for group_config in &config.groups {
             let Some(group_bus) = bus_map.get(&group_config.name) else {
@@ -399,7 +417,9 @@ struct NoopSpawner;
 #[async_trait::async_trait]
 impl AgentSpawner for NoopSpawner {
     async fn spawn(&self, name: &str, _system_prompt: Option<&str>) -> Result<(), String> {
-        Err(format!("sub-agent cannot spawn further agents (requested: '{name}')"))
+        Err(format!(
+            "sub-agent cannot spawn further agents (requested: '{name}')"
+        ))
     }
 }
 
@@ -453,8 +473,10 @@ fn build_group_agent(
         let flag = streaming.cancelled.clone();
         let base: Arc<dyn eventage::llm::LlmProvider> = Arc::new(streaming);
         let llm = if config.requests_per_minute > 0 {
-            Arc::new(RateLimitedProvider::from_arc(base, config.requests_per_minute))
-                as Arc<dyn eventage::llm::LlmProvider>
+            Arc::new(RateLimitedProvider::from_arc(
+                base,
+                config.requests_per_minute,
+            )) as Arc<dyn eventage::llm::LlmProvider>
         } else {
             base
         };
@@ -462,7 +484,10 @@ fn build_group_agent(
     } else {
         let base_llm = OpenAiProvider::new(&config.llm_url, &config.api_key, &config.model);
         let llm: Arc<dyn eventage::llm::LlmProvider> = if config.requests_per_minute > 0 {
-            Arc::new(RateLimitedProvider::new(base_llm, config.requests_per_minute))
+            Arc::new(RateLimitedProvider::new(
+                base_llm,
+                config.requests_per_minute,
+            ))
         } else {
             Arc::new(base_llm)
         };
@@ -520,12 +545,24 @@ fn build_group_agent(
 
     // ── Standard tools (all groups) ───────────────────────────────────────────
     builder = builder
-        .tool(LsTool { work_dir: work_dir.clone() })
-        .tool(ReadFileTool { work_dir: work_dir.clone() })
-        .tool(WriteFileTool { work_dir: work_dir.clone() })
-        .tool(EditFileTool { work_dir: work_dir.clone() })
-        .tool(GlobTool { work_dir: work_dir.clone() })
-        .tool(GrepTool { work_dir: work_dir.clone() });
+        .tool(LsTool {
+            work_dir: work_dir.clone(),
+        })
+        .tool(ReadFileTool {
+            work_dir: work_dir.clone(),
+        })
+        .tool(WriteFileTool {
+            work_dir: work_dir.clone(),
+        })
+        .tool(EditFileTool {
+            work_dir: work_dir.clone(),
+        })
+        .tool(GlobTool {
+            work_dir: work_dir.clone(),
+        })
+        .tool(GrepTool {
+            work_dir: work_dir.clone(),
+        });
 
     // ── Docker tool (opt-in) ──────────────────────────────────────────────────
     if config.docker_enabled {
@@ -547,7 +584,9 @@ fn build_group_agent(
             reply_group: schedule_reply_group.map(|s| s.to_string()),
             tasks_path: tasks_path.clone(),
         })
-        .tool(ListTasksTool { state: schedule_state.clone() })
+        .tool(ListTasksTool {
+            state: schedule_state.clone(),
+        })
         .tool(CancelTaskTool {
             bus: shared_bus.clone(),
             state: schedule_state.clone(),
@@ -568,8 +607,14 @@ fn build_group_agent(
             known_groups: known_groups.to_vec(),
             source_group: group_config.name.clone(),
         })
-        .tool(AddTaskTool { state: task_state.clone(), bus: group_bus.clone() })
-        .tool(CompleteTaskTool { state: task_state.clone(), bus: group_bus.clone() })
+        .tool(AddTaskTool {
+            state: task_state.clone(),
+            bus: group_bus.clone(),
+        })
+        .tool(CompleteTaskTool {
+            state: task_state.clone(),
+            bus: group_bus.clone(),
+        })
         .tool(ListSessionTasksTool { state: task_state });
 
     // ── Admin tools (main group only) ─────────────────────────────────────────
@@ -598,7 +643,9 @@ fn build_group_agent(
     } else if group_config.require_approve_all {
         builder = builder.hook(HumanApprovalHook::all_tools());
     } else if !group_config.human_approval_tools.is_empty() {
-        builder = builder.hook(HumanApprovalHook::new(group_config.human_approval_tools.clone()));
+        builder = builder.hook(HumanApprovalHook::new(
+            group_config.human_approval_tools.clone(),
+        ));
     }
 
     let agent = builder.build();

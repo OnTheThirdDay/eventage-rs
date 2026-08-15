@@ -10,16 +10,16 @@
 
 mod error;
 mod exporter;
-mod observer;
 mod jsonl;
+mod observer;
 
 #[cfg(feature = "opentelemetry")]
 pub mod otel;
 
 pub use error::ObsError;
 pub use exporter::ObservabilityExporter;
-pub use observer::BusObserver;
 pub use jsonl::JsonlExporter;
+pub use observer::BusObserver;
 
 #[cfg(feature = "opentelemetry")]
 pub use otel::OtelExporter;

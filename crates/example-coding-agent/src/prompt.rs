@@ -115,7 +115,12 @@ mod tests {
             .next()
             .unwrap();
 
-        for gate in ["before editing", "when answering", "when asked", "questions about"] {
+        for gate in [
+            "before editing",
+            "when answering",
+            "when asked",
+            "questions about",
+        ] {
             assert!(
                 !grounding.contains(gate),
                 "grounding must not be conditioned on a kind of work, found {gate:?}"

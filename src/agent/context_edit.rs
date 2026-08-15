@@ -166,8 +166,7 @@ impl ToolResultClearingAssembler {
         cleared: &HashSet<usize>,
         need: usize,
     ) -> Vec<usize> {
-        let results: Vec<&ChatMessage> =
-            messages.iter().filter(|m| m.role == Role::Tool).collect();
+        let results: Vec<&ChatMessage> = messages.iter().filter(|m| m.role == Role::Tool).collect();
         let total = results.len();
         // The newest few are off limits — the model is still working from them.
         let open = total.saturating_sub(self.keep_recent);
@@ -405,10 +404,11 @@ mod tests {
         let ctx = AssemblyContext::new(&events);
         let messages = assembler.assemble(&ctx).await;
         assert!(
-            messages
-                .iter()
-                .filter(|m| m.role == Role::Tool)
-                .all(|m| !m.content.as_deref().unwrap_or("").starts_with("[cleared")),
+            messages.iter().filter(|m| m.role == Role::Tool).all(|m| !m
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("[cleared")),
             "sub-floor results must survive"
         );
     }

@@ -16,8 +16,8 @@ pub mod strategy;
 pub mod stuck;
 pub mod summarizing;
 pub mod tokens;
-pub mod web;
 pub mod tool;
+pub mod web;
 pub mod worker;
 
 pub use crate::schema::validate_args;

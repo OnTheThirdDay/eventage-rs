@@ -51,9 +51,7 @@ fn shared_prefix(a: &[ChatMessage], b: &[ChatMessage]) -> usize {
         .zip(b.iter())
         // Compared as serialised, which is what the provider actually sees
         // and therefore what a cache keys on.
-        .take_while(|(x, y)| {
-            serde_json::to_string(x).ok() == serde_json::to_string(y).ok()
-        })
+        .take_while(|(x, y)| serde_json::to_string(x).ok() == serde_json::to_string(y).ok())
         .count()
 }
 

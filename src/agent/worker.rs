@@ -3,10 +3,10 @@
 //! Workers execute arbitrary async logic in response to subscribed events.
 //! Use them for workflows, external API integration, human-in-the-loop, or memory.
 
-use async_trait::async_trait;
 use crate::bus::EventBus;
-use crate::event::Event;
 use crate::error::BusError;
+use crate::event::Event;
+use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;

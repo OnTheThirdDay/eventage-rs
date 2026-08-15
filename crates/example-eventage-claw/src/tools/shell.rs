@@ -14,7 +14,10 @@ pub struct RunCommandTool {
 
 impl RunCommandTool {
     pub fn new(work_dir: PathBuf) -> Self {
-        Self { work_dir, timeout_secs: 30 }
+        Self {
+            work_dir,
+            timeout_secs: 30,
+        }
     }
 }
 

@@ -89,10 +89,7 @@ fn count_done(tasks: &[Task]) -> usize {
 }
 
 fn count_total(tasks: &[Task]) -> usize {
-    tasks
-        .iter()
-        .map(|t| 1 + count_total(&t.subtasks))
-        .sum()
+    tasks.iter().map(|t| 1 + count_total(&t.subtasks)).sum()
 }
 
 // ── AddTaskTool ───────────────────────────────────────────────────────────────

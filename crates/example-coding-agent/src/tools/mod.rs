@@ -9,10 +9,10 @@
 //! - `_plan: [...]`                        → the task checklist
 
 pub mod git;
-pub mod patch;
-pub mod vision;
 pub mod intel;
+pub mod patch;
 pub mod task;
+pub mod vision;
 
 use crate::acp::ClientFs;
 use crate::lsp::LspPool;
@@ -121,7 +121,11 @@ impl Tool for ReadFile {
                 text.len()
             )));
         }
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
 
         let total = text.lines().count();
@@ -328,8 +332,14 @@ impl Tool for MultiEdit {
         // Apply to a scratch copy so a late failure cannot leave a half-edit.
         let mut updated = original.clone();
         for (i, edit) in edits.iter().enumerate() {
-            let old = edit.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new = edit.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let old = edit
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new = edit
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let all = edit
                 .get("replace_all")
                 .and_then(|v| v.as_bool())
@@ -602,18 +612,16 @@ impl Tool for Bash {
             }));
         }
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| {
-            AgentError::Tool(format!(
-                "command timed out after {timeout_secs}s; re-run with background:true \
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+                .await
+                .map_err(|_| {
+                    AgentError::Tool(format!(
+                        "command timed out after {timeout_secs}s; re-run with background:true \
                  or a longer timeout_secs"
-            ))
-        })?
-        .map_err(|e| AgentError::Tool(format!("command failed to start: {e}")))?;
+                    ))
+                })?
+                .map_err(|e| AgentError::Tool(format!("command failed to start: {e}")))?;
 
         Ok(json!({
             "exit_code": output.status.code().unwrap_or(-1),
@@ -729,11 +737,7 @@ mod tests {
 
         // A client that advertised nothing must never be called: these
         // return without touching the peer, so we fall back to disk.
-        let no_caps = ClientFs::new(
-            Arc::new(Peer::new()),
-            "s1".into(),
-            Default::default(),
-        );
+        let no_caps = ClientFs::new(Arc::new(Peer::new()), "s1".into(), Default::default());
         assert!(no_caps.read(&file.display().to_string()).await.is_none());
         assert!(!no_caps.write(&file.display().to_string(), "x").await);
 

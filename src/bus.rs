@@ -1,6 +1,6 @@
 use crate::error::BusError;
 use crate::event::kinds;
-use crate::event::{Event, EventId, meta_keys};
+use crate::event::{meta_keys, Event, EventId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock};
@@ -628,7 +628,6 @@ impl EventBus {
         }
     }
 
-
     // ── Utility ───────────────────────────────────────────────────────────────
 
     /// Blocks until the next event matching `predicate` arrives.
@@ -842,8 +841,14 @@ mod tests {
         bus.publish(Event::new(kinds::USER_MESSAGE, json!({ "text": "hi" })))
             .await
             .unwrap();
-        bus.broadcast(Event::new(kinds::ASSISTANT_DELTA, json!({ "content": "he" })));
-        bus.broadcast(Event::new(kinds::ASSISTANT_DELTA, json!({ "content": "llo" })));
+        bus.broadcast(Event::new(
+            kinds::ASSISTANT_DELTA,
+            json!({ "content": "he" }),
+        ));
+        bus.broadcast(Event::new(
+            kinds::ASSISTANT_DELTA,
+            json!({ "content": "llo" }),
+        ));
         bus.publish(Event::new(
             kinds::ASSISTANT_MESSAGE,
             json!({ "content": "hello" }),
@@ -877,7 +882,10 @@ mod tests {
         bus.broadcast(Event::new(kinds::ASSISTANT_DELTA, json!({})));
         let event = rx.recv().await.unwrap();
         assert_eq!(
-            event.metadata.get(meta_keys::EPHEMERAL).and_then(|v| v.as_bool()),
+            event
+                .metadata
+                .get(meta_keys::EPHEMERAL)
+                .and_then(|v| v.as_bool()),
             Some(true)
         );
     }

@@ -414,9 +414,14 @@ skills_dir = "skills"
         let tools = ToolRegistry::new();
         let host = ComponentHost::new(EventBus::new(), tools.clone(), DynamicHookChain::new());
 
-        host.load(Arc::new(PluginComponent::new(plugin))).await.unwrap();
+        host.load(Arc::new(PluginComponent::new(plugin)))
+            .await
+            .unwrap();
         assert_eq!(host.state("demo"), Some(ComponentState::Active));
-        assert!(tools.get("skill").is_some(), "plugin contributed its skill tool");
+        assert!(
+            tools.get("skill").is_some(),
+            "plugin contributed its skill tool"
+        );
 
         // The whole point: unloading takes its tools with it.
         host.unload("demo").await.unwrap();
