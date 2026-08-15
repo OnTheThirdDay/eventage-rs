@@ -611,3 +611,42 @@ fn every_containment_level_has_a_name_a_user_can_type() {
     }
     assert!(tools::ShellContainment::from_id("sandbox").is_none());
 }
+
+#[tokio::test]
+async fn an_invalid_glob_is_an_error_not_a_different_search() {
+    // It used to fall back to a substring match, which answers a question the
+    // caller did not ask and says nothing about having done so.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("keep.rs"), "x").unwrap();
+    let ws = Arc::new(Workspace::open(repo.path()).unwrap());
+
+    let err = (tools::Glob {
+        ws: Arc::clone(&ws),
+    })
+    .execute(json!({ "pattern": "[unclosed" }))
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not a valid glob"), "{err}");
+
+    // A valid one still works.
+    let ok = (tools::Glob { ws })
+        .execute(json!({ "pattern": "**/*.rs" }))
+        .await
+        .unwrap();
+    assert!(format!("{ok}").contains("keep.rs"), "{ok}");
+}
+
+#[tokio::test]
+async fn an_invalid_grep_filter_is_reported_rather_than_ignored() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("a.rs"), "needle\n").unwrap();
+    let ws = Arc::new(Workspace::open(repo.path()).unwrap());
+
+    let err = (tools::Grep { ws })
+        .execute(json!({ "pattern": "needle", "glob": "[unclosed" }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid 'glob' filter"), "{err}");
+}

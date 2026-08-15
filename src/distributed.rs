@@ -43,7 +43,7 @@
 use crate::bus::EventBus;
 use crate::event::Event;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -90,7 +90,57 @@ pub struct DistributedBus {
     filter: Vec<String>,
     /// Events already seen (published locally or received), so nothing
     /// echoes around the network.
-    seen: Arc<Mutex<HashSet<Uuid>>>,
+    seen: Arc<Mutex<SeenEvents>>,
+}
+
+/// Event ids already handled, bounded.
+///
+/// This exists to stop an event looping back around a mesh of buses, which
+/// needs only a short memory: an event that has not come back within the last
+/// few thousand is not going to. It was an unbounded `HashSet`, which for a
+/// process that stays up — the only kind that runs a distributed bus — meant
+/// a leak with no ceiling.
+///
+/// A ring rather than an LRU: recency of *arrival* is what matters here, not
+/// recency of use, and a queue plus a set needs no extra dependency.
+struct SeenEvents {
+    ids: HashSet<Uuid>,
+    order: VecDeque<Uuid>,
+}
+
+/// How many ids to remember. At ~40 bytes an entry this is a few hundred KB,
+/// and a loop that takes longer than 8192 events to come back around is not a
+/// loop worth suppressing.
+const SEEN_CAPACITY: usize = 8192;
+
+impl Default for SeenEvents {
+    fn default() -> Self {
+        Self {
+            ids: HashSet::with_capacity(SEEN_CAPACITY),
+            order: VecDeque::with_capacity(SEEN_CAPACITY),
+        }
+    }
+}
+
+impl SeenEvents {
+    /// Record `id`; `true` if it is new, matching `HashSet::insert`.
+    fn insert(&mut self, id: Uuid) -> bool {
+        if !self.ids.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > SEEN_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
 }
 
 impl DistributedBus {
@@ -100,7 +150,7 @@ impl DistributedBus {
             transport: Arc::new(transport),
             node_id: Uuid::new_v4().to_string(),
             filter: Vec::new(),
-            seen: Arc::new(Mutex::new(HashSet::new())),
+            seen: Arc::new(Mutex::new(SeenEvents::default())),
         }
     }
 
@@ -124,7 +174,7 @@ impl DistributedBus {
     }
 
     /// `true` if this event is new to this node (and record it).
-    fn mark_seen(seen: &Mutex<HashSet<Uuid>>, id: Uuid) -> bool {
+    fn mark_seen(seen: &Mutex<SeenEvents>, id: Uuid) -> bool {
         seen.lock().unwrap_or_else(|e| e.into_inner()).insert(id)
     }
 
@@ -431,5 +481,36 @@ mod tests {
                 .any(|e| e.kind == kinds::TOOL_RESULT),
             "filtered kind must not cross the wire"
         );
+    }
+}
+
+#[cfg(test)]
+mod seen_tests {
+    use super::*;
+
+    #[test]
+    fn the_loop_suppressor_does_not_grow_without_bound() {
+        // It was an unbounded `HashSet` in a process designed to stay up.
+        let mut seen = SeenEvents::default();
+        for _ in 0..SEEN_CAPACITY * 3 {
+            assert!(seen.insert(Uuid::new_v4()));
+        }
+        assert_eq!(seen.len(), SEEN_CAPACITY);
+    }
+
+    #[test]
+    fn a_recent_event_is_still_recognised_as_seen() {
+        // Bounding it is only safe if it still does its job over the window
+        // that matters: an event coming straight back must be suppressed.
+        let mut seen = SeenEvents::default();
+        let id = Uuid::new_v4();
+        assert!(seen.insert(id), "first sighting is new");
+        assert!(!seen.insert(id), "immediate loop-back must be suppressed");
+
+        // And it forgets only after the window has passed.
+        for _ in 0..SEEN_CAPACITY {
+            seen.insert(Uuid::new_v4());
+        }
+        assert!(seen.insert(id), "beyond the window it is new again");
     }
 }

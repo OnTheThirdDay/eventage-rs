@@ -433,9 +433,15 @@ impl Tool for Glob {
 
     async fn execute(&self, args: Value) -> Result<Value, AgentError> {
         let pattern = arg_str(&args, "pattern")?;
+        // Compiled here rather than inside the walk. It used to fall back to
+        // a substring match when the pattern would not parse, which is a
+        // different search wearing the same name — the caller gets results
+        // for a question they did not ask and no indication of it.
+        let matcher = glob::Pattern::new(&pattern)
+            .map_err(|e| AgentError::Tool(format!("'{pattern}' is not a valid glob: {e}")))?;
         let root = self.ws.root().to_path_buf();
         let matches = tokio::task::spawn_blocking(move || {
-            let matcher = glob::Pattern::new(&pattern).ok();
+            let matcher = Some(matcher);
             let mut found: Vec<String> = Vec::new();
             for entry in ignore::Walk::new(&root).flatten() {
                 if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -497,7 +503,9 @@ impl Tool for Grep {
         let file_glob = args
             .get("glob")
             .and_then(|v| v.as_str())
-            .and_then(|g| glob::Pattern::new(g).ok());
+            .map(glob::Pattern::new)
+            .transpose()
+            .map_err(|e| AgentError::Tool(format!("invalid 'glob' filter: {e}")))?;
 
         // Checked through the workspace handle: `Walk::new` follows a
         // symlinked root, so a search rooted at one would walk outside.
@@ -902,14 +910,21 @@ impl BackgroundJobs {
 
 impl Drop for BackgroundJobs {
     /// A watcher the agent started must not outlive the session that started
-    /// it. Blocking and signal-only, because `Drop` cannot await.
+    /// it.
+    ///
+    /// Best-effort by nature: `Drop` cannot await, so this signals the
+    /// process groups and returns without reaping them. What it no longer
+    /// does is skip silently — it used to `try_lock`, which fails while
+    /// anything else holds the mutex and then quietly left the jobs running.
+    /// `get_mut` needs no lock at all: `Drop` has `&mut self`, so by
+    /// definition nobody else holds a reference.
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Ok(jobs) = self.jobs.try_lock() {
-            for job in jobs.iter() {
-                if Self::alive(job.pid) {
-                    unsafe { libc::killpg(job.pid, libc::SIGKILL) };
-                }
+        for job in self.jobs.get_mut().iter() {
+            if Self::alive(job.pid) {
+                // The group, not the process: a dev server's children would
+                // otherwise survive the shell that started them.
+                unsafe { libc::killpg(job.pid, libc::SIGKILL) };
             }
         }
     }
@@ -945,8 +960,15 @@ pub enum ShellContainment {
     /// at something that carries the project's toolchain when you need
     /// builds to work inside it.
     Container,
-    /// The host, as it was. For when the toolchain genuinely needs it, and
-    /// named so that choosing it is visible.
+    /// The host, as it was: a **login** shell with the user's full
+    /// environment, so `~/.profile` and friends are sourced and whatever they
+    /// export — credentials included — is present.
+    ///
+    /// That is the point of it rather than an oversight. `Confined` uses a
+    /// non-login shell precisely to stop a profile re-importing the
+    /// credentials it just scrubbed; `Host` is the escape hatch for when a
+    /// toolchain genuinely needs the user's real environment, and it is named
+    /// so that choosing it is a visible decision.
     Host,
 }
 
