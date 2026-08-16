@@ -104,6 +104,29 @@ export const api = {
     },
   ) => post<void>(`/sessions/${id}/permission`, body),
 
+  /**
+   * Write one workstream's result into the folder.
+   *
+   * Refuses by default when the folder changed under the workstream, and
+   * returns the conflicting paths instead of resolving them by overwriting.
+   * `force` is the user having seen them and chosen anyway.
+   */
+  adopt: (id: string, workstream_id: string, force = false) =>
+    post<{
+      changed: string[];
+      conflicts: { path: string; workstream: string; live: string }[];
+    }>(`/sessions/${id}/adopt`, { workstream_id, force }),
+
+  /**
+   * Abandon a workstream, recording why.
+   *
+   * The reason is required by the server, not merely encouraged: an epitaph
+   * with nothing in it teaches a later attempt nothing, which is the only
+   * thing sealing is for.
+   */
+  seal: (id: string, workstream_id: string, reason: string) =>
+    post<void>(`/sessions/${id}/seal`, { workstream_id, reason }),
+
   listDir: (path: string) =>
     request<{
       path: string;

@@ -9,6 +9,7 @@
 //! Bound to loopback and gated on a token. A local port that starts work in
 //! somebody's documents folder is not a thing to leave open.
 
+use crate::kinds;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -82,9 +83,15 @@ async fn set_goal(
     if !authorised(&state, &req.token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // A request to start work, not a chat message. Publishing
+    // `user.message` here looked right and did nothing: no one was listening
+    // for it, so the endpoint accepted a goal and silently dropped it.
     state
         .bus
-        .publish(Event::new(ev::USER_MESSAGE, json!({ "text": req.goal })))
+        .publish(Event::new(
+            kinds::GOAL_REQUESTED,
+            json!({ "goal": req.goal, "source": "http" }),
+        ))
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(Json(json!({ "accepted": true })))

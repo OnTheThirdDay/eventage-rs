@@ -623,214 +623,6 @@ impl Tool for ListDirectory {
     }
 }
 
-// ── verify ────────────────────────────────────────────────────────────────────
-
-/// Commands a subagent may run without anyone approving them.
-///
-/// Matched on the leading words, so `cargo test --lib -p foo` is allowed. The
-/// argument is a program and its arguments, never a shell string, so there is
-/// nothing for a `;` or a backtick to do.
-const VERIFIABLE: &[&[&str]] = &[
-    &["cargo", "test"],
-    &["cargo", "build"],
-    &["cargo", "check"],
-    &["cargo", "clippy"],
-    &["cargo", "fmt"],
-    &["npm", "test"],
-    &["npm", "run"],
-    &["pnpm", "test"],
-    &["yarn", "test"],
-    &["pytest"],
-    &["go", "test"],
-    &["go", "build"],
-    &["make", "test"],
-    &["mvn", "test"],
-    &["gradle", "test"],
-];
-
-/// Run the project's own checks, and nothing else.
-///
-/// A subagent is told to verify its work and cannot: it has no user to
-/// approve a shell command, so `bash` is denied outright and its instructions
-/// asked for something impossible. Giving it `bash` instead would hand an
-/// unsupervised agent arbitrary execution, which is what the permission model
-/// exists to prevent.
-///
-/// This is the narrow middle. It takes a program and arguments rather than a
-/// shell line — no shell runs, so no pipes, redirection, chaining or
-/// substitution — and the program must be on a fixed list of things that
-/// build or test a project. Enough to answer "does it compile, do the tests
-/// pass", not enough to be worth attacking.
-pub struct Verify {
-    pub ws: Arc<Workspace>,
-    pub containment: ShellContainment,
-    /// Image for [`ShellContainment::Container`]. Ignored otherwise.
-    pub container_image: String,
-}
-
-impl Verify {
-    fn permitted(argv: &[String]) -> bool {
-        VERIFIABLE.iter().any(|allowed| {
-            argv.len() >= allowed.len()
-                && allowed
-                    .iter()
-                    .zip(argv.iter())
-                    .all(|(want, got)| want == got)
-        })
-    }
-}
-
-#[async_trait]
-impl Tool for Verify {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            "verify",
-            "Run the project's own build or tests to check your work. Takes the command \
-             as a list of arguments — no shell runs, so pipes, redirection and chaining \
-             are not available — and only build and test commands are permitted (cargo, \
-             npm, pytest, go, make, mvn, gradle). Use it rather than reporting something \
-             as verified when you have not run it.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Program and arguments, e.g. [\"cargo\", \"test\", \"--lib\"]"
-                    },
-                    "timeout_secs": { "type": "integer" }
-                },
-                "required": ["command"]
-            }),
-        )
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value, AgentError> {
-        let argv: Vec<String> = args
-            .get("command")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if argv.is_empty() {
-            return Err(AgentError::Tool(
-                "give the command as a list of arguments, e.g. [\"cargo\", \"test\"]".into(),
-            ));
-        }
-        if !Self::permitted(&argv) {
-            return Err(AgentError::Tool(format!(
-                "`{}` is not something verify will run. It is limited to build and test \
-                 commands (cargo, npm, pytest, go, make, mvn, gradle). If you need \
-                 something else, say so in your report and let your caller run it.",
-                argv.join(" ")
-            )));
-        }
-
-        let timeout = args
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(600);
-
-        // `verify` runs the repository's own build and tests, which means it
-        // executes `build.rs`, npm lifecycle scripts, Makefile recipes and
-        // test bodies — all of them repository-controlled — and it is on the
-        // read-only tool list, so it needs no approval in any mode. It must
-        // therefore honour the session's containment exactly as `bash` does.
-        // It did not: `Container` fell through to the host Landlock path,
-        // because the branch was written for three modes out of four.
-        if self.containment == ShellContainment::Container {
-            let output = container_exec(
-                &self.container_image,
-                self.ws.root(),
-                &argv[0],
-                argv[1..].to_vec(),
-                timeout,
-            )
-            .await?;
-            return Ok(json!({
-                "command": argv.join(" "),
-                "exit_code": output.exit_code,
-                "passed": output.exit_code == 0 && !output.timed_out,
-                "stdout": output.stdout,
-                "stderr": output.stderr,
-                "timed_out": output.timed_out,
-                "containment": format!(
-                    "container ({}) — {}",
-                    self.container_image,
-                    ShellContainment::Container.describe(true),
-                ),
-            }));
-        }
-
-        // The `containment` field was being ignored, so `Strict` silently ran
-        // unconfined and every result reported `containment: null` — the tool
-        // said nothing about how it had run, which is the property the shell
-        // tool states explicitly.
-        let confined = crate::shell_sandbox::confined_argv(
-            self.ws.root(),
-            self.containment.policy(),
-            &argv[0],
-            &argv[1..],
-        )
-        .filter(|_| self.containment != ShellContainment::Host);
-        if self.containment == ShellContainment::Strict && confined.is_none() {
-            return Err(AgentError::Tool(
-                "this session requires filesystem confinement and the kernel does not \
-                 provide it (Landlock unavailable); refusing to run the command"
-                    .into(),
-            ));
-        }
-
-        // The same trampoline the shell uses: the ruleset is built in a fresh
-        // single-threaded process, never in a forked child.
-        let is_confined = confined.is_some();
-        let mut cmd: tokio::process::Command = match confined {
-            Some(helper) => helper.into(),
-            None => {
-                let mut plain = std::process::Command::new(&argv[0]);
-                plain.args(&argv[1..]);
-                plain.into()
-            }
-        };
-        cmd.current_dir(self.ws.root())
-            .kill_on_drop(true)
-            .env_clear()
-            .envs(scrubbed_env());
-
-        #[cfg(unix)]
-        unsafe {
-            // SAFETY: bare syscalls only — see the note on the shell tool.
-            cmd.pre_exec(move || {
-                libc::setsid();
-                apply_resource_limits();
-                Ok(())
-            });
-        }
-
-        let output = tokio::time::timeout(std::time::Duration::from_secs(timeout), cmd.output())
-            .await
-            .map_err(|_| {
-                AgentError::Tool(format!("`{}` timed out after {timeout}s", argv.join(" ")))
-            })?
-            .map_err(|e| AgentError::Tool(format!("could not run `{}`: {e}", argv[0])))?;
-
-        Ok(json!({
-            "command": argv.join(" "),
-            "exit_code": output.status.code().unwrap_or(-1),
-            "passed": output.status.success(),
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
-            // Stated rather than assumed, exactly as the shell tool does.
-            "containment": self.containment.describe(is_confined),
-        }))
-    }
-}
-
 // ── jobs ──────────────────────────────────────────────────────────────────────
 
 /// Inspect and stop background commands.
@@ -991,13 +783,13 @@ pub enum ShellContainment {
     /// limits, and confine **writes** to the workspace and the toolchain
     /// caches with Landlock where the kernel offers it.
     ///
-    /// Reads go everywhere except the credential stores — `~/.ssh`, `~/.aws`,
-    /// `~/.gnupg`, `~/.npmrc` and the rest of
-    /// [`HOME_SECRETS`](crate::shell_sandbox). Broad on purpose: toolchains
-    /// install themselves in unpredictable places under `$HOME`, and a read
-    /// policy that guesses wrong makes `node` or `cargo` disappear. The
-    /// network is open, so a command here can still reach out — it just has
-    /// nothing of yours to send. Use `Strict` when even that is too much.
+    /// Reads are **not** confined and the network is open. That is a
+    /// deliberate trade, and the same one Codex's Linux sandbox makes:
+    /// toolchains install themselves in unpredictable places under `$HOME`,
+    /// and a read policy that guesses wrong makes `node` or `cargo` vanish.
+    /// It stops a command *changing* anything outside the repository; it does
+    /// not stop one reading `~/.ssh` and sending it somewhere. Use `Strict`
+    /// when that matters.
     Confined,
     /// As `Confined`, and additionally: reads narrowed to the system, the
     /// named toolchain locations and the workspace; the network refused at
@@ -1146,7 +938,7 @@ impl ShellContainment {
         }
         let policy = match self {
             ShellContainment::Strict => crate::shell_sandbox::Policy::strict(),
-            _ => crate::shell_sandbox::Policy::for_git(),
+            _ => crate::shell_sandbox::Policy::permissive(),
         };
         match crate::shell_sandbox::confined_argv(root, policy, program, args) {
             Some(helper) => Ok(Some(helper.into())),
@@ -1176,9 +968,8 @@ impl ShellContainment {
                  confined and there is no network isolation"
                 .into(),
             ShellContainment::Confined => "credentials scrubbed, own process group, \
-                 memory/cpu/file-size limits, writes confined to the workspace, reads \
-                 allowed everywhere except credential stores (~/.ssh, ~/.aws, ~/.gnupg \
-                 and similar). The network is open."
+                 memory/cpu/file-size limits, writes confined to the workspace. Reads are \
+                 NOT confined and the network is open."
                 .into(),
             ShellContainment::Strict => "credentials scrubbed, own process group, \
                  memory/cpu/file-size limits, writes confined to the workspace, reads \

@@ -20,6 +20,7 @@ import type {
   SourceLocation,
   StudioEvent,
   ToolItem,
+  Workstream,
 } from "./types";
 
 const K = {
@@ -48,6 +49,14 @@ const K = {
   rewound: "studio.rewound",
   backendLost: "studio.backend.lost",
   fsRefused: "studio.fs.refused",
+  goalSet: "cowork.goal.set",
+  planProposed: "cowork.plan.proposed",
+  wsStarted: "cowork.workstream.started",
+  wsFinished: "cowork.workstream.finished",
+  wsSealed: "cowork.workstream.sealed",
+  adopted: "cowork.adopted",
+  adoptionBlocked: "cowork.adoption.blocked",
+  notTracked: "cowork.not_tracked",
   treeRestored: "session.working_tree_restored",
   treeUnchanged: "session.working_tree_unchanged",
   plan: "studio.plan",
@@ -211,6 +220,24 @@ export function reduce(events: StudioEvent[]): ChatState {
   const rolledBack = rejectedBy(events);
 
   let plan: PlanEntry[] = [];
+  // Keyed by workstream id, with the planned order held separately.
+  //
+  // A `Map` orders by insertion, so replacing a plan's placeholder with the
+  // real stream when it starts moved it to the end — and streams start in
+  // whatever order the concurrency limiter admits them, so the panel
+  // reshuffled itself while the user was reading it. `order` keeps the list
+  // in the order the goal was split, which is the only stable one there is.
+  const workstreams = new Map<string, Workstream>();
+  const order: string[] = [];
+  const placeKey = (key: string) => {
+    if (!order.includes(key)) order.push(key);
+  };
+  const rekey = (from: string, to: string) => {
+    const at = order.indexOf(from);
+    if (at === -1) placeKey(to);
+    else order[at] = to;
+  };
+  let untracked: string[] = [];
   let running = false;
   let openAssistant: AssistantItem | null = null;
   let cycleStartedAt: number | null = null;
@@ -596,6 +623,130 @@ export function reduce(events: StudioEvent[]): ChatState {
         break;
       }
 
+      case K.planProposed: {
+        const parts = Array.isArray(p.workstreams) ? p.workstreams : [];
+        for (const part of parts) {
+          const rec = asRecord(part);
+          if (!rec) continue;
+          const title = str(rec.title);
+          // Ids are assigned when a stream starts, so before that the title
+          // is the only handle there is.
+          const key = `planned:${title}`;
+          placeKey(key);
+          workstreams.set(key, {
+            id: "",
+            title,
+            brief: str(rec.brief),
+            status: "running",
+            changes: [],
+          });
+        }
+        items.push(
+          notice(
+            event,
+            "info",
+            parts.length === 1
+              ? "Working on this in one piece"
+              : `Split into ${parts.length} workstreams`,
+            parts.map((w) => str(asRecord(w)?.title)).join(" · "),
+          ),
+        );
+        break;
+      }
+
+      case K.wsStarted: {
+        const id = str(p.id);
+        const title = str(p.title);
+        // Replace the placeholder the plan created, keeping its position.
+        const planned = workstreams.get(`planned:${title}`);
+        if (planned) workstreams.delete(`planned:${title}`);
+        rekey(`planned:${title}`, id);
+        workstreams.set(id, {
+          id,
+          title,
+          brief: str(p.brief) || planned?.brief || "",
+          status: "running",
+          changes: [],
+        });
+        break;
+      }
+
+      case K.wsFinished: {
+        const id = str(p.id);
+        const existing = workstreams.get(id);
+        const changes = (Array.isArray(p.changes) ? p.changes : []).flatMap((c) => {
+          const rec = asRecord(c);
+          return rec ? [{ path: str(rec.path), status: str(rec.status) }] : [];
+        });
+        workstreams.set(id, {
+          id,
+          title: str(p.title) || existing?.title || id,
+          brief: existing?.brief ?? "",
+          status: "finished",
+          changes,
+          report: str(p.report) || undefined,
+        });
+        break;
+      }
+
+      case K.wsSealed: {
+        const id = str(p.id);
+        const existing = workstreams.get(id);
+        if (existing) {
+          workstreams.set(id, {
+            ...existing,
+            status: "sealed",
+            epitaph: str(p.epitaph) || undefined,
+          });
+        }
+        break;
+      }
+
+      case K.adopted: {
+        const changed = Array.isArray(p.changes) ? p.changes.length : 0;
+        items.push(
+          notice(
+            event,
+            "info",
+            `Kept "${str(p.title)}"`,
+            `${changed} file${changed === 1 ? "" : "s"} written to your folder${
+              p.overrode === true ? ", overriding your own changes" : ""
+            }.`,
+          ),
+        );
+        break;
+      }
+
+      case K.adoptionBlocked: {
+        const conflicts = Array.isArray(p.conflicts) ? p.conflicts : [];
+        items.push(
+          notice(
+            event,
+            "warn",
+            `"${str(p.title)}" was not applied — you changed the same files`,
+            `${conflicts
+              .map((c) => str(asRecord(c)?.path))
+              .join(", ")} — your folder is untouched. Keep your versions, or adopt again overriding them.`,
+          ),
+        );
+        break;
+      }
+
+      case K.notTracked: {
+        untracked = (Array.isArray(p.repositories) ? p.repositories : []).map(str);
+        if (untracked.length) {
+          items.push(
+            notice(
+              event,
+              "warn",
+              "Some of this folder is not tracked",
+              `${untracked.join(", ")} — these have their own history, so cowork will not snapshot or restore them.`,
+            ),
+          );
+        }
+        break;
+      }
+
       case K.modeChanged: {
         items.push(
           notice(event, "info", `Mode set to ${str(p.label) || str(p.mode)}`),
@@ -639,5 +790,10 @@ export function reduce(events: StudioEvent[]): ChatState {
     pendingPermissions: items.filter(
       (i): i is PermissionItem => i.type === "permission" && i.status === "pending",
     ),
+    workstreams: order.flatMap((key) => {
+      const stream = workstreams.get(key);
+      return stream ? [stream] : [];
+    }),
+    untracked,
   };
 }

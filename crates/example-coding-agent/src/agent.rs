@@ -399,11 +399,6 @@ impl CodingSession {
                 container_image: config.container_image.clone(),
             })
             .tool(tools::Jobs { jobs: jobs_handle })
-            .tool(tools::Verify {
-                ws: ws.clone(),
-                containment: config.shell,
-                container_image: config.container_image.clone(),
-            })
             .tool(intel::LspDiagnostics {
                 ws: ws.clone(),
                 lsp: lsp.clone(),
@@ -631,6 +626,19 @@ impl CodingSession {
     /// discarded turns modified, so the user is told what to revert rather
     /// than left believing the undo covered it.
     pub async fn rewind(&self, turns: usize) -> Result<usize> {
+        // Refused while a turn is running. Rewinding rolls back the event DAG
+        // *and* rewrites the working tree; doing that underneath a live turn
+        // means the model's next tool call lands on files that moved and its
+        // events attach to a branch that was sealed while it was thinking.
+        // The gate has existed since `prompt_turn` and this simply never took
+        // it — ACP can call `session/rewind` at any moment, and nothing
+        // stopped it.
+        let _gate = self.turn_gate.try_lock().map_err(|_| {
+            anyhow::anyhow!(
+                "this session is working on something; stop the current turn before \
+                 rewinding it"
+            )
+        })?;
         let turns = turns.max(1);
         let mut checkpoints = self.checkpoints.lock().await;
         if checkpoints.is_empty() {
@@ -737,6 +745,13 @@ impl CodingSession {
     /// ten turns is easier to navigate by pointing at the moment you want to
     /// return to — which is what the timeline's checkpoint flags are.
     pub async fn rewind_to(&self, checkpoint: eventage::EventId) -> Result<usize> {
+        // Same reasoning as `rewind`: not while a turn is in flight.
+        let _gate = self.turn_gate.try_lock().map_err(|_| {
+            anyhow::anyhow!(
+                "this session is working on something; stop the current turn before \
+                 rewinding it"
+            )
+        })?;
         let mut checkpoints = self.checkpoints.lock().await;
         let position = checkpoints
             .iter()

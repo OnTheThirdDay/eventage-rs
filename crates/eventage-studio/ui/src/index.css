@@ -1,0 +1,102 @@
+
+/* ── workstreams ───────────────────────────────────────────────────────────
+   A fan-out shown as a comparison. The rows are deliberately plain: the
+   information that matters is which files each stream touched, and any
+   decoration competes with that. */
+.workstreams {
+  border-top: 1px solid var(--line);
+  padding: 1rem 1.25rem 1.5rem;
+}
+.workstreams-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.workstreams-head h2 {
+  font-size: 0.9rem;
+  margin: 0;
+}
+.workstreams-head .hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.workstreams > ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+.workstream {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.75rem 0.9rem;
+}
+.workstream.sealed {
+  opacity: 0.65;
+}
+.workstream-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.workstream-head .glyph {
+  font-family: ui-monospace, monospace;
+}
+.workstream-head .title {
+  font-weight: 600;
+}
+.workstream-head .count {
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.workstream .brief,
+.workstream .report {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.workstream .epitaph {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+}
+.workstream .changes {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.15rem;
+  font-size: 0.8rem;
+}
+.workstream .changes li {
+  display: flex;
+  gap: 0.5rem;
+}
+.workstream .changes .status {
+  min-width: 4.5rem;
+  color: var(--muted);
+}
+.workstream .actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+.workstream .seal {
+  margin-top: 0.6rem;
+  display: grid;
+  gap: 0.35rem;
+}
+.workstream .seal label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.workstream .seal input {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}

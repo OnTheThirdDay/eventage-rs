@@ -156,6 +156,26 @@ export interface SessionStats {
   lastTurnMs?: number;
 }
 
+/**
+ * One line of work in a cowork session.
+ *
+ * Derived from the event stream like everything else here, so a browser that
+ * joined halfway through a fan-out renders the same picture as one that
+ * watched it from the start.
+ */
+export interface Workstream {
+  id: string;
+  title: string;
+  brief: string;
+  status: "running" | "finished" | "sealed";
+  /** Files it changed in its own copy, against the session's base. */
+  changes: { path: string; status: string }[];
+  /** Its own account of what it did. */
+  report?: string;
+  /** Why it was abandoned, if it was. */
+  epitaph?: string;
+}
+
 export interface ChatState {
   items: ChatItem[];
   plan: PlanEntry[];
@@ -164,4 +184,13 @@ export interface ChatState {
   /** Ids the log says were rolled back — hidden from the transcript, kept in the trace. */
   rolledBack: Set<string>;
   pendingPermissions: PermissionItem[];
+  /**
+   * Cowork workstreams, in the order they were planned.
+   *
+   * Empty for the coding and ACP backends, which have no such thing — the
+   * panel simply does not render.
+   */
+  workstreams: Workstream[];
+  /** Paths of the folder cowork is not tracking, and why it said so. */
+  untracked: string[];
 }

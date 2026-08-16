@@ -73,6 +73,16 @@ impl EventWorker for SchedulerWorker {
             ))
             .await
             .map_err(|e| WorkerError::Worker(e.to_string()))?;
+
+            // And ask for it to actually run. Firing alone published an event
+            // nothing consumed, so an automation "fired" every time it came
+            // due and never did any work.
+            bus.publish(Event::new(
+                kinds::GOAL_REQUESTED,
+                json!({ "goal": description, "source": format!("schedule:{name}") }),
+            ))
+            .await
+            .map_err(|e| WorkerError::Worker(e.to_string()))?;
         }
         Ok(())
     }

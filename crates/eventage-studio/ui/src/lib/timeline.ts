@@ -282,11 +282,29 @@ export function buildTimeline(events: StudioEvent[]): TimelineModel {
     { id: SYSTEM_LANE, label: "System", kind: "system" },
   ];
 
-  const times = events.map(time).filter((t) => t > 0);
-  const startMs = times.length ? Math.min(...times) : 0;
+  // One pass rather than `Math.min(...times)`. Spreading an array into a
+  // call passes one argument per element, and every engine has a limit —
+  // around 125k on the Node version this was measured against. A long
+  // session would hit it and the whole timeline would throw rather than
+  // render, which is the worst possible failure for a view whose only job is
+  // to show you what happened.
+  let startMs = 0;
+  let rawEnd = 0;
+  let seen = false;
+  for (const event of events) {
+    const t = time(event);
+    if (t <= 0) continue;
+    if (!seen) {
+      startMs = t;
+      rawEnd = t;
+      seen = true;
+      continue;
+    }
+    if (t < startMs) startMs = t;
+    if (t > rawEnd) rawEnd = t;
+  }
   // A session with one instant would divide by zero when scaling; give it a
   // second of width so a single event still lands somewhere sensible.
-  const rawEnd = times.length ? Math.max(...times) : 0;
   const endMs = rawEnd > startMs ? rawEnd : startMs + 1000;
 
   return {

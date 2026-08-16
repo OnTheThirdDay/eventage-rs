@@ -437,3 +437,134 @@ describe("harness notices", () => {
     expect(state.running).toBe(false);
   });
 });
+
+describe("cowork workstreams", () => {
+  it("derives the fan-out from the event stream alone", () => {
+    // Everything the panel needs is on the bus, so a browser that joins
+    // halfway through a fan-out renders the same picture as one that watched
+    // it from the start. That is what makes a session resumable rather than a
+    // property of the process that started it.
+    const chat = reduce([
+      ev("user.message", { text: "tidy the Q3 notes" }),
+      ev("cowork.plan.proposed", {
+        workstreams: [
+          { title: "summary", brief: "write the summary" },
+          { title: "index", brief: "build the index" },
+        ],
+      }),
+      ev("cowork.workstream.started", {
+        id: "a1",
+        title: "summary",
+        brief: "write the summary",
+      }),
+      ev("cowork.workstream.started", {
+        id: "b2",
+        title: "index",
+        brief: "build the index",
+      }),
+      ev("cowork.workstream.finished", {
+        id: "a1",
+        title: "summary",
+        report: "wrote summary.md",
+        changes: [{ path: "summary.md", status: "added" }],
+      }),
+    ]);
+
+    expect(chat.workstreams).toHaveLength(2);
+    const summary = chat.workstreams[0]!;
+    const index = chat.workstreams[1]!;
+    expect(summary).toMatchObject({
+      id: "a1",
+      title: "summary",
+      status: "finished",
+      report: "wrote summary.md",
+    });
+    expect(summary.changes).toEqual([{ path: "summary.md", status: "added" }]);
+    // Still going, and shown as such rather than omitted.
+    expect(index).toMatchObject({ id: "b2", status: "running" });
+  });
+
+  it("keeps the planned order when a stream starts", () => {
+    // A stream has no id until it starts, so the plan seeds placeholders by
+    // title. Replacing one must not send it to the end of the list.
+    const chat = reduce([
+      ev("cowork.plan.proposed", {
+        workstreams: [
+          { title: "first", brief: "" },
+          { title: "second", brief: "" },
+        ],
+      }),
+      ev("cowork.workstream.started", { id: "z", title: "second", brief: "" }),
+      ev("cowork.workstream.started", { id: "a", title: "first", brief: "" }),
+    ]);
+    expect(chat.workstreams.map((w) => w.title)).toEqual(["first", "second"]);
+  });
+
+  it("shows an abandoned stream with its reason rather than dropping it", () => {
+    // The difference from rejecting a diff: what produced the result stays,
+    // and so does why it was wrong.
+    const chat = reduce([
+      ev("cowork.workstream.started", { id: "a1", title: "rewrite", brief: "" }),
+      ev("cowork.workstream.finished", { id: "a1", title: "rewrite", changes: [] }),
+      ev("cowork.workstream.sealed", {
+        id: "a1",
+        title: "rewrite",
+        epitaph: "rewriting lost the citations",
+      }),
+    ]);
+    expect(chat.workstreams[0]).toMatchObject({
+      status: "sealed",
+      epitaph: "rewriting lost the citations",
+    });
+  });
+
+  it("says which parts of the folder are not tracked", () => {
+    const chat = reduce([
+      ev("cowork.not_tracked", { repositories: ["vendor/lib", "notes/.git-repo"] }),
+    ]);
+    expect(chat.untracked).toEqual(["vendor/lib", "notes/.git-repo"]);
+    expect(only(chat.items, "notice")[0]).toMatchObject({ level: "warn" });
+  });
+
+  it("has no workstreams for a backend that does not produce them", () => {
+    // The coding and ACP backends never emit these, and the panel must not
+    // render an empty box in their sessions.
+    const chat = reduce([ev("user.message", { text: "hi" })]);
+    expect(chat.workstreams).toEqual([]);
+  });
+});
+
+describe("a blocked adoption", () => {
+  it("names the files and says the folder is untouched", () => {
+    // The failure it replaces was silent: the workstream's version simply
+    // overwrote the user's edit. A refusal nobody sees is the same thing.
+    const chat = reduce([
+      ev("cowork.adoption.blocked", {
+        id: "a1",
+        title: "summary",
+        conflicts: [
+          { path: "report.md", workstream: "modified", live: "modified" },
+          { path: "data.csv", workstream: "modified", live: "deleted" },
+        ],
+      }),
+    ]);
+    const notice = only(chat.items, "notice")[0];
+    expect(notice).toMatchObject({ level: "warn" });
+    expect(notice.title).toContain("summary");
+    expect(notice.detail).toContain("report.md");
+    expect(notice.detail).toContain("data.csv");
+    expect(notice.detail).toContain("untouched");
+  });
+
+  it("says so when an adoption overrode the user's own changes", () => {
+    const chat = reduce([
+      ev("cowork.adopted", {
+        id: "a1",
+        title: "summary",
+        overrode: true,
+        changes: [{ path: "report.md", status: "modified" }],
+      }),
+    ]);
+    expect(only(chat.items, "notice")[0].detail).toContain("overriding your own changes");
+  });
+})

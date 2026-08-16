@@ -258,6 +258,24 @@ impl Peer {
             .await
     }
 
+    /// Answer a request with a protocol error.
+    ///
+    /// Refusals used to travel as *successful* results carrying an `"error"`
+    /// property. A JSON-RPC client that checks whether the call succeeded —
+    /// which is the only thing a client is obliged to do — then reads a
+    /// refused write as a completed one. Our own agent did exactly that, and
+    /// skipped the disk fallback it would otherwise have taken, so a write
+    /// Studio had rejected was reported to the model as done and the edit was
+    /// silently lost.
+    async fn respond_error(&self, id: i64, code: i64, message: &str) -> Result<()> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message },
+        }))
+        .await
+    }
+
     /// Fail every outstanding call. Called when the child exits, so callers
     /// get an error instead of waiting forever on a dead process.
     async fn abandon_all(&self) {
@@ -459,32 +477,33 @@ async fn dispatch(peer: &Arc<Peer>, feed: &Arc<EventFeed>, root: &Path, line: &s
             }
             "fs/read_text_file" => {
                 let asked = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let result = match confine(root, asked) {
+                match confine(root, asked) {
                     Err(refusal) => {
                         refused(feed, "read", asked, &refusal);
-                        json!({ "content": "", "error": refusal })
+                        // Refusing with an empty string would be worse than
+                        // refusing loudly: the agent would read it as an
+                        // empty file and could overwrite the real one.
+                        peer.respond_error(id, -32001, &refusal).await?;
                     }
                     Ok(path) => match tokio::fs::read_to_string(&path).await {
-                        Ok(content) => json!({ "content": content }),
-                        Err(e) => json!({ "content": "", "error": e.to_string() }),
+                        Ok(content) => peer.respond(id, json!({ "content": content })).await?,
+                        Err(e) => peer.respond_error(id, -32002, &e.to_string()).await?,
                     },
-                };
-                peer.respond(id, result).await?;
+                }
             }
             "fs/write_text_file" => {
                 let asked = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let result = match confine(root, asked) {
+                match confine(root, asked) {
                     Err(refusal) => {
                         refused(feed, "write", asked, &refusal);
-                        json!({ "error": refusal })
+                        peer.respond_error(id, -32001, &refusal).await?;
                     }
                     Ok(path) => match tokio::fs::write(&path, content).await {
-                        Ok(()) => json!({}),
-                        Err(e) => json!({ "error": e.to_string() }),
+                        Ok(()) => peer.respond(id, json!({})).await?,
+                        Err(e) => peer.respond_error(id, -32002, &e.to_string()).await?,
                     },
-                };
-                peer.respond(id, result).await?;
+                }
             }
             other => {
                 debug!("agent asked for '{other}', which Studio does not implement");

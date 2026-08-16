@@ -35,6 +35,15 @@ use std::path::Path;
 /// trailing newline from every restored file, and decoding as UTF-8 would
 /// corrupt every binary one — a rewind that quietly rewrites a PNG is worse
 /// than a rewind that does nothing.
+/// How long any one snapshot command may take.
+///
+/// A snapshot runs on **every prompt**, so its cost is paid constantly while
+/// its benefit — a rewind — is claimed rarely. `git add -A` walks the whole
+/// working tree and can invoke repository-configured clean filters and
+/// fsmonitor commands, so on a large or unusual repository it is not
+/// obviously fast. Without a bound, a turn could simply never start.
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn git_bytes(repo: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args)
@@ -44,15 +53,26 @@ async fn git_bytes(repo: &Path, index: Option<&Path>, args: &[&str]) -> Result<V
         // repository's hooks this process's environment.
         .env_clear()
         .envs(crate::tools::scrubbed_env())
-        // Hooks are not involved in any command here, but a system-wide
-        // config that redirects one would be, and it is not ours.
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .kill_on_drop(true)
+        // Neither system nor user configuration applies. Both can define
+        // `core.fsmonitor` and clean filters — programs git runs on our
+        // behalf, chosen by someone who is not the operator and not us.
+        // `.git/config` still applies, and that one is the user's own.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0");
     if let Some(index) = index {
         cmd.env("GIT_INDEX_FILE", index);
     }
-    let out = cmd
-        .output()
+    let out = tokio::time::timeout(SNAPSHOT_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "git {} did not finish within {}s",
+                args.join(" "),
+                SNAPSHOT_TIMEOUT.as_secs()
+            )
+        })?
         .with_context(|| format!("could not run git {}", args.join(" ")))?;
     if !out.status.success() {
         bail!(
@@ -126,6 +146,16 @@ pub struct Restored {
 ///
 /// Ignored files are never involved, because `git add -A` never staged them.
 pub async fn restore(repo: &Path, target: &str) -> Result<Restored> {
+    // Every write goes through the workspace handle rather than
+    // `repo.join(path)` and ambient `tokio::fs`. A tracked file can be
+    // replaced by a symlink after the checkpoint was taken, and an ambient
+    // write then follows it and puts the old contents somewhere outside the
+    // repository entirely. The handle resolves beneath its root and replaces
+    // a link rather than writing through it — the same discipline every tool
+    // already uses, which restore had simply never been held to.
+    let ws = crate::workspace::Workspace::open(repo)
+        .with_context(|| format!("cannot open '{}' to restore into", repo.display()))?;
+
     // Before anything is overwritten. Work done since the checkpoint is then
     // recoverable rather than destroyed, which is the difference between an
     // undo and a loss.
@@ -153,17 +183,13 @@ pub async fn restore(repo: &Path, target: &str) -> Result<Restored> {
         match kind.chars().next() {
             // Present now, absent in the snapshot: the turn created it.
             Some('A') => {
-                let _ = tokio::fs::remove_file(repo.join(path)).await;
+                let _ = ws.remove_file(path).await;
             }
             // Changed or deleted since the snapshot: write the old blob back,
             // byte for byte.
             Some('M' | 'D' | 'T') => {
                 let blob = git_bytes(repo, None, &["show", &format!("{target}:{path}")]).await?;
-                let full = repo.join(path);
-                if let Some(parent) = full.parent() {
-                    tokio::fs::create_dir_all(parent).await.ok();
-                }
-                tokio::fs::write(&full, blob).await?;
+                ws.write(path, blob).await?;
             }
             _ => continue,
         }

@@ -80,14 +80,21 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Before anything else, including argument parsing: a process started
-    // with the sandbox marker is not really this program, it is a trampoline
-    // that confines itself and execs the real command. Never returns when it
-    // matches.
-    eventage_code::shell_sandbox::run_if_helper();
-
+/// Everything that touches the process environment, done before the runtime
+/// exists.
+///
+/// `set_var` and `remove_var` are unsafe on Unix for a reason: another thread
+/// calling `getenv` concurrently is undefined behaviour, and the standard
+/// library's guidance is that a multi-threaded program simply must not do it.
+/// Under `#[tokio::main]` the runtime — and its worker threads — are already
+/// built before the first line of the async body runs, so the settings block
+/// and the credential scrub were happening in exactly the situation the rule
+/// forbids.
+///
+/// So `main` is an ordinary function again. This runs single-threaded, with
+/// nothing else in the process that could be reading the environment, and the
+/// runtime is built afterwards.
+fn prologue() -> Result<(Cli, ModelConfig)> {
     let cli = Cli::parse();
 
     // Read before the model is resolved: this is where a workspace configured
@@ -97,7 +104,11 @@ async fn main() -> Result<()> {
     let settings =
         eventage_code::settings::ClaudeSettings::load(std::env::current_dir().unwrap_or_default());
     let _applied = settings.apply_env();
-    let model = ModelConfig::from_env(cli.model.or(settings.model));
+
+    // Resolved into an immutable profile — endpoint, credential, model, auth
+    // mode and headers together. Nothing re-reads the environment for any of
+    // them afterwards, which is what makes the scrub below safe to do.
+    let model = ModelConfig::from_env(cli.model.clone().or(settings.model));
 
     // Everything that reads a credential out of the environment has now run,
     // so take them out of it. A process's environment is a file that any
@@ -110,6 +121,24 @@ async fn main() -> Result<()> {
             "moved credentials out of the environment"
         );
     }
+    Ok((cli, model))
+}
+
+fn main() -> Result<()> {
+    // Before anything else, including argument parsing: a process started
+    // with the sandbox marker is not really this program, it is a trampoline
+    // that confines itself and execs the real command. Never returns when it
+    // matches.
+    eventage_code::shell_sandbox::run_if_helper();
+
+    let (cli, model) = prologue()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli, model))
+}
+
+async fn run(cli: Cli, model: ModelConfig) -> Result<()> {
     let container_image = cli.container_image.clone();
     let shell = eventage_code::tools::ShellContainment::from_id(&cli.sandbox).ok_or_else(|| {
         anyhow::anyhow!(

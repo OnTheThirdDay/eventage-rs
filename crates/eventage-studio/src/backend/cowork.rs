@@ -22,7 +22,7 @@
 //! coding agent's plan/auto/yolo, because they are the vocabulary users of
 //! these products already have.
 
-use crate::backend::{Backend, Session};
+use crate::backend::{AdoptConflict, Adopted, Backend, Session};
 use crate::feed::EventFeed;
 use crate::protocol::{
     studio_kinds, AppInfo, ModeInfo, NewSessionRequest, PermissionResponse, PromptBlock,
@@ -95,15 +95,24 @@ impl Backend for CoworkBackend {
             ],
             version: env!("CARGO_PKG_VERSION"),
             full_trace: true,
-            credentials_hint: match self.model.api_key.is_empty() {
-                true => Some("no model credentials were found in the environment".into()),
-                false => None,
+            // The same profile field, for the same reason. `api_key` is not
+            // the test: the keyless fallback fills in a placeholder.
+            credentials_hint: match self.model.credentialed {
+                false => Some(format!(
+                    "No API key found, so cowork is pointed at {}. Set ANTHROPIC_API_KEY, \
+                     QWEN_API_KEY, or OPENAI_API_KEY (with OPENAI_BASE_URL) and restart.",
+                    self.model.base_url()
+                )),
+                true => None,
             },
         }
     }
 
     async fn open(&self, req: NewSessionRequest) -> Result<Arc<dyn Session>> {
-        let folder = req.cwd.clone().unwrap_or_else(|| self.default_folder.clone());
+        let folder = req
+            .cwd
+            .clone()
+            .unwrap_or_else(|| self.default_folder.clone());
         let mut config = CoworkConfig::new(&folder);
         config.max_parallel = self.max_parallel;
         config.max_workstreams = self.max_workstreams;
@@ -111,9 +120,12 @@ impl Backend for CoworkBackend {
             config.steering = mode;
         }
 
-        let id = uuid::Uuid::new_v4().to_string();
         let llm = eventage_code::agent::provider_for(&self.model);
-        let session = CoworkSession::open(id.clone(), llm, config).await?;
+        let session = match req.resume.as_deref() {
+            Some(id) => CoworkSession::resume(id.to_string(), llm, config).await?,
+            None => CoworkSession::open(uuid::Uuid::new_v4().to_string(), llm, config).await?,
+        };
+        let id = session.id.clone();
         Ok(CoworkStudioSession::start(id, session, folder).await)
     }
 
@@ -141,6 +153,8 @@ struct CoworkStudioSession {
     created_at: String,
     turn: Mutex<Option<JoinHandle<()>>>,
     bridge: JoinHandle<()>,
+    /// Runs goals published by the channel or the scheduler.
+    requests: JoinHandle<()>,
 }
 
 impl CoworkStudioSession {
@@ -156,6 +170,11 @@ impl CoworkStudioSession {
         for event in session.bus.log().await {
             feed.push(StudioEvent::from(&event));
         }
+
+        // Goals that arrive over cowork's own HTTP channel or from an
+        // automation run through here; Studio's own `prompt` calls `run`
+        // directly and publishes no request, so nothing is run twice.
+        let requests = tokio::spawn(Arc::clone(&session).serve_requests());
 
         let bridge = {
             let feed = Arc::clone(&feed);
@@ -178,6 +197,7 @@ impl CoworkStudioSession {
             created_at: chrono::Utc::now().to_rfc3339(),
             turn: Mutex::new(None),
             bridge,
+            requests,
         })
     }
 }
@@ -316,13 +336,42 @@ impl Session for CoworkStudioSession {
         Ok(())
     }
 
+    async fn adopt(&self, workstream_id: &str, override_conflicts: bool) -> Result<Adopted> {
+        let outcome = match override_conflicts {
+            true => self.session.adopt_overriding(workstream_id).await?,
+            false => self.session.adopt(workstream_id).await?,
+        };
+        Ok(Adopted {
+            changed: outcome.applied.into_iter().map(|c| c.path).collect(),
+            conflicts: outcome
+                .conflicts
+                .into_iter()
+                .map(|c| AdoptConflict {
+                    path: c.path,
+                    workstream: c.workstream.as_str().to_string(),
+                    live: c.live.as_str().to_string(),
+                })
+                .collect(),
+        })
+    }
+
+    async fn seal(&self, workstream_id: &str, why: &str) -> Result<()> {
+        self.session.seal(workstream_id, why).await
+    }
+
     async fn shutdown(&self) {
         if let Some(handle) = self.turn.lock().await.take() {
             handle.abort();
         }
         self.bridge.abort();
+        self.requests.abort();
         self.feed.close();
-        self.session.bus.close();
+        // Waits for the log rather than dropping the task with it: the events
+        // still queued are the ones a resume needs most.
+        let failures = self.session.close().await;
+        if failures > 0 {
+            tracing::warn!(failures, "this session will reopen incomplete");
+        }
     }
 }
 
@@ -382,11 +431,12 @@ mod tests {
             return;
         };
         let err = studio
-            .prompt(vec![PromptBlock::Text {
-                text: "   ".into(),
-            }])
+            .prompt(vec![PromptBlock::Text { text: "   ".into() }])
             .await;
-        assert!(err.is_err(), "an empty goal started a session's worth of work");
+        assert!(
+            err.is_err(),
+            "an empty goal started a session's worth of work"
+        );
     }
 
     #[tokio::test]
@@ -410,7 +460,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(studio.feed().first_user_text().as_deref(), Some("tidy the notes"));
+        assert_eq!(
+            studio.feed().first_user_text().as_deref(),
+            Some("tidy the notes")
+        );
         studio.shutdown().await;
     }
 }

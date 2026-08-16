@@ -142,6 +142,15 @@ impl ClientFs {
         })
         .ok()?;
         let result = self.peer.request("fs/read_text_file", params).await.ok()?;
+        // A result carrying an `error` is a failure however it was framed.
+        // Deserialising it anyway yields `content: ""`, which the agent reads
+        // as an empty file — and an empty file is a thing it will happily
+        // overwrite. Older clients answer refusals this way, so the check
+        // stays even now that Studio returns proper protocol errors.
+        if result.get("error").is_some() {
+            warn!("the editor refused a read: {}", result["error"]);
+            return None;
+        }
         serde_json::from_value::<ReadTextFileResult>(result)
             .ok()
             .map(|r| r.content)
@@ -159,10 +168,22 @@ impl ClientFs {
         }) else {
             return false;
         };
-        self.peer
-            .request("fs/write_text_file", params)
-            .await
-            .is_ok()
+        // `is_ok()` alone was wrong twice over: it accepted a transport
+        // success carrying an `error` property, and the caller uses this
+        // boolean to decide whether to fall back to writing the file itself.
+        // A refused write was therefore reported to the model as done, and
+        // the edit went nowhere.
+        match self.peer.request("fs/write_text_file", params).await {
+            Ok(result) if result.get("error").is_none() => true,
+            Ok(result) => {
+                warn!("the editor refused a write: {}", result["error"]);
+                false
+            }
+            Err(e) => {
+                warn!("the editor could not be asked to write: {e}");
+                false
+            }
+        }
     }
 }
 

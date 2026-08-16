@@ -42,6 +42,23 @@ pub trait Backend: Send + Sync + 'static {
     async fn forget(&self, id: &str) -> Result<()>;
 }
 
+/// What adopting a workstream did, or why it did not.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Adopted {
+    /// Paths written into the folder.
+    pub changed: Vec<String>,
+    /// Paths changed by both the workstream and the folder since the base.
+    /// Non-empty means nothing was written.
+    pub conflicts: Vec<AdoptConflict>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdoptConflict {
+    pub path: String,
+    pub workstream: String,
+    pub live: String,
+}
+
 #[async_trait]
 pub trait Session: Send + Sync + 'static {
     /// The event stream this session's views are derived from.
@@ -72,6 +89,30 @@ pub trait Session: Send + Sync + 'static {
 
     /// Answer a pending permission request.
     async fn permission(&self, response: PermissionResponse) -> Result<()>;
+
+    /// Apply one workstream's result to the folder.
+    ///
+    /// Cowork's alone, and defaulted so the coding and ACP backends need to
+    /// know nothing about it. A cowork turn deliberately leaves its results
+    /// unmerged — several were run precisely because they are not equally
+    /// good — so choosing between them is an action the session has to offer
+    /// rather than something the turn does on its way out.
+    /// Returns the paths written, or the conflicts that stopped it.
+    ///
+    /// `override_conflicts` is the user having seen them and chosen the
+    /// workstream's version anyway.
+    async fn adopt(&self, _workstream_id: &str, _override_conflicts: bool) -> Result<Adopted> {
+        anyhow::bail!("this backend has no workstreams to adopt")
+    }
+
+    /// Abandon a workstream, recording why.
+    ///
+    /// Not a delete. The reasoning stays in the graph, and a later attempt is
+    /// told about it — which is the difference between this and rejecting a
+    /// diff in the products cowork is answering.
+    async fn seal(&self, _workstream_id: &str, _why: &str) -> Result<()> {
+        anyhow::bail!("this backend has no workstreams to seal")
+    }
 
     /// Release everything the session holds. Called when it is closed and at
     /// shutdown, so child processes and LSP servers do not outlive the app.

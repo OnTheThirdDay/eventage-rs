@@ -68,12 +68,11 @@ impl SubagentKind {
             }
             Self::General => {
                 "You are an implementation subagent working in an isolated copy of the \
-                 repository. Complete the assigned task, verify it, and report exactly \
-                 what you changed and what you verified. Use `verify` to run the \
-                 project's build and tests — it needs no approval. `bash` is available \
-                 for anything else, but it asks the user, so prefer `verify` and do not \
-                 reach for the shell out of habit. Report failures honestly: your \
-                 caller will review your diff."
+                 repository. Complete the assigned task, check it, and report exactly \
+                 what you changed and what you checked. `bash` runs the project's own \
+                 build and tests, and anything else you need; it asks the user, so \
+                 batch what you run rather than issuing many small commands. Report \
+                 failures honestly: your caller will review your diff."
             }
         }
     }
@@ -719,15 +718,9 @@ impl Tool for Task {
                     client: None,
                     lsp: lsp.clone(),
                 })
-                // `verify` first, because it is what a subagent should reach
-                // for and needs no approval at all. `bash` is here too now
-                // that a prompt reaches the user rather than a bus nobody is
-                // listening to.
-                .tool(tools::Verify {
-                    ws: ws.clone(),
-                    containment: self.containment,
-                    container_image: self.container_image.clone(),
-                })
+                // `bash` is the only way to run anything, for a subagent as
+                // much as for the session that spawned it. A permission
+                // request from here reaches the user like any other.
                 .tool(tools::Bash {
                     ws: ws.clone(),
                     jobs: Arc::new(tools::BackgroundJobs::default()),

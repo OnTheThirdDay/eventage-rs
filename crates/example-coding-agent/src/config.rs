@@ -102,8 +102,6 @@ impl PermissionMode {
         "view_image",
         "repo_map",
         "jobs",
-        // Runs only build and test commands, with no shell involved.
-        "verify",
     ];
 
     /// Tools that modify the workspace.
@@ -117,7 +115,27 @@ impl PermissionMode {
         "task",
     ];
 
-    /// Tools that reach outside the workspace or can destroy work.
+    /// Tools that execute code, reach outside the workspace, or destroy work.
+    ///
+    /// `bash` is the *only* way to run anything. There used to be a second,
+    /// `verify`, which took a program and arguments from a fixed list of
+    /// build and test commands and ran without approval. It was added for a
+    /// reason that has since expired — a subagent had no one to approve a
+    /// shell command, so it could be told to verify its work and had no way
+    /// to — and subagents reach the user now.
+    ///
+    /// What it left behind was worse than the gap it filled: a second
+    /// execution path whose allow-list looked like a boundary and was not.
+    /// `npm run` runs whatever the package names, `make test` runs whatever
+    /// the recipe says, `cargo test` runs `build.rs` and the test bodies. It
+    /// constrained the *spelling* of the command, never the code that ran —
+    /// and being approval-free, it was the easiest way to execute a
+    /// repository's code without anyone being asked.
+    ///
+    /// One path, gated once, is easier to reason about than two paths where
+    /// the narrower one is narrower in name only. Repeated commands are for
+    /// standing approvals to solve — those are scoped to exact arguments, so
+    /// allowing `cargo test` allows `cargo test` and nothing else.
     pub const RISKY_TOOLS: &'static [&'static str] = &["bash", "git", "web_fetch"];
 
     /// Build the permission policy for this mode.
@@ -212,6 +230,17 @@ pub struct ModelConfig {
     pub base_url: Option<String>,
     /// Headers a gateway routes on, e.g. `x-portkey-provider`.
     pub headers: Vec<(String, String)>,
+    /// Whether a real credential was found when this profile was resolved.
+    ///
+    /// Recorded here rather than re-checked later. Startup takes
+    /// credential-shaped variables out of the environment, so anything asking
+    /// "is `QWEN_API_KEY` set?" afterwards is asking a question whose answer
+    /// has been deliberately erased — Studio's "no API key found" banner did
+    /// exactly that, and told everyone with a working key that they had none.
+    ///
+    /// Not the same as `api_key.is_empty()`: the keyless fallback fills in a
+    /// placeholder so an Ollama user still has something to send.
+    pub credentialed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,12 +277,16 @@ impl ModelConfig {
                 thinking_tokens: Some(8_000),
                 max_tokens: 32_000,
                 bearer_auth: bearer.is_some(),
+                credentialed: true,
                 base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
                 headers: std::env::var("ANTHROPIC_CUSTOM_HEADERS")
                     .map(|raw| crate::settings::parse_custom_headers(&raw))
                     .unwrap_or_default(),
             };
         }
+        // Captured here, with everything else, rather than read again later.
+        let endpoint = std::env::var("OPENAI_BASE_URL").ok();
+
         // Qwen first: it needs its own dialect, not OpenAI's.
         if let Ok(key) = std::env::var("QWEN_API_KEY") {
             return Self {
@@ -262,6 +295,8 @@ impl ModelConfig {
                 api_key: key,
                 thinking_tokens: None,
                 max_tokens: 32_000,
+                credentialed: true,
+                base_url: endpoint,
                 ..Self::gatewayless()
             };
         }
@@ -272,15 +307,20 @@ impl ModelConfig {
                 api_key: key,
                 thinking_tokens: None,
                 max_tokens: 32_000,
+                credentialed: true,
+                base_url: endpoint,
                 ..Self::gatewayless()
             };
         }
+        // Nothing was found: the fallback points at a local server and says
+        // so, rather than pretending to be configured.
         Self {
             provider: Provider::OpenAiChat,
             model: model_override.unwrap_or_else(|| "qwen3:4b".into()),
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "ollama".into()),
             thinking_tokens: None,
             max_tokens: 8_000,
+            base_url: endpoint,
             ..Self::gatewayless()
         }
     }
@@ -296,6 +336,7 @@ impl ModelConfig {
             bearer_auth: false,
             base_url: None,
             headers: Vec::new(),
+            credentialed: false,
         }
     }
 
@@ -303,12 +344,29 @@ impl ModelConfig {
     ///
     /// `OPENAI_BASE_URL` points at any compatible gateway (Aliyun, Azure,
     /// OpenRouter, vLLM, Ollama…); the default is a local Ollama.
+    /// The endpoint this config was resolved against.
+    ///
+    /// Read from the stored field, never from the environment. It used to
+    /// re-read `OPENAI_BASE_URL` here, at provider-construction time — which
+    /// is *after* startup takes credential-shaped variables out of the
+    /// environment, and `OPENAI_*` is credential-shaped. A session pointed at
+    /// a local vLLM, an Ollama instance or a private gateway therefore fell
+    /// back to a hard-coded default, and for the Responses provider that
+    /// default is `api.openai.com`: the operator's key and the repository's
+    /// contents went to an endpoint they had not chosen.
+    ///
+    /// The scrub was added to stop credentials leaking. Reading configuration
+    /// lazily out of the same namespace turned it into a credential-routing
+    /// bug — which is why endpoint, credential, model, auth mode and headers
+    /// are now captured together, once, and never re-derived.
     pub fn base_url(&self) -> String {
-        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| match self.provider {
-            Provider::OpenAiResponses => "https://api.openai.com/v1".into(),
-            Provider::Qwen => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into(),
-            _ => "http://localhost:11434/v1".into(),
-        })
+        self.base_url
+            .clone()
+            .unwrap_or_else(|| match self.provider {
+                Provider::OpenAiResponses => "https://api.openai.com/v1".into(),
+                Provider::Qwen => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into(),
+                _ => "http://localhost:11434/v1".into(),
+            })
     }
 }
 

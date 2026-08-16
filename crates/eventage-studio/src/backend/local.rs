@@ -68,8 +68,12 @@ impl LocalBackend {
 /// fails with a connection error to a host they never chose. Detecting it at
 /// startup lets the UI say so before anything is typed.
 fn credentials_hint(model: &ModelConfig) -> Option<String> {
-    const KEYS: [&str; 3] = ["ANTHROPIC_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY"];
-    if KEYS.iter().any(|key| std::env::var(key).is_ok()) {
+    // Read off the resolved profile, never from the environment. Startup
+    // moves credentials out of it, so asking `env::var("QWEN_API_KEY")` here
+    // always said "unset" — and the banner told anyone with a perfectly good
+    // key, pointed at a perfectly good gateway, that they had no credentials
+    // at all.
+    if model.credentialed {
         return None;
     }
     Some(format!(

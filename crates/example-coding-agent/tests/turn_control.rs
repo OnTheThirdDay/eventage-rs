@@ -149,3 +149,36 @@ async fn a_second_prompt_cannot_join_the_running_turn() {
     let _ = tokio::time::timeout(Duration::from_secs(5), first).await;
     assert!(session.was_cancelled());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewind_is_refused_while_a_turn_is_running() {
+    // Rewinding rolls back the event DAG *and* rewrites the working tree.
+    // Underneath a live turn that means the model's next tool call lands on
+    // files that moved and its events attach to a branch sealed while it was
+    // thinking. ACP exposes `session/rewind` directly, so nothing but this
+    // stopped it.
+    let state = tempfile::tempdir().unwrap();
+    let (session, _ws) = stalled_session(&state).await;
+
+    let running = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.prompt_turn(&[ContentBlock::text("go")]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(session.is_busy());
+
+    let refused = session.rewind(1).await;
+    assert!(refused.is_err(), "a rewind ran underneath a live turn");
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("stop the current turn"),
+        "the refusal should say what to do about it"
+    );
+
+    session.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    // And it works again once the turn is over.
+    assert!(session.rewind(1).await.is_ok());
+}

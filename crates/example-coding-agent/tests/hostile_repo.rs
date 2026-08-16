@@ -397,118 +397,6 @@ async fn a_confined_command_can_still_do_its_job_in_the_workspace() {
 // ── the verify capability ─────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn verify_runs_the_projects_tests_and_refuses_anything_else() {
-    // Subagents are told to verify their work and could not: with nobody to
-    // approve a shell command, `bash` is always denied. This is the narrow
-    // capability that closes that without handing an unsupervised agent
-    // arbitrary execution.
-    let repo = tempfile::tempdir().unwrap();
-    let ws = Arc::new(Workspace::open(repo.path()).unwrap());
-    let tool = tools::Verify {
-        ws,
-        containment: tools::ShellContainment::Confined,
-        container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
-    };
-
-    // Not on the list.
-    for command in [
-        json!(["curl", "https://example.com"]),
-        json!(["bash", "-c", "echo hi"]),
-        json!(["rm", "-rf", "/"]),
-        json!(["cargo", "publish"]),
-    ] {
-        let err = tool
-            .execute(json!({ "command": command }))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("not something verify will run"),
-            "{command}: {err}"
-        );
-    }
-
-    // There is no shell, so a chained command is just a nonsense argument
-    // rather than two commands.
-    let err = tool
-        .execute(json!({ "command": ["cargo test; rm -rf /"] }))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("not something verify"), "{err}");
-
-    // And a real one runs.
-    let out = tool
-        .execute(json!({ "command": ["make", "test"], "timeout_secs": 30 }))
-        .await;
-    // No Makefile here, so it fails — the point is that it was *allowed* to
-    // try, and reported the failure rather than refusing.
-    match out {
-        Ok(result) => assert_eq!(result["passed"], false, "{result}"),
-        Err(e) => assert!(
-            e.to_string().contains("could not run"),
-            "it should have been permitted: {e}"
-        ),
-    }
-}
-
-#[tokio::test]
-async fn verify_states_how_it_ran() {
-    // It used to report `containment: null` — the field was set at every call
-    // site and read at none, so `Strict` ran unconfined and the result said
-    // nothing about how it had run.
-    let repo = tempfile::tempdir().unwrap();
-    let ws = Arc::new(Workspace::open(repo.path()).unwrap());
-
-    let out = (tools::Verify {
-        ws,
-        containment: tools::ShellContainment::Confined,
-        container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
-    })
-    .execute(json!({ "command": ["make", "test"], "timeout_secs": 30 }))
-    .await;
-
-    if let Ok(result) = out {
-        let stated = result["containment"].as_str().unwrap_or_default();
-        assert!(
-            !stated.is_empty(),
-            "the result must say how it ran: {result}"
-        );
-        assert!(stated.contains("scrubbed"), "{result}");
-        assert_eq!(
-            stated.contains("NOT confined"),
-            !eventage_code::shell_sandbox::available(),
-            "the claim must match what the kernel actually offers: {result}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn strict_verify_refuses_rather_than_running_unconfined() {
-    let repo = tempfile::tempdir().unwrap();
-    let ws = Arc::new(Workspace::open(repo.path()).unwrap());
-
-    let out = (tools::Verify {
-        ws,
-        containment: tools::ShellContainment::Strict,
-        container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
-    })
-    .execute(json!({ "command": ["cargo", "check"] }))
-    .await;
-
-    if eventage_code::shell_sandbox::available() {
-        // Confinement is possible, so it should have been attempted.
-        assert!(
-            out.is_ok() || format!("{out:?}").contains("could not run"),
-            "{out:?}"
-        );
-    } else {
-        let err = out.unwrap_err().to_string();
-        assert!(err.contains("refusing to run"), "{err}");
-    }
-}
-
-#[tokio::test]
 async fn container_containment_says_what_it_needs_when_docker_is_absent() {
     // The one containment that is a boundary rather than a seatbelt — and the
     // one with a dependency outside the process. When that dependency is
@@ -652,4 +540,30 @@ async fn an_invalid_grep_filter_is_reported_rather_than_ignored() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("invalid 'glob' filter"), "{err}");
+}
+
+#[test]
+fn plan_mode_does_not_run_the_repositorys_code() {
+    // Plan mode's own description says "no edits or commands". There used to
+    // be a second execution path — `verify` — on the read-only list, so it was
+    // automatically permitted here, and `cargo test` runs `build.rs`,
+    // `npm run` runs whatever the package names, `pytest` imports
+    // `conftest.py`. A mode that promises to run nothing and then runs the
+    // repository's test suite is lying to whoever chose it.
+    use eventage_code::config::PermissionMode;
+
+    // There is one execution path now, and it is not read-only.
+    assert!(!PermissionMode::READ_ONLY_TOOLS.contains(&"bash"));
+    assert!(PermissionMode::RISKY_TOOLS.contains(&"bash"));
+    for tool in PermissionMode::READ_ONLY_TOOLS {
+        assert!(
+            !["verify", "shell", "run", "exec"].contains(tool),
+            "'{tool}' is automatically permitted and can execute code"
+        );
+    }
+
+    // The promise the label makes, checked against the list it is built from.
+    assert!(PermissionMode::Plan
+        .description()
+        .contains("no edits or commands"));
 }

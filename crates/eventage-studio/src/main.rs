@@ -20,7 +20,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use eventage_code::config::ModelConfig;
-use eventage_studio::backend::{acp::AcpBackend, local::LocalBackend, Backend};
+use eventage_studio::backend::{
+    acp::AcpBackend, cowork::CoworkBackend, local::LocalBackend, Backend,
+};
 use eventage_studio::server;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -38,6 +40,22 @@ struct Cli {
     /// `--acp eventage-code`.
     #[arg(long, num_args = 1.., value_name = "COMMAND")]
     acp: Option<Vec<String>>,
+
+    /// Run cowork instead of the coding agent.
+    ///
+    /// A goal is split into workstreams that run against independent copies
+    /// of the folder; you compare what they produced and keep one. Nothing is
+    /// written to the folder until you do.
+    #[arg(long)]
+    cowork: bool,
+
+    /// Cowork: how many workstreams may run at once.
+    #[arg(long, default_value_t = 3)]
+    parallel: usize,
+
+    /// Cowork: how many workstreams a goal may be split into.
+    #[arg(long, default_value_t = 5)]
+    split: usize,
 
     /// Workspace to open. Defaults to the current directory.
     #[arg(long)]
@@ -57,14 +75,14 @@ struct Cli {
     no_open: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Before anything else, including argument parsing: a process started
-    // with the sandbox marker is not really this program, it is a trampoline
-    // that confines itself and execs the real command. Never returns when it
-    // matches.
-    eventage_code::shell_sandbox::run_if_helper();
-
+/// Everything that touches the process environment, before the runtime exists.
+///
+/// `set_var` and `remove_var` are unsafe on Unix because another thread
+/// calling `getenv` concurrently is undefined behaviour, and `#[tokio::main]`
+/// has already built the runtime's worker threads by the time the async body
+/// starts. Doing the settings block and the credential scrub here means the
+/// process really is single-threaded while it happens.
+fn prologue() -> Result<(Cli, String, ModelConfig)> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -95,7 +113,7 @@ async fn main() -> Result<()> {
         // Names only. Several of these are credentials.
         tracing::info!(vars = ?env.applied, "applied .claude/settings.json");
     }
-    let model_choice = cli.model.or(settings.model);
+    let model_choice = cli.model.clone().or(settings.model);
 
     // Resolved before the credentials are taken out of the environment;
     // everything downstream reads them from the config, not from `getenv`.
@@ -113,9 +131,32 @@ async fn main() -> Result<()> {
         );
     }
 
-    let backend: Arc<dyn Backend> = match cli.acp {
-        Some(command) => Arc::new(AcpBackend::new(command, cwd.clone())?),
-        None => Arc::new(LocalBackend::new(model, cwd.clone()).await),
+    Ok((cli, cwd, model))
+}
+
+fn main() -> Result<()> {
+    // Before anything else, including argument parsing: a process started
+    // with the sandbox marker is not really this program, it is a trampoline
+    // that confines itself and execs the real command. Never returns when it
+    // matches.
+    eventage_code::shell_sandbox::run_if_helper();
+
+    let (cli, cwd, model) = prologue()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli, cwd, model))
+}
+
+async fn run(cli: Cli, cwd: String, model: ModelConfig) -> Result<()> {
+    let backend: Arc<dyn Backend> = match (cli.acp.clone(), cli.cowork) {
+        (Some(command), _) => Arc::new(AcpBackend::new(command, cwd.clone())?),
+        // Cowork over the same folder: a goal fans into workstreams that each
+        // work in a private copy, and nothing lands until one is kept.
+        (None, true) => {
+            Arc::new(CoworkBackend::new(model, cwd.clone()).with_limits(cli.parallel, cli.split))
+        }
+        (None, false) => Arc::new(LocalBackend::new(model, cwd.clone()).await),
     };
 
     let info = backend.info();

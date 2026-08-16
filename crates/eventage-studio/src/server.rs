@@ -135,6 +135,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/mode", post(set_mode))
         .route("/sessions/:id/rewind", post(rewind))
         .route("/sessions/:id/permission", post(permission))
+        .route("/sessions/:id/adopt", post(adopt))
+        .route("/sessions/:id/seal", post(seal))
         .route("/sessions/:id/summary", post(override_summary))
         .route("/sessions/:id/branch", post(branch))
         .route("/stored/:id", delete(forget_session))
@@ -383,6 +385,57 @@ async fn set_mode(
     Json(req): Json<ModeRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.session(&id).await?.set_mode(&req.mode).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct WorkstreamRequest {
+    workstream_id: String,
+    /// Why it is being abandoned. Required to seal, ignored to adopt.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Adopt even where the folder has changed under the workstream.
+    ///
+    /// Defaults to false, so the first attempt always reports conflicts
+    /// rather than resolving them by overwriting.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Apply one workstream's result to the folder.
+async fn adopt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<WorkstreamRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let outcome = state
+        .session(&id)
+        .await?
+        .adopt(&req.workstream_id, req.force)
+        .await?;
+    Ok(Json(serde_json::json!(outcome)))
+}
+
+/// Abandon one workstream, recording why.
+async fn seal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<WorkstreamRequest>,
+) -> Result<StatusCode, ApiError> {
+    // The reason is the point: an epitaph with nothing in it teaches a later
+    // attempt nothing, and this is the one field the UI must not skip.
+    let why = req.reason.unwrap_or_default();
+    if why.trim().is_empty() {
+        return Err(ApiError::from(anyhow::anyhow!(
+            "say why this workstream is being abandoned — the reason is what a later \
+             attempt reads back"
+        )));
+    }
+    state
+        .session(&id)
+        .await?
+        .seal(&req.workstream_id, &why)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

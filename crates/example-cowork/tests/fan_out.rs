@@ -125,3 +125,123 @@ async fn reverting_puts_the_folder_back_after_an_adoption() {
     );
     assert!(!folder.path().join("extra.md").exists());
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn adopting_cannot_write_through_a_planted_symlink() {
+    // The escape: a tracked file in the live folder is replaced by a symlink
+    // after the base snapshot is taken. An ambient `folder.join(path)` write
+    // follows it, so adopting a workstream — or reverting a session — puts
+    // content wherever the link points. Both paths now go through the
+    // workspace capability handle, which replaces a link rather than writing
+    // through it.
+    use cowork::shadow::Shadow;
+
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("notes.md"), "original\n").unwrap();
+
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let victim = outside.join("victim.txt");
+    std::fs::write(&victim, "do not touch\n").unwrap();
+
+    let Ok((shadow, _)) = Shadow::open(dir.path().join("shadow.git"), &folder).await else {
+        return; // no git on this machine
+    };
+    let base = shadow.snapshot("base").await.unwrap();
+
+    // A workstream edits the file in its own copy.
+    let ws = dir.path().join("ws");
+    shadow.worktree(&ws, &base).await.unwrap();
+    std::fs::write(ws.join("notes.md"), "the workstream's version\n").unwrap();
+    let result = shadow.snapshot_tree(&ws, "ws").await.unwrap();
+
+    // Meanwhile the live file becomes a link pointing out of the folder.
+    std::fs::remove_file(folder.join("notes.md")).unwrap();
+    std::os::unix::fs::symlink(&victim, folder.join("notes.md")).unwrap();
+
+    let _ = shadow.adopt(&result, &base).await;
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "do not touch\n",
+        "adoption wrote through a symlink and clobbered a file outside the folder"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_from_the_channel_actually_runs() {
+    // The HTTP endpoint published a `user.message` that nothing consumed, so
+    // it answered "accepted" and dropped the goal; the scheduler did the same
+    // with its firing. Both now publish one request kind, and one consumer
+    // runs it — so a goal from a phone, a cron entry, or the command line all
+    // take the same path.
+    use eventage::Event;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let plan = r#"[{"title":"only","brief":"do the thing"}]"#;
+    let Some((_folder, _state, session)) = session(vec![plan, "did the thing"]).await else {
+        return;
+    };
+    let session = Arc::new(session);
+
+    let mut watching = session.bus.subscribe();
+    let requests = tokio::spawn(Arc::clone(&session).serve_requests());
+
+    session
+        .bus
+        .publish(Event::new(
+            cowork::kinds::GOAL_REQUESTED,
+            json!({ "goal": "tidy the notes", "source": "http" }),
+        ))
+        .await
+        .unwrap();
+
+    // The run is what proves it: a plan was proposed for the goal we sent.
+    let proposed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let event = watching.recv().await.expect("the bus stayed open");
+            if event.kind == cowork::kinds::PLAN_PROPOSED {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("the requested goal was never run");
+
+    assert_eq!(proposed.payload["goal"], "tidy the notes");
+    assert_eq!(session.workstreams().await.len(), 1);
+    requests.abort();
+}
+
+#[tokio::test]
+async fn a_request_with_no_goal_is_ignored_rather_than_run() {
+    use eventage::Event;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let Some((_folder, _state, session)) = session(vec!["[]"]).await else {
+        return;
+    };
+    let session = Arc::new(session);
+    let requests = tokio::spawn(Arc::clone(&session).serve_requests());
+
+    session
+        .bus
+        .publish(Event::new(
+            cowork::kinds::GOAL_REQUESTED,
+            json!({ "goal": "   ", "source": "http" }),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        session.workstreams().await.is_empty(),
+        "an empty goal started a session's worth of work"
+    );
+    requests.abort();
+}

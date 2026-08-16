@@ -30,6 +30,13 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
+/// How long any one shadow command may take.
+///
+/// A snapshot runs on every turn, so its cost is constant while a rewind is
+/// occasional. Without a bound a large folder could stall a session before it
+/// began.
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How deep to look for nested repositories, and how many to tolerate.
 ///
 /// A bound rather than an unbounded walk: `open` runs on every session start,
@@ -49,6 +56,15 @@ const ALWAYS_EXCLUDED: &[&str] = &[
     ".DS_Store",
     ".cowork/",
 ];
+
+/// What to do to one path in the live folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// Write the blob from the named commit.
+    Write,
+    /// Take it out of the folder.
+    Remove,
+}
 
 /// A git repository that tracks a folder from outside it.
 pub struct Shadow {
@@ -87,6 +103,31 @@ impl ChangeStatus {
             Self::Deleted => "deleted",
         }
     }
+}
+
+/// One path both a workstream and the live folder changed since the base.
+///
+/// Detected per *path*, not per hunk. A content-level three-way merge is the
+/// right answer for source code and the wrong one here: this folder holds
+/// spreadsheets, decks and images, and writing `<<<<<<<` into an `.xlsx` is
+/// corruption rather than a merge. Overlap at the file level is something a
+/// person can resolve; a half-merged binary is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub path: String,
+    /// What the workstream did to it.
+    pub workstream: ChangeStatus,
+    /// What happened to it in the folder meanwhile.
+    pub live: ChangeStatus,
+}
+
+/// The outcome of adopting a workstream's result.
+#[derive(Debug, Clone, Default)]
+pub struct Adoption {
+    /// What was written into the folder. Empty when anything conflicted.
+    pub applied: Vec<FileChange>,
+    /// Paths changed on both sides since the base snapshot.
+    pub conflicts: Vec<Conflict>,
 }
 
 /// What [`Shadow::open`] decided not to track.
@@ -159,9 +200,14 @@ impl Shadow {
             .args(args)
             .env_clear()
             .envs(eventage_code::tools::scrubbed_env())
-            // The folder may contain a repository whose config would
-            // otherwise be consulted, and it is not ours.
+            .kill_on_drop(true)
+            // Neither system nor user configuration applies. Both can define
+            // `core.fsmonitor` and clean filters — programs git runs on our
+            // behalf, chosen by someone who is not the operator. The shadow's
+            // own config is ours, so nothing here is the folder's to set.
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_AUTHOR_NAME", "cowork")
             .env("GIT_AUTHOR_EMAIL", "cowork@localhost")
             .env("GIT_COMMITTER_NAME", "cowork")
@@ -172,9 +218,15 @@ impl Shadow {
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
-        let out = cmd
-            .output()
+        let out = tokio::time::timeout(SNAPSHOT_TIMEOUT, cmd.output())
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "git {} did not finish within {}s",
+                    args.join(" "),
+                    SNAPSHOT_TIMEOUT.as_secs()
+                )
+            })?
             .with_context(|| format!("could not run git {}", args.join(" ")))?;
         if !out.status.success() {
             bail!(
@@ -328,47 +380,133 @@ impl Shadow {
     pub async fn restore(&self, to: &str) -> Result<Vec<FileChange>> {
         let now = self.snapshot("restore-point").await?;
         let changes = self.diff(to, &now).await?;
-        for change in &changes {
-            let full = self.folder.join(&change.path);
-            match change.status {
-                // Present now, absent in the target: created since.
-                ChangeStatus::Added => {
-                    let _ = tokio::fs::remove_file(&full).await;
+        let ops: Vec<(String, Op)> = changes
+            .iter()
+            .map(|c| {
+                let op = match c.status {
+                    // Present now, absent in the target: created since.
+                    ChangeStatus::Added => Op::Remove,
+                    ChangeStatus::Modified | ChangeStatus::Deleted => Op::Write,
+                };
+                (c.path.clone(), op)
+            })
+            .collect();
+        self.apply(to, &ops).await?;
+        Ok(changes)
+    }
+
+    /// Write a change set into the folder through the capability handle.
+    ///
+    /// Never `folder.join(path)` with ambient `tokio::fs`. A file in the live
+    /// folder can be replaced by a symlink between the snapshot and the
+    /// write, and an ambient write follows it — so adopting a workstream, or
+    /// reverting a session, could put content anywhere on the machine the
+    /// link pointed at. The handle resolves beneath the folder and replaces a
+    /// link rather than writing through it.
+    ///
+    /// Takes explicit operations rather than a diff. Restoring and adopting
+    /// read the same `ChangeStatus` in opposite directions — for a restore
+    /// `Added` means "created since, remove it", for an adoption it means
+    /// "the workstream made it, write it" — and folding both onto one status
+    /// enum got adoption exactly backwards. The direction is the caller's to
+    /// state.
+    async fn apply(&self, from: &str, ops: &[(String, Op)]) -> Result<()> {
+        let ws = eventage_code::workspace::Workspace::open(&self.folder)
+            .with_context(|| format!("cannot open '{}' to write into", self.folder.display()))?;
+        for (path, op) in ops {
+            match op {
+                Op::Remove => {
+                    let _ = ws.remove_file(path).await;
                 }
-                ChangeStatus::Modified | ChangeStatus::Deleted => {
-                    let blob = self.show(to, &change.path).await?;
-                    if let Some(parent) = full.parent() {
-                        tokio::fs::create_dir_all(parent).await.ok();
-                    }
-                    tokio::fs::write(&full, blob).await?;
+                Op::Write => {
+                    let blob = self.show(from, path).await?;
+                    ws.write(path, blob).await?;
                 }
             }
         }
-        Ok(changes)
+        Ok(())
     }
 
     /// Apply one workstream's result to the folder.
     ///
     /// The workstream worked in its own checkout; this brings its changes
     /// across, and reports them so the caller can show what landed.
-    pub async fn adopt(&self, workstream_commit: &str, base: &str) -> Result<Vec<FileChange>> {
+    /// Apply a workstream's result, refusing if the folder moved underneath it.
+    ///
+    /// Three-way, against the base every workstream branched from: what the
+    /// workstream changed, and what changed in the live folder since. A path
+    /// in both sets is a conflict, and the adoption applies **nothing** —
+    /// partial application would leave the folder in a state neither side
+    /// asked for, and is the harder thing to undo.
+    ///
+    /// Without this it was last-writer-wins: a workstream finished, the user
+    /// edited a file it had also touched, and adopting silently discarded the
+    /// user's edit with nothing said.
+    pub async fn adopt(&self, workstream_commit: &str, base: &str) -> Result<Adoption> {
+        self.adopt_with(workstream_commit, base, false).await
+    }
+
+    /// Apply a workstream's result even where the folder has moved on.
+    ///
+    /// For when the user has looked at the conflicts and wants the
+    /// workstream's version anyway. Separate method rather than a flag so it
+    /// cannot be reached by accident.
+    pub async fn adopt_overriding(&self, workstream_commit: &str, base: &str) -> Result<Adoption> {
+        self.adopt_with(workstream_commit, base, true).await
+    }
+
+    async fn adopt_with(
+        &self,
+        workstream_commit: &str,
+        base: &str,
+        override_conflicts: bool,
+    ) -> Result<Adoption> {
         let changes = self.diff(base, workstream_commit).await?;
-        for change in &changes {
-            let full = self.folder.join(&change.path);
-            match change.status {
-                ChangeStatus::Deleted => {
-                    let _ = tokio::fs::remove_file(&full).await;
-                }
-                ChangeStatus::Added | ChangeStatus::Modified => {
-                    let blob = self.show(workstream_commit, &change.path).await?;
-                    if let Some(parent) = full.parent() {
-                        tokio::fs::create_dir_all(parent).await.ok();
-                    }
-                    tokio::fs::write(&full, blob).await?;
-                }
-            }
+
+        // What the folder itself has done since the base. Snapshotting it is
+        // how "the live state" becomes comparable at all — the folder is not
+        // a commit until it is made one.
+        let live_now = self.snapshot("live").await?;
+        let live_changes = self.diff(base, &live_now).await?;
+
+        let conflicts: Vec<Conflict> = changes
+            .iter()
+            .filter_map(|theirs| {
+                live_changes
+                    .iter()
+                    .find(|ours| ours.path == theirs.path)
+                    .map(|ours| Conflict {
+                        path: theirs.path.clone(),
+                        workstream: theirs.status,
+                        live: ours.status,
+                    })
+            })
+            .collect();
+
+        if !conflicts.is_empty() && !override_conflicts {
+            return Ok(Adoption {
+                applied: Vec::new(),
+                conflicts,
+            });
         }
-        Ok(changes)
+
+        let ops: Vec<(String, Op)> = changes
+            .iter()
+            .map(|c| {
+                let op = match c.status {
+                    // The workstream made or changed it: bring it across.
+                    ChangeStatus::Added | ChangeStatus::Modified => Op::Write,
+                    // The workstream removed it: remove it here too.
+                    ChangeStatus::Deleted => Op::Remove,
+                };
+                (c.path.clone(), op)
+            })
+            .collect();
+        self.apply(workstream_commit, &ops).await?;
+        Ok(Adoption {
+            applied: changes,
+            conflicts,
+        })
     }
 }
 
@@ -572,7 +710,8 @@ mod tests {
 
         // Keeping B's result brings exactly its changes into the folder.
         let landed = shadow.adopt(&commit_b, &base).await.unwrap();
-        assert_eq!(landed.len(), 2);
+        assert!(landed.conflicts.is_empty(), "{:?}", landed.conflicts);
+        assert_eq!(landed.applied.len(), 2);
         assert_eq!(
             std::fs::read_to_string(shadow.folder().join("report.txt")).unwrap(),
             "B rewrote this\n"
@@ -581,6 +720,112 @@ mod tests {
 
         shadow.remove_worktree(&a).await.unwrap();
         shadow.remove_worktree(&b).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_users_edit_is_not_silently_discarded_by_an_adoption() {
+        // The failure this closes: a workstream finishes, the user edits a
+        // file it also touched, and adopting overwrites their work with
+        // nothing said. Last-writer-wins is the wrong default when one of the
+        // writers is a person who was not asked.
+        let Some((dir, shadow, _)) = folder().await else {
+            return;
+        };
+        let base = shadow.snapshot("base").await.unwrap();
+
+        let ws = dir.path().join("ws");
+        shadow.worktree(&ws, &base).await.unwrap();
+        std::fs::write(ws.join("report.txt"), "the workstream's version\n").unwrap();
+        std::fs::write(ws.join("new.md"), "and something new\n").unwrap();
+        let result = shadow.snapshot_tree(&ws, "ws").await.unwrap();
+
+        // Meanwhile, the person whose folder this is edits the same file.
+        std::fs::write(shadow.folder().join("report.txt"), "MY OWN EDIT\n").unwrap();
+
+        let outcome = shadow.adopt(&result, &base).await.unwrap();
+
+        assert_eq!(outcome.conflicts.len(), 1, "{:?}", outcome.conflicts);
+        assert_eq!(outcome.conflicts[0].path, "report.txt");
+        assert_eq!(outcome.conflicts[0].workstream, ChangeStatus::Modified);
+        assert_eq!(outcome.conflicts[0].live, ChangeStatus::Modified);
+
+        // Nothing was applied — not even the file that did not conflict.
+        // Partial application leaves the folder in a state neither side asked
+        // for, and is the harder thing to undo.
+        assert!(outcome.applied.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(shadow.folder().join("report.txt")).unwrap(),
+            "MY OWN EDIT\n"
+        );
+        assert!(!shadow.folder().join("new.md").exists());
+
+        // Having seen the conflict, the user can still take the workstream's
+        // version deliberately.
+        let forced = shadow.adopt_overriding(&result, &base).await.unwrap();
+        assert_eq!(forced.applied.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(shadow.folder().join("report.txt")).unwrap(),
+            "the workstream's version\n"
+        );
+        shadow.remove_worktree(&ws).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_edit_is_not_a_conflict() {
+        // Conflicts are per path. Editing a file the workstream never touched
+        // must not block the adoption, or the check would be useless in any
+        // folder somebody is actually working in.
+        let Some((dir, shadow, _)) = folder().await else {
+            return;
+        };
+        let base = shadow.snapshot("base").await.unwrap();
+
+        let ws = dir.path().join("ws");
+        shadow.worktree(&ws, &base).await.unwrap();
+        std::fs::write(ws.join("report.txt"), "rewritten\n").unwrap();
+        let result = shadow.snapshot_tree(&ws, "ws").await.unwrap();
+
+        // A different file entirely.
+        std::fs::write(shadow.folder().join("sub/data.csv"), "a,b\n9,9\n").unwrap();
+
+        let outcome = shadow.adopt(&result, &base).await.unwrap();
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+        assert_eq!(outcome.applied.len(), 1);
+        // Both survive: theirs applied, ours untouched.
+        assert_eq!(
+            std::fs::read_to_string(shadow.folder().join("report.txt")).unwrap(),
+            "rewritten\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(shadow.folder().join("sub/data.csv")).unwrap(),
+            "a,b\n9,9\n"
+        );
+        shadow.remove_worktree(&ws).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deletion_on_either_side_still_counts_as_a_conflict() {
+        // Deleting a file the workstream rewrote is as much a decision as
+        // editing it, and the reverse likewise.
+        let Some((dir, shadow, _)) = folder().await else {
+            return;
+        };
+        let base = shadow.snapshot("base").await.unwrap();
+
+        let ws = dir.path().join("ws");
+        shadow.worktree(&ws, &base).await.unwrap();
+        std::fs::write(ws.join("report.txt"), "rewritten by the stream\n").unwrap();
+        let result = shadow.snapshot_tree(&ws, "ws").await.unwrap();
+
+        // The user decided they did not want the file at all.
+        std::fs::remove_file(shadow.folder().join("report.txt")).unwrap();
+
+        let outcome = shadow.adopt(&result, &base).await.unwrap();
+        assert_eq!(outcome.conflicts.len(), 1, "{:?}", outcome.conflicts);
+        assert_eq!(outcome.conflicts[0].live, ChangeStatus::Deleted);
+        assert!(outcome.applied.is_empty());
+        assert!(!shadow.folder().join("report.txt").exists());
+        shadow.remove_worktree(&ws).await.unwrap();
     }
 
     #[tokio::test]

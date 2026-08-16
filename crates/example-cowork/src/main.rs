@@ -67,22 +67,58 @@ struct Cli {
     /// The model to use.
     #[arg(long)]
     model: Option<String>,
+
+    /// Reopen a session by id, with its workstreams intact.
+    ///
+    /// The results of a previous run are still in its shadow repository, so a
+    /// session interrupted halfway can be picked up rather than restarted.
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Everything that touches the process environment, before the runtime exists.
+///
+/// `set_var` and `remove_var` are unsafe on Unix because another thread
+/// calling `getenv` concurrently is undefined behaviour. `#[tokio::main]`
+/// builds the runtime — and its worker threads — before the first line of the
+/// async body, so doing this there was exactly what the rule forbids.
+fn prologue() -> Result<(Cli, ModelConfig)> {
+    let cli = Cli::parse();
+    let folder = match &cli.folder {
+        Some(f) => std::path::PathBuf::from(f),
+        None => std::env::current_dir()?,
+    };
+    let settings = eventage_code::settings::ClaudeSettings::load(&folder);
+    let _ = settings.apply_env();
+    let model = ModelConfig::from_env(cli.model.clone().or(settings.model));
+    let _ = eventage_code::secrets::capture_and_scrub();
+    Ok((cli, model))
+}
+
+fn main() -> Result<()> {
     // Before anything parses arguments: a confined command re-executes this
     // binary's sibling trampoline, and the check has to come first.
     eventage_code::shell_sandbox::run_if_helper();
 
+    let (cli, model) = prologue()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli, model))
+}
+
+async fn run(cli: Cli, model: ModelConfig) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "cowork=info".into()))
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     let goal = cli.goal.join(" ");
-    if goal.trim().is_empty() {
+    // A goal is required to start, but not to reopen: the point of reopening
+    // is usually to look at what a previous run produced and keep or abandon
+    // one of its results. Demanding a goal meant every resume immediately ran
+    // something new and replaced what had just been reopened.
+    if goal.trim().is_empty() && cli.resume.is_none() {
         anyhow::bail!("say what to work on, e.g. cowork \"summarise the Q3 notes\"");
     }
 
@@ -90,13 +126,6 @@ async fn main() -> Result<()> {
         Some(f) => std::path::PathBuf::from(f),
         None => std::env::current_dir()?,
     };
-
-    let settings = eventage_code::settings::ClaudeSettings::load(&folder);
-    let _ = settings.apply_env();
-    let model = ModelConfig::from_env(cli.model.or(settings.model));
-    // Everything that reads a credential has run; take them out of the
-    // environment, where any process of this user could read them.
-    let _ = eventage_code::secrets::capture_and_scrub();
 
     let steering = Steering::from_id(&cli.steering).with_context(|| {
         format!(
@@ -113,11 +142,26 @@ async fn main() -> Result<()> {
     config.token_budget = cli.budget;
 
     let llm = eventage_code::agent::provider_for(&model);
-    let session = Arc::new(
-        CoworkSession::open(uuid::Uuid::new_v4().to_string(), llm, config)
+    let session = Arc::new(match &cli.resume {
+        Some(id) => CoworkSession::resume(id.clone(), llm, config)
+            .await
+            .with_context(|| format!("could not reopen session {id}"))?,
+        None => CoworkSession::open(uuid::Uuid::new_v4().to_string(), llm, config)
             .await
             .context("could not open the session")?,
-    );
+    });
+    println!("session:  {}", session.id);
+
+    // What a reopened session already knows.
+    let existing = session.workstreams().await;
+    if !existing.is_empty() {
+        println!("reopened with {} workstream(s) from before", existing.len());
+    }
+
+    // Goals arriving from anywhere but this command line — the HTTP channel,
+    // an automation — are run by this. Without it those surfaces accepted
+    // requests and dropped them.
+    let requests = tokio::spawn(Arc::clone(&session).serve_requests());
 
     if let Some(port) = cli.port {
         let token = uuid::Uuid::new_v4().to_string();
@@ -128,9 +172,18 @@ async fn main() -> Result<()> {
 
     println!("folder:   {}", folder.display());
     println!("steering: {} — {}", steering.id(), steering.describe());
-    println!("goal:     {goal}\n");
 
-    let streams = session.run(&goal).await?;
+    let streams = match goal.trim().is_empty() {
+        // Reopened with nothing new to do: show what is there and stop.
+        true => {
+            println!("goal:     (reopened; nothing new asked for)\n");
+            existing
+        }
+        false => {
+            println!("goal:     {goal}\n");
+            session.run(&goal).await?
+        }
+    };
 
     println!("\n── workstreams ──");
     for stream in &streams {
@@ -171,16 +224,49 @@ async fn main() -> Result<()> {
             match best {
                 None => println!("\nNo workstream produced anything to adopt."),
                 Some(stream) => {
-                    let changes = session.adopt(&stream.id).await?;
-                    println!(
-                        "\nAdopted '{}': {} file(s) written to your folder.",
-                        stream.title,
-                        changes.len()
-                    );
+                    let outcome = session.adopt(&stream.id).await?;
+                    match outcome.conflicts.is_empty() {
+                        true => println!(
+                            "\nAdopted '{}': {} file(s) written to your folder.",
+                            stream.title,
+                            outcome.applied.len()
+                        ),
+                        // Nothing was written. Naming the files is the whole
+                        // point: the user has two versions and has to choose.
+                        false => {
+                            println!(
+                                "\nNot adopted — '{}' and your folder both changed these \
+                                 since the session started:",
+                                stream.title
+                            );
+                            for conflict in &outcome.conflicts {
+                                println!(
+                                    "    {}  (workstream {}, yours {})",
+                                    conflict.path,
+                                    conflict.workstream.as_str(),
+                                    conflict.live.as_str()
+                                );
+                            }
+                            println!(
+                                "\nYour folder is untouched. Move or keep your versions, \
+                                 then adopt again."
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 
+    requests.abort();
+    // The log is flushed before the process says it is done; without this the
+    // last events — the ones a resume needs — are dropped with the task.
+    let failures = session.close().await;
+    if failures > 0 {
+        eprintln!(
+            "warning: {failures} event(s) never reached the log; this session will \
+                   reopen incomplete"
+        );
+    }
     Ok(())
 }

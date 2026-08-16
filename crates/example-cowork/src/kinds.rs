@@ -9,6 +9,14 @@
 /// The task the user described. Payload: `{ goal }`.
 pub const GOAL_SET: &str = "cowork.goal.set";
 
+/// Somebody asked for work to start. Payload: `{ goal, source }`.
+///
+/// Distinct from [`GOAL_SET`], which records that a run *began*. This is the
+/// request, and it is what the HTTP channel and the scheduler publish — so a
+/// goal arriving from a phone and one arriving from a cron entry take exactly
+/// the same path as one typed into Studio.
+pub const GOAL_REQUESTED: &str = "cowork.goal.requested";
+
 /// How the goal was split. Payload: `{ workstreams: [{ id, title, brief }] }`.
 pub const PLAN_PROPOSED: &str = "cowork.plan.proposed";
 
@@ -18,11 +26,25 @@ pub const WORKSTREAM_STARTED: &str = "cowork.workstream.started";
 /// A workstream finished. Payload: `{ id, report, commit, changes }`.
 pub const WORKSTREAM_FINISHED: &str = "cowork.workstream.finished";
 
+/// A workstream could not finish. Payload: `{ id, title, error }`.
+///
+/// Published rather than only logged, because a resumed session has to know
+/// that a stream was attempted and failed — otherwise it comes back looking
+/// as though it never ran.
+pub const WORKSTREAM_FAILED: &str = "cowork.workstream.failed";
+
 /// A workstream was abandoned. Payload: `{ id, epitaph }`.
 ///
 /// Sealed rather than deleted: its trajectory stays in the DAG as a rejected
 /// branch, and the coordinator reads it back as something already tried.
 pub const WORKSTREAM_SEALED: &str = "cowork.workstream.sealed";
+
+/// An adoption was refused because the folder moved. Payload:
+/// `{ id, title, conflicts: [{ path, workstream, live }] }`.
+///
+/// A refusal is a fact about the session, not an error to be swallowed: the
+/// user has two versions of the same files and has to choose.
+pub const ADOPTION_BLOCKED: &str = "cowork.adoption.blocked";
 
 /// A workstream's result was applied to the folder. Payload: `{ id, changes }`.
 pub const ADOPTED: &str = "cowork.adopted";

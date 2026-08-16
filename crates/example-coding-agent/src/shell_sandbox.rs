@@ -18,28 +18,33 @@
 //! the same: it is the only way to get a real ruleset installed without
 //! doing forbidden work in a forked child.
 //!
-//! What it buys depends on the [`Reads`] policy, and the difference matters:
+//! What it buys depends on the [`Reads`] policy. There are two, and the line
+//! between them is deliberately stark:
 //!
-//! * [`Reads::ExceptSecrets`] — reads everything **except** a named list of
-//!   credential stores: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.npmrc`,
-//!   `~/.git-credentials`, `~/.config/gh` and their neighbours.
-//!
-//!   Landlock has no deny rules — you can only grant — so "everything except"
-//!   is built by granting siblings: every entry of `/` but `/home`, then
-//!   every entry of `$HOME` but the denied ones, and so on down to each
-//!   denied path. It costs a directory listing at startup and it keeps every
-//!   toolchain working, because toolchains live in unpredictable places under
-//!   `$HOME` and a policy that guesses wrong makes `node` or `cargo` vanish.
-//!
-//!   It fails closed in a useful way: because `$HOME` itself is never
-//!   granted, a directory created there *after* the ruleset is built is
-//!   unreadable rather than quietly allowed.
+//! * [`Reads::Everywhere`] — **writes** are confined to the workspace and the
+//!   toolchain caches; reads are not confined at all. A command can still read
+//!   `~/.ssh`. This is the trade Codex's Linux sandbox makes, and the reason
+//!   is that toolchains install themselves in unpredictable places under
+//!   `$HOME`: a read policy that guesses wrong makes `node` or `cargo` vanish.
 //! * [`Reads::Workspace`] — reads narrowed to the system directories, the
 //!   toolchain locations we can name, and the workspace. Your other
 //!   repositories go too. This is what makes
 //!   [`ShellContainment::Strict`](crate::tools::ShellContainment) worth
 //!   choosing, and it is allowed to break an exotic toolchain — a repository
 //!   you do not trust is one you would rather fail loudly on.
+//!
+//! There used to be a third, in between: read everything *except* a named list
+//! of credential stores, built by granting every sibling of every secret since
+//! Landlock has no deny rules. It is gone, and the reasoning is worth keeping
+//! because the same idea will look attractive again.
+//!
+//! It was not a boundary. It enumerated `$HOME` at startup, so a directory
+//! created there afterwards became unreadable for no reason a user could
+//! predict; and `git push` needs `~/.ssh`, so it grew a carve-out that let
+//! git read exactly the secrets the policy existed to hide. A rule shaped by
+//! what happened to break is not a security property, and a middle mode
+//! invites the confidence of one without the substance. Two modes that each
+//! mean something are worth more than three where one is a story.
 //!
 //! Neither buys network isolation or resource accounting across a process
 //! tree; the network is a separate seccomp filter ([`Network`]), and nothing
@@ -168,125 +173,12 @@ fn readable_paths(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Credential stores a command has no business reading, relative to `$HOME`.
-///
-/// The list is the policy, so it is written out rather than pattern-matched:
-/// a rule like "anything starting with a dot" would take `~/.cargo` with it,
-/// and one like "anything with `key` in the name" would miss every entry
-/// here. Adding to it is cheap; each entry costs one directory listing.
-pub const HOME_SECRETS: &[&str] = &[
-    ".ssh",
-    ".aws",
-    ".gnupg",
-    ".kube",
-    ".netrc",
-    ".authinfo",
-    ".npmrc",
-    ".pypirc",
-    ".git-credentials",
-    ".docker/config.json",
-    ".config/gh",
-    ".config/gcloud",
-    ".config/op",
-    ".config/containers/auth.json",
-    ".password-store",
-    ".local/share/keyrings",
-];
-
-/// Grant everything under `base` except `deny`, by granting siblings.
-///
-/// Landlock only grants. Excluding one directory therefore means naming
-/// everything beside it: to withhold `~/.ssh` you grant every other entry of
-/// `$HOME` and never `$HOME` itself. `deny` entries may be nested
-/// (`.config/gh`), in which case the walk descends — `.config` is not granted
-/// whole, its children are, minus `gh`.
-///
-/// Paths that do not exist are skipped; a denied path that is not there costs
-/// nothing but also grants nothing extra.
-fn grant_except(base: &Path, deny: &[&str]) -> Vec<PathBuf> {
-    // Split each denied path into its first component and the rest, so the
-    // walk can decide per directory: grant it, or descend into it.
-    let mut here: Vec<&str> = Vec::new();
-    let mut deeper: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
-    for entry in deny {
-        match entry.split_once('/') {
-            None => here.push(entry),
-            Some((head, rest)) => deeper.entry(head).or_default().push(rest),
-        }
-    }
-
-    let Ok(entries) = std::fs::read_dir(base) else {
-        // Unreadable or not a directory: nothing to enumerate, and granting
-        // `base` itself would defeat the exclusion.
-        return Vec::new();
-    };
-
-    let mut granted = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            // A non-UTF-8 name cannot match a denied path, so it is granted
-            // like any other neighbour.
-            granted.push(entry.path());
-            continue;
-        };
-        if here.contains(&name) {
-            continue;
-        }
-        match deeper.get(name) {
-            None => granted.push(entry.path()),
-            Some(nested) => granted.extend(grant_except(&entry.path(), nested)),
-        }
-    }
-    granted
-}
-
-/// The credential stores git itself needs, and only git.
-///
-/// `git push` over SSH reads `~/.ssh`; over HTTPS with the `store` helper it
-/// reads `~/.git-credentials`. Denying them to the `git` tool would confine
-/// it by breaking it, which is not the same thing.
-///
-/// The exception is narrow and earned rather than convenient: the `git` tool
-/// runs a known binary with `core.hooksPath` pointed at nothing, so the one
-/// repository-controlled execution path it had is already gone. A shell
-/// command gets no such allowance, and neither does git under `Strict`.
-pub const GIT_CREDENTIALS: &[&str] = &[".ssh", ".git-credentials"];
-
-/// Everything except the credential stores, for [`Reads::ExceptSecrets`].
-fn readable_except_secrets(root: &Path, allow_git: bool) -> Vec<PathBuf> {
-    // `/home` is withheld and `$HOME` re-granted child by child below, so
-    // other users' home directories are excluded too.
-    let mut paths = grant_except(Path::new("/"), &["home", "root"]);
-
-    if let Ok(home) = std::env::var("HOME") {
-        let denied: Vec<&str> = HOME_SECRETS
-            .iter()
-            .copied()
-            .filter(|s| !allow_git || !GIT_CREDENTIALS.contains(s))
-            .collect();
-        paths.extend(grant_except(Path::new(&home), &denied));
-    }
-
-    // The workspace, in case it lives somewhere the walk did not reach.
-    paths.push(root.to_path_buf());
-    paths.extend(writable_paths(root));
-    paths.retain(|p| p.exists());
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
 /// How much of the filesystem a confined command may read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reads {
-    /// Everything but the named credential stores. Keeps every toolchain
-    /// working. See the module docs for how "except" is built.
-    ExceptSecrets,
-    /// As [`ExceptSecrets`](Self::ExceptSecrets), plus the two stores git
-    /// needs to reach a remote. For the `git` tool alone — see
-    /// [`GIT_CREDENTIALS`].
-    ExceptSecretsAllowingGit,
+    /// Unrestricted. Only writes are confined — see the module docs for why
+    /// the middle option was removed rather than narrowed.
+    Everywhere,
     /// Reads narrowed to the system, the named toolchains and the workspace.
     Workspace,
 }
@@ -294,16 +186,14 @@ pub enum Reads {
 impl Reads {
     fn token(self) -> &'static str {
         match self {
-            Reads::ExceptSecrets => "read-except-secrets",
-            Reads::ExceptSecretsAllowingGit => "read-git",
+            Reads::Everywhere => "read-all",
             Reads::Workspace => "read-workspace",
         }
     }
 
     fn parse(token: &str) -> Option<Self> {
         match token {
-            "read-except-secrets" => Some(Reads::ExceptSecrets),
-            "read-git" => Some(Reads::ExceptSecretsAllowingGit),
+            "read-all" => Some(Reads::Everywhere),
             "read-workspace" => Some(Reads::Workspace),
             _ => None,
         }
@@ -318,12 +208,12 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Writes confined, credential stores unreadable, network open. The
-    /// default for a repository you are working on rather than inspecting.
+    /// Writes confined, reads open, network open. The default for a
+    /// repository you are working on rather than inspecting.
     pub const fn permissive() -> Self {
         Self {
             network: Network::Allow,
-            reads: Reads::ExceptSecrets,
+            reads: Reads::Everywhere,
         }
     }
 
@@ -333,15 +223,6 @@ impl Policy {
         Self {
             network: Network::Deny,
             reads: Reads::Workspace,
-        }
-    }
-
-    /// As [`permissive`](Self::permissive), with git's own credential stores
-    /// readable so it can reach a remote.
-    pub const fn for_git() -> Self {
-        Self {
-            network: Network::Allow,
-            reads: Reads::ExceptSecretsAllowingGit,
         }
     }
 }
@@ -622,8 +503,9 @@ pub fn run_if_helper() {
         // Allocation and file opening are fine here: this process is
         // single-threaded and has not forked.
         let readable = match reads {
-            Reads::ExceptSecrets => readable_except_secrets(&root, false),
-            Reads::ExceptSecretsAllowingGit => readable_except_secrets(&root, true),
+            // `/` really does mean unrestricted reads: a deliberate choice,
+            // documented as such, not an oversight.
+            Reads::Everywhere => vec![PathBuf::from("/")],
             Reads::Workspace => readable_paths(&root),
         };
         if let Err(e) = eventage::sandbox::landlock_confine(&readable, &writable_paths(&root)) {
@@ -681,77 +563,6 @@ mod tests {
         );
         // `cmd > /dev/null` is not an exotic thing to write.
         assert!(paths.contains(&PathBuf::from("/dev/null")));
-    }
-
-    /// Is `path` reachable through any granted hierarchy?
-    fn reachable(granted: &[PathBuf], path: &Path) -> bool {
-        granted.iter().any(|g| path.starts_with(g))
-    }
-
-    #[test]
-    fn granting_siblings_excludes_a_path_and_keeps_its_neighbours() {
-        // Landlock only grants, so "everything except `.ssh`" means naming
-        // every other entry of the directory and never the directory itself.
-        let home = tempfile::tempdir().unwrap();
-        for dir in [".ssh", ".cargo", ".config", "projects"] {
-            std::fs::create_dir(home.path().join(dir)).unwrap();
-        }
-        std::fs::create_dir(home.path().join(".config/gh")).unwrap();
-        std::fs::create_dir(home.path().join(".config/pip")).unwrap();
-
-        let granted = grant_except(home.path(), &[".ssh", ".config/gh"]);
-
-        assert!(!reachable(&granted, &home.path().join(".ssh/id_ed25519")));
-        assert!(!reachable(
-            &granted,
-            &home.path().join(".config/gh/hosts.yml")
-        ));
-        // The neighbours survive, which is the whole reason for the walk.
-        assert!(reachable(&granted, &home.path().join(".cargo/config.toml")));
-        assert!(reachable(&granted, &home.path().join("projects/repo/src")));
-        assert!(reachable(
-            &granted,
-            &home.path().join(".config/pip/pip.conf")
-        ));
-        // And the parent itself is never granted, or the exclusion is void.
-        assert!(!granted.contains(&home.path().to_path_buf()));
-        assert!(!granted.contains(&home.path().join(".config")));
-    }
-
-    #[test]
-    fn a_denied_path_that_does_not_exist_costs_nothing() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir(home.path().join("work")).unwrap();
-        let granted = grant_except(home.path(), &[".ssh", ".config/gh"]);
-        assert!(reachable(&granted, &home.path().join("work/file")));
-        assert!(!reachable(&granted, &home.path().join(".ssh")));
-    }
-
-    #[test]
-    fn the_default_read_policy_still_hides_the_credential_stores() {
-        // The `Confined` default. It reads almost everything — that is what
-        // keeps toolchains working — but not these.
-        let dir = tempfile::tempdir().unwrap();
-        let granted = readable_except_secrets(dir.path(), false);
-
-        assert!(reachable(&granted, Path::new("/usr/bin/cc")));
-        assert!(reachable(&granted, dir.path()));
-        assert!(
-            !granted.contains(&PathBuf::from("/")),
-            "granting / makes every exclusion below it meaningless"
-        );
-
-        if let Ok(home) = std::env::var("HOME") {
-            let home = Path::new(&home);
-            assert!(!granted.contains(&home.to_path_buf()));
-            for secret in [".ssh", ".aws", ".gnupg", ".config/gh"] {
-                assert!(
-                    !reachable(&granted, &home.join(secret)),
-                    "{} is reachable",
-                    home.join(secret).display()
-                );
-            }
-        }
     }
 
     #[test]

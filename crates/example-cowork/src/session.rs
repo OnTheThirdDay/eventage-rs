@@ -19,12 +19,14 @@
 //! workstream carries its own budget hook.
 
 use crate::kinds;
-use crate::shadow::{FileChange, Shadow};
+use crate::shadow::{Adoption, FileChange, Shadow};
 use crate::steering::{SharedSteering, Steering, SteeringGate};
 use anyhow::{Context, Result};
 use eventage::agent::{DefaultContextAssembler, TokenBudgetHook};
 use eventage::event::kinds as ev;
 use eventage::llm::LlmProvider;
+use eventage::observability::BusObserver;
+use eventage::sqlite::{SqliteEventStore, SqliteExporter};
 use eventage::{AgentBuilder, Event, EventBus, ReactStrategy};
 use eventage_code::lsp::LspPool;
 use eventage_code::workspace::Workspace;
@@ -32,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -127,6 +130,9 @@ pub struct CoworkSession {
     /// The snapshot every workstream branches from.
     base: Mutex<Option<String>>,
     workstreams: Mutex<Vec<Workstream>>,
+    /// The task writing events to disk, and its running failure count.
+    persistence: Mutex<Option<tokio::task::JoinHandle<usize>>>,
+    export_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CoworkSession {
@@ -140,13 +146,73 @@ impl CoworkSession {
         llm: Arc<dyn LlmProvider>,
         config: CoworkConfig,
     ) -> Result<Self> {
-        let id = id.into();
+        Self::build(id.into(), llm, config, false).await
+    }
+
+    /// Reopen a session recorded earlier, with its workstreams intact.
+    ///
+    /// Everything needed is already on the bus — that was the bet the whole
+    /// design makes, and this is where it pays. The plan, each stream's
+    /// identity and outcome, what it changed, why one was abandoned, and the
+    /// base snapshot they all branch from were published as events because a
+    /// surface needed to render them; the same events rebuild the session.
+    /// There is no second copy of the state to keep in step.
+    ///
+    /// The snapshots survive too, because they are referenced under
+    /// `refs/cowork/` rather than left dangling — an unreferenced commit is
+    /// collectable, and a resumed session that offered to adopt a workstream
+    /// whose tree `git gc` had taken would be worse than one that offered
+    /// nothing.
+    pub async fn resume(
+        id: impl Into<String>,
+        llm: Arc<dyn LlmProvider>,
+        config: CoworkConfig,
+    ) -> Result<Self> {
+        Self::build(id.into(), llm, config, true).await
+    }
+
+    async fn build(
+        id: String,
+        llm: Arc<dyn LlmProvider>,
+        config: CoworkConfig,
+        restore: bool,
+    ) -> Result<Self> {
+        // The id becomes a directory name directly beneath the state
+        // directory, so an id from an untrusted caller is a path traversal.
+        if !eventage_code::config::is_valid_session_id(&id) {
+            anyhow::bail!(
+                "'{id}' is not a valid session id (expected a UUID); refusing to turn \
+                 it into a file path"
+            );
+        }
         let session_state = config.state_dir.join(&id);
         tokio::fs::create_dir_all(&session_state).await.ok();
 
         let (shadow, excluded) =
             Shadow::open(session_state.join("shadow.git"), &config.folder).await?;
         let bus = EventBus::new();
+
+        // ── persistence ──────────────────────────────────────────────────
+        let db = session_state.join("events.db");
+        let recorded = match restore {
+            false => Vec::new(),
+            true => {
+                let saved = SqliteEventStore::new(&db).await?.load_all().await?;
+                info!(events = saved.len(), "reopening cowork session");
+                bus.restore_from(saved.clone()).await;
+                saved
+            }
+        };
+
+        // Subscribed here rather than inside the task: a subscription made
+        // after the spawn misses whatever is published before the task is
+        // first polled, and those are exactly the events a resume needs.
+        let observer = BusObserver::new(bus.clone()).add_exporter(SqliteExporter::new(&db).await?);
+        let events = observer.subscribe();
+        let export_failures = observer.failures();
+        let persistence = tokio::spawn(observer.run_with(events));
+
+        let (restored_base, restored_streams, restored_steering) = rebuild(&recorded);
 
         if !excluded.repositories.is_empty() || excluded.scan_truncated {
             bus.publish(Event::new(
@@ -162,8 +228,19 @@ impl CoworkSession {
             .ok();
         }
 
-        let steering = Arc::new(SharedSteering::new(config.steering));
-        crate::steering::announce(&bus, config.steering).await;
+        // A resumed session keeps the mode it was left in; the configured
+        // one is only a starting point for a session that has none.
+        let mode = restored_steering.unwrap_or(config.steering);
+        let steering = Arc::new(SharedSteering::new(mode));
+        crate::steering::announce(&bus, mode).await;
+
+        if restore {
+            info!(
+                workstreams = restored_streams.len(),
+                base = restored_base.is_some(),
+                "cowork session reopened"
+            );
+        }
 
         Ok(Self {
             id,
@@ -172,9 +249,44 @@ impl CoworkSession {
             llm,
             config,
             steering,
-            base: Mutex::new(None),
-            workstreams: Mutex::new(Vec::new()),
+            base: Mutex::new(restored_base),
+            workstreams: Mutex::new(restored_streams),
+            persistence: Mutex::new(Some(persistence)),
+            export_failures,
         })
+    }
+
+    /// How many events failed to reach the log.
+    ///
+    /// Non-zero means this session's history is incomplete and reopening it
+    /// will be missing something.
+    pub fn export_failures(&self) -> usize {
+        self.export_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Close the session and wait for its log to be written.
+    ///
+    /// Dropping the persistence task instead loses whatever it had not yet
+    /// flushed — the last events of the session, which are exactly the ones a
+    /// resume needs.
+    pub async fn close(&self) -> usize {
+        self.bus.close();
+        let handle = self.persistence.lock().await.take();
+        match handle {
+            None => self.export_failures(),
+            Some(task) => match tokio::time::timeout(Duration::from_secs(10), task).await {
+                Ok(Ok(failures)) => failures,
+                Ok(Err(e)) => {
+                    warn!("the persistence task failed: {e}");
+                    self.export_failures() + 1
+                }
+                Err(_) => {
+                    warn!("persistence did not finish flushing within 10s");
+                    self.export_failures() + 1
+                }
+            },
+        }
     }
 
     /// Change how much happens without asking, mid-session.
@@ -202,7 +314,12 @@ impl CoworkSession {
         let base = self.shadow.snapshot("base").await?;
         *self.base.lock().await = Some(base.clone());
 
-        let briefs = self.plan(goal).await;
+        // What earlier attempts in this session tried and abandoned. Sealing
+        // recorded a reason and nothing ever read it, which made the whole
+        // mechanism decorative: the graph kept the evidence and the planner
+        // went on proposing the same thing.
+        let lessons = self.lessons().await;
+        let briefs = self.plan(goal, &lessons).await;
         self.bus
             .publish(Event::new(
                 kinds::PLAN_PROPOSED,
@@ -229,7 +346,25 @@ impl CoworkSession {
                 epitaph: None,
             })
             .collect();
-        *self.workstreams.lock().await = planned.clone();
+        // Sealed streams are carried across rounds; everything else is
+        // replaced. Wholesale replacement dropped them, so `lessons()` came
+        // back empty on the second goal and the planner stopped being told
+        // what had already failed — the feedback worked within one round and
+        // silently stopped at the boundary, which is the worst place for it
+        // to stop.
+        //
+        // Finished streams are *not* carried, and that is deliberate: each
+        // round takes a fresh base snapshot, so an earlier result diffs
+        // against a tree that no longer exists and adopting it would apply
+        // the wrong change set.
+        {
+            let mut held = self.workstreams.lock().await;
+            let carried: Vec<Workstream> = held
+                .drain(..)
+                .filter(|w| w.status == Status::Sealed)
+                .collect();
+            *held = carried.into_iter().chain(planned.clone()).collect();
+        }
 
         // Bounded, and the bound is deliberate — see `max_parallel`.
         let limit = Arc::new(tokio::sync::Semaphore::new(self.config.max_parallel.max(1)));
@@ -267,7 +402,14 @@ impl CoworkSession {
             }
         }
         finished.sort_by(|a, b| a.title.cmp(&b.title));
-        *self.workstreams.lock().await = finished.clone();
+        {
+            let mut held = self.workstreams.lock().await;
+            let carried: Vec<Workstream> = held
+                .drain(..)
+                .filter(|w| w.status == Status::Sealed)
+                .collect();
+            *held = carried.into_iter().chain(finished.clone()).collect();
+        }
         Ok(finished)
     }
 
@@ -277,7 +419,7 @@ impl CoworkSession {
     /// does not answer with something parseable. A session that refused to
     /// start because the planning step returned prose would be worse than one
     /// that simply does the work in one piece.
-    async fn plan(&self, goal: &str) -> Vec<Brief> {
+    async fn plan(&self, goal: &str, lessons: &[String]) -> Vec<Brief> {
         let single = || {
             vec![Brief {
                 title: "the task".into(),
@@ -285,18 +427,7 @@ impl CoworkSession {
             }]
         };
 
-        let prompt = format!(
-            "You are planning a piece of work in a folder of documents.\n\n\
-             GOAL: {goal}\n\n\
-             Split this into at most {} independent workstreams that can run at the same \
-             time without needing each other's output. Independent means they touch \
-             different files, or answer different questions. If the goal is genuinely one \
-             indivisible piece of work, return exactly one workstream — that is a good \
-             answer, not a failure.\n\n\
-             Reply with JSON only, no prose, no code fence:\n\
-             [{{\"title\": \"short label\", \"brief\": \"what this stream should do, in full\"}}]",
-            self.config.max_workstreams
-        );
+        let prompt = self.planning_prompt(goal, lessons);
 
         let response = match self
             .llm
@@ -325,8 +456,60 @@ impl CoworkSession {
         }
     }
 
+    /// The prompt the planner is given.
+    ///
+    /// Separate from the call so what the planner is told can be checked
+    /// without spending a model request on it — the interesting part is the
+    /// history, and a test that had to call a model to see it would not be
+    /// written.
+    fn planning_prompt(&self, goal: &str, lessons: &[String]) -> String {
+        // Stated as findings rather than prohibitions. A sealed workstream
+        // means "this was tried and was wrong", which is a fact about the
+        // problem; turning it into "never do X" would outlive its reason.
+        let history = match lessons.is_empty() {
+            true => String::new(),
+            false => format!(
+                "ALREADY TRIED IN THIS SESSION, AND ABANDONED:\n{}\n\nDo not \
+                 propose these again unless the goal has changed to ask for them. \
+                 Say briefly how your plan differs.\n\n",
+                lessons
+                    .iter()
+                    .map(|l| format!("- {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        };
+
+        format!(
+            "You are planning a piece of work in a folder of documents.\n\n\
+             GOAL: {goal}\n\n\
+             {history}\
+             Split this into at most {} independent workstreams that can run at the same \
+             time without needing each other's output. Independent means they touch \
+             different files, or answer different questions. If the goal is genuinely one \
+             indivisible piece of work, return exactly one workstream — that is a good \
+             answer, not a failure.\n\n\
+             Reply with JSON only, no prose, no code fence:\n\
+             [{{\"title\": \"short label\", \"brief\": \"what this stream should do, in full\"}}]",
+            self.config.max_workstreams
+        )
+    }
+
     /// Apply one workstream's result to the folder.
-    pub async fn adopt(&self, workstream_id: &str) -> Result<Vec<FileChange>> {
+    ///
+    /// Refuses if the folder changed underneath the workstream — see
+    /// [`Shadow::adopt`]. The refusal is published, because the user now has
+    /// two versions of the same files and has to choose between them.
+    pub async fn adopt(&self, workstream_id: &str) -> Result<Adoption> {
+        self.adopt_with(workstream_id, false).await
+    }
+
+    /// Apply it anyway, discarding the folder's own changes to those paths.
+    pub async fn adopt_overriding(&self, workstream_id: &str) -> Result<Adoption> {
+        self.adopt_with(workstream_id, true).await
+    }
+
+    async fn adopt_with(&self, workstream_id: &str, override_conflicts: bool) -> Result<Adoption> {
         let base = self
             .base
             .lock()
@@ -343,20 +526,38 @@ impl CoworkSession {
             .as_ref()
             .context("that workstream produced nothing to adopt")?;
 
-        let changes = self.shadow.adopt(commit, &base).await?;
-        self.bus
-            .publish(Event::new(
+        let outcome = match override_conflicts {
+            true => self.shadow.adopt_overriding(commit, &base).await?,
+            false => self.shadow.adopt(commit, &base).await?,
+        };
+
+        let event = match outcome.applied.is_empty() && !outcome.conflicts.is_empty() {
+            true => Event::new(
+                kinds::ADOPTION_BLOCKED,
+                json!({
+                    "id": stream.id,
+                    "title": stream.title,
+                    "conflicts": outcome.conflicts.iter().map(|c| json!({
+                        "path": c.path,
+                        "workstream": c.workstream.as_str(),
+                        "live": c.live.as_str(),
+                    })).collect::<Vec<_>>(),
+                }),
+            ),
+            false => Event::new(
                 kinds::ADOPTED,
                 json!({
                     "id": stream.id,
                     "title": stream.title,
-                    "changes": changes.iter().map(|c| json!({
+                    "overrode": override_conflicts,
+                    "changes": outcome.applied.iter().map(|c| json!({
                         "path": c.path, "status": c.status.as_str()
                     })).collect::<Vec<_>>(),
                 }),
-            ))
-            .await?;
-        Ok(changes)
+            ),
+        };
+        self.bus.publish(event).await?;
+        Ok(outcome)
     }
 
     /// Abandon a workstream, and record why.
@@ -393,6 +594,61 @@ impl CoworkSession {
             .collect()
     }
 
+    /// Run goals that arrive from somewhere other than the caller.
+    ///
+    /// The HTTP channel and the scheduler both publish
+    /// [`GOAL_REQUESTED`](crate::kinds::GOAL_REQUESTED); until this existed,
+    /// nothing consumed it. The endpoint answered "accepted" and did nothing,
+    /// and an automation reported itself fired every time it came due without
+    /// ever doing the work — both advertised, both hollow.
+    ///
+    /// Serialised deliberately. Requests queue behind whatever is running
+    /// rather than fanning out on top of it: a session is one folder, and two
+    /// goals adopting into it at once is not a thing to discover in
+    /// production.
+    ///
+    /// Subscribes **before** returning its future, so a request published
+    /// immediately after the call cannot be missed. Subscribing inside the
+    /// spawned task instead left a window between `tokio::spawn` and the
+    /// subscription in which a goal simply vanished — rare in a real session,
+    /// where the consumer starts long before anyone asks for anything, and
+    /// certain in a test that asks straight away.
+    ///
+    /// The returned future completes when the bus closes, so a caller can
+    /// spawn it and abort the handle at shutdown.
+    pub fn serve_requests(self: Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
+        let mut rx = self.bus.subscribe();
+        async move { self.consume_requests(&mut rx).await }
+    }
+
+    async fn consume_requests(&self, rx: &mut eventage::bus::BusReceiver) {
+        while let Some(event) = rx.recv().await {
+            if event.kind != kinds::GOAL_REQUESTED {
+                continue;
+            }
+            let Some(goal) = event
+                .payload
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|g| !g.trim().is_empty())
+            else {
+                warn!("a goal request arrived with nothing to do");
+                continue;
+            };
+            let source = event
+                .payload
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            info!(%source, "running a requested goal");
+            if let Err(e) = self.run(&goal).await {
+                warn!(%source, "the requested goal failed: {e:#}");
+            }
+        }
+    }
+
     /// Put the folder back to the state the session started from.
     pub async fn revert(&self) -> Result<Vec<FileChange>> {
         let base = self
@@ -403,6 +659,165 @@ impl CoworkSession {
             .context("this session has not run anything yet")?;
         self.shadow.restore(&base).await
     }
+}
+
+/// Rebuild a session's state from the events it recorded.
+///
+/// The reconstruction is possible because nothing was ever kept only in
+/// memory: every fact a surface needed to render — the plan, each stream's
+/// identity and outcome, what it changed, why one was abandoned — was
+/// published, and the same events answer "what was this session doing?" for a
+/// process that was not there.
+///
+/// Planned order is preserved separately from the map, for the same reason
+/// the UI does it: streams *start* in whatever order the concurrency limiter
+/// admits them, and a session that came back in a different order each time
+/// would be disorienting for no reason.
+fn rebuild(events: &[Event]) -> (Option<String>, Vec<Workstream>, Option<Steering>) {
+    use std::collections::HashMap;
+
+    let mut base = None;
+    let mut steering = None;
+    let mut by_id: HashMap<String, Workstream> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    let str_at = |e: &Event, key: &str| {
+        e.payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let place = |order: &mut Vec<String>, key: &str| {
+        if !order.iter().any(|k| k == key) {
+            order.push(key.to_string());
+        }
+    };
+
+    for event in events {
+        match event.kind.as_str() {
+            kinds::PLAN_PROPOSED => {
+                if let Some(commit) = str_at(event, "base") {
+                    base = Some(commit);
+                }
+                let planned = event
+                    .payload
+                    .get("workstreams")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for part in planned {
+                    let Some(title) = part.get("title").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    // A stream has no id until it starts, so the title is the
+                    // only handle the plan gives.
+                    let key = format!("planned:{title}");
+                    place(&mut order, &key);
+                    by_id.insert(
+                        key,
+                        Workstream {
+                            id: String::new(),
+                            title: title.to_string(),
+                            brief: part
+                                .get("brief")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            status: Status::Planned,
+                            commit: None,
+                            report: None,
+                            changes: Vec::new(),
+                            epitaph: None,
+                        },
+                    );
+                }
+            }
+            kinds::WORKSTREAM_STARTED => {
+                let (Some(id), Some(title)) = (str_at(event, "id"), str_at(event, "title")) else {
+                    continue;
+                };
+                let placeholder = format!("planned:{title}");
+                let planned = by_id.remove(&placeholder);
+                match order.iter().position(|k| *k == placeholder) {
+                    Some(at) => order[at] = id.clone(),
+                    None => place(&mut order, &id),
+                }
+                by_id.insert(
+                    id.clone(),
+                    Workstream {
+                        id,
+                        title,
+                        brief: str_at(event, "brief")
+                            .or_else(|| planned.map(|p| p.brief))
+                            .unwrap_or_default(),
+                        // Running when the log ended means the process died
+                        // mid-turn: it did not finish, and saying it did
+                        // would offer a result that is not there.
+                        status: Status::Failed,
+                        commit: None,
+                        report: Some("interrupted before it finished".into()),
+                        changes: Vec::new(),
+                        epitaph: None,
+                    },
+                );
+            }
+            kinds::WORKSTREAM_FINISHED => {
+                let Some(id) = str_at(event, "id") else {
+                    continue;
+                };
+                if let Some(stream) = by_id.get_mut(&id) {
+                    stream.status = Status::Done;
+                    stream.commit = str_at(event, "commit");
+                    stream.report = str_at(event, "report");
+                    stream.changes = event
+                        .payload
+                        .get("changes")
+                        .and_then(|v| v.as_array())
+                        .map(|cs| {
+                            cs.iter()
+                                .filter_map(|c| {
+                                    c.get("path").and_then(|p| p.as_str()).map(str::to_string)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+            }
+            kinds::WORKSTREAM_FAILED => {
+                let Some(id) = str_at(event, "id") else {
+                    continue;
+                };
+                if let Some(stream) = by_id.get_mut(&id) {
+                    stream.status = Status::Failed;
+                    stream.report = str_at(event, "error");
+                }
+            }
+            kinds::WORKSTREAM_SEALED => {
+                let Some(id) = str_at(event, "id") else {
+                    continue;
+                };
+                if let Some(stream) = by_id.get_mut(&id) {
+                    stream.status = Status::Sealed;
+                    stream.epitaph = str_at(event, "epitaph");
+                }
+            }
+            kinds::STEERING_CHANGED => {
+                if let Some(mode) = str_at(event, "steering")
+                    .as_deref()
+                    .and_then(Steering::from_id)
+                {
+                    steering = Some(mode);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let streams = order
+        .iter()
+        .filter_map(|key| by_id.remove(key))
+        .collect::<Vec<_>>();
+    (base, streams, steering)
 }
 
 /// Pull a JSON array out of a model's reply.
@@ -438,8 +853,12 @@ async fn run_workstream(
 
     if let Err(e) = shadow.worktree(&worktree, &base).await {
         warn!(id = %stream.id, "could not create a working copy: {e:#}");
-        stream.status = Status::Failed;
-        stream.report = Some(format!("could not create a working copy: {e:#}"));
+        fail(
+            &mut stream,
+            &session_bus,
+            format!("could not create a working copy: {e:#}"),
+        )
+        .await;
         return stream;
     }
 
@@ -495,20 +914,36 @@ async fn run_workstream(
                 }
                 Err(e) => {
                     warn!(id = %stream.id, "could not record the result: {e:#}");
-                    stream.status = Status::Failed;
+                    fail(
+                        &mut stream,
+                        &session_bus,
+                        format!("could not record the result: {e:#}"),
+                    )
+                    .await;
                 }
             }
         }
         Err(e) => {
             warn!(id = %stream.id, "workstream failed: {e:#}");
-            stream.status = Status::Failed;
-            stream.report = Some(format!("{e:#}"));
+            fail(&mut stream, &session_bus, format!("{e:#}")).await;
         }
     }
 
     // The checkout has served its purpose; the result is in the snapshot.
     let _ = shadow.remove_worktree(&worktree).await;
     stream
+}
+
+/// Record a workstream's failure, on the bus as well as in memory.
+async fn fail(stream: &mut Workstream, bus: &EventBus, why: String) {
+    stream.status = Status::Failed;
+    stream.report = Some(why.clone());
+    let _ = bus
+        .publish(Event::new(
+            kinds::WORKSTREAM_FAILED,
+            json!({ "id": stream.id, "title": stream.title, "error": why }),
+        ))
+        .await;
 }
 
 /// Build an agent over the working copy and run the brief.
@@ -665,6 +1100,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_was_abandoned_reaches_the_next_plan() {
+        // Sealing recorded a reason and nothing read it, so the graph kept
+        // the evidence and the planner went on proposing the same thing. The
+        // lesson is now in the prompt the planner sees.
+        let folder = tempfile::tempdir().unwrap();
+        let Some(session) = session(&folder, vec!["[]", "[]"]).await else {
+            return;
+        };
+        session.workstreams.lock().await.push(Workstream {
+            id: "abc".into(),
+            title: "rewrite in the 2026 template".into(),
+            brief: "…".into(),
+            status: Status::Sealed,
+            commit: None,
+            report: None,
+            changes: vec![],
+            epitaph: Some("the 2026 template is for external reports".into()),
+        });
+
+        let lessons = session.lessons().await;
+        assert_eq!(lessons.len(), 1);
+
+        // The planner is told, and a fresh session is not.
+        let with = session.planning_prompt("tidy the reports", &lessons);
+        assert!(with.contains("ALREADY TRIED"), "{with}");
+        assert!(with.contains("external reports"), "{with}");
+
+        let without = session.planning_prompt("tidy the reports", &[]);
+        assert!(!without.contains("ALREADY TRIED"), "{without}");
+    }
+
+    #[tokio::test]
     async fn an_unplannable_goal_still_runs_as_one_piece() {
         // A session that refused to start because the planning step returned
         // prose would be worse than one that simply does the work in a single
@@ -674,7 +1141,7 @@ mod tests {
         let Some(session) = session(&folder, vec!["I'd rather just chat about it."]).await else {
             return;
         };
-        let briefs = session.plan("tidy the notes").await;
+        let briefs = session.plan("tidy the notes", &[]).await;
         assert_eq!(briefs.len(), 1);
         assert_eq!(briefs[0].brief, "tidy the notes");
     }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Chat } from "./components/Chat";
+import { Workstreams } from "./components/Workstreams";
 import { Composer } from "./components/Composer";
 import { RewindDialog } from "./components/RewindDialog";
 import { Sidebar } from "./components/Sidebar";
@@ -289,6 +290,24 @@ export default function App() {
     [activeId, guard, refreshSessions],
   );
 
+  /** Write one workstream's result into the folder. */
+  const adoptWorkstream = useCallback(
+    (workstreamId: string) => {
+      if (!activeId) return;
+      void guard(() => api.adopt(activeId, workstreamId));
+    },
+    [activeId, guard],
+  );
+
+  /** Abandon a workstream, recording why for a later attempt to read. */
+  const sealWorkstream = useCallback(
+    (workstreamId: string, reason: string) => {
+      if (!activeId) return;
+      void guard(() => api.seal(activeId, workstreamId, reason));
+    },
+    [activeId, guard],
+  );
+
   const answerPermission = useCallback(
     (requestId: string, approve: boolean, always: boolean) => {
       if (!activeId) return;
@@ -546,6 +565,14 @@ export default function App() {
                 onInspectContext={inspectContext}
                 onBranchFrom={(seq) => void branchFrom(seq)}
                 emptyState={emptyState}
+              />
+              {/* Below the transcript rather than beside it: the comparison
+                  is what you do *after* reading what each stream reported. */}
+              <Workstreams
+                workstreams={chat.workstreams}
+                busy={fullChat.running}
+                onAdopt={(ws) => void adoptWorkstream(ws)}
+                onSeal={(ws, reason) => void sealWorkstream(ws, reason)}
               />
             </div>
 
