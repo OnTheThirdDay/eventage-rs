@@ -149,14 +149,24 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli, cwd: String, model: ModelConfig) -> Result<()> {
+    // Saved settings layer over what the environment resolved, so a provider
+    // chosen in the app survives a restart. Built before the backend because
+    // both of them read it at session-open time.
+    let state_dir =
+        eventage_code::config::SessionConfig::new(cwd.clone(), model.clone()).state_dir();
+    tokio::fs::create_dir_all(&state_dir).await.ok();
+    let settings =
+        Arc::new(eventage_studio::model_settings::ModelSettings::load(model, &state_dir).await);
+
     let backend: Arc<dyn Backend> = match (cli.acp.clone(), cli.cowork) {
         (Some(command), _) => Arc::new(AcpBackend::new(command, cwd.clone())?),
         // Cowork over the same folder: a goal fans into workstreams that each
         // work in a private copy, and nothing lands until one is kept.
-        (None, true) => {
-            Arc::new(CoworkBackend::new(model, cwd.clone()).with_limits(cli.parallel, cli.split))
-        }
-        (None, false) => Arc::new(LocalBackend::new(model, cwd.clone()).await),
+        (None, true) => Arc::new(
+            CoworkBackend::new(Arc::clone(&settings), cwd.clone())
+                .with_limits(cli.parallel, cli.split),
+        ),
+        (None, false) => Arc::new(LocalBackend::new(Arc::clone(&settings), cwd.clone()).await),
     };
 
     let info = backend.info();

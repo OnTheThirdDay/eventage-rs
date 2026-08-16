@@ -140,6 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/summary", post(override_summary))
         .route("/sessions/:id/branch", post(branch))
         .route("/stored/:id", delete(forget_session))
+        .route("/model", get(model_settings).post(set_model_settings))
         .route("/fs/list", get(list_dir))
         .with_state(state.clone());
 
@@ -386,6 +387,36 @@ async fn set_mode(
 ) -> Result<StatusCode, ApiError> {
     state.session(&id).await?.set_mode(&req.mode).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What the settings screen shows. Never includes the credential.
+async fn model_settings(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let settings = state.backend.model_settings().ok_or_else(|| {
+        ApiError::from(anyhow::anyhow!(
+            "this backend does not own the model — the connected agent does"
+        ))
+    })?;
+    Ok(Json(serde_json::json!(settings.view())))
+}
+
+/// Apply a change. Takes effect for sessions opened afterwards.
+async fn set_model_settings(
+    State(state): State<AppState>,
+    Json(update): Json<crate::model_settings::ModelUpdate>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let settings = state.backend.model_settings().ok_or_else(|| {
+        ApiError::from(anyhow::anyhow!(
+            "this backend does not own the model — the connected agent does"
+        ))
+    })?;
+    // The request body carries a credential, so nothing about it is logged —
+    // not the body, not a "changed model to …" line that happens to include
+    // it. The view that comes back has no key in it.
+    let view = settings.set(update).await?;
+    tracing::info!(provider = %view.provider, model = %view.model, "model settings changed");
+    Ok(Json(serde_json::json!(view)))
 }
 
 #[derive(serde::Deserialize)]

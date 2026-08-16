@@ -1,6 +1,7 @@
 /** Typed client for the Studio server. */
 
 import type {
+  ModelView,
   AppInfo,
   PromptBlock,
   SessionInfo,
@@ -126,6 +127,24 @@ export const api = {
    */
   seal: (id: string, workstream_id: string, reason: string) =>
     post<void>(`/sessions/${id}/seal`, { workstream_id, reason }),
+
+  /** Provider, model and endpoint — never the key. */
+  modelSettings: () => request<ModelView>("/model"),
+
+  /**
+   * Change the model sessions are opened with.
+   *
+   * Omit `api_key` to keep the configured one: the form is never given the
+   * key, so it cannot round-trip it, and sending an empty string would sign
+   * the user out every time they renamed a model.
+   */
+  setModelSettings: (body: {
+    provider: string;
+    model: string;
+    base_url: string;
+    api_key?: string;
+    remember_key: boolean;
+  }) => post<ModelView>("/model", body),
 
   listDir: (path: string) =>
     request<{

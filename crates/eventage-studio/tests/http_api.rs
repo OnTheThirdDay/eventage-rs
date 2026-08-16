@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 
 struct FakeBackend {
     session: Arc<FakeSession>,
+    settings: Arc<eventage_studio::model_settings::ModelSettings>,
 }
 
 struct FakeSession {
@@ -43,6 +44,10 @@ impl FakeSession {
 
 #[async_trait]
 impl Backend for FakeBackend {
+    fn model_settings(&self) -> Option<Arc<eventage_studio::model_settings::ModelSettings>> {
+        Some(Arc::clone(&self.settings))
+    }
+
     fn info(&self) -> AppInfo {
         AppInfo {
             backend: "local",
@@ -165,8 +170,19 @@ struct Studio {
 impl Studio {
     async fn start() -> Self {
         let session = Arc::new(FakeSession::new());
+        let state_dir = tempfile::tempdir().unwrap();
+        let settings = Arc::new(
+            eventage_studio::model_settings::ModelSettings::load(
+                eventage_code::config::ModelConfig::from_env(Some("test-model".into())),
+                state_dir.path(),
+            )
+            .await,
+        );
+        // The settings file must outlive the server.
+        std::mem::forget(state_dir);
         let backend = Arc::new(FakeBackend {
             session: session.clone(),
+            settings,
         });
         let token = "test-token".to_string();
         let state = AppState::new(backend, token.clone());
@@ -668,4 +684,79 @@ fn urlencode(s: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
+}
+
+#[tokio::test]
+async fn model_settings_never_hand_the_key_back() {
+    // A settings screen that echoes the credential has put it somewhere new
+    // for no benefit: the person typing it already knows it. This is the
+    // property the whole module is arranged around, checked at the wire.
+    let studio = Studio::start().await;
+
+    let saved: Value = studio
+        .client
+        .post(studio.url("/api/model"))
+        .json(&json!({
+            "provider": "openai-chat",
+            "model": "qwen3:4b",
+            "base_url": "http://localhost:11434/v1/",
+            "api_key": "sk-must-not-come-back",
+            "remember_key": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(saved["provider"], "openai-chat");
+    assert_eq!(saved["has_key"], true);
+    // The trailing slash is normalised away.
+    assert_eq!(saved["base_url"], "http://localhost:11434/v1");
+    assert!(
+        !saved.to_string().contains("sk-must-not-come-back"),
+        "the response carried the credential: {saved}"
+    );
+
+    // Nor on the way back out.
+    let read: Value = studio
+        .client
+        .get(studio.url("/api/model"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !read.to_string().contains("sk-must-not-come-back"),
+        "{read}"
+    );
+    assert_eq!(read["has_key"], true);
+
+    // And the app's own title-bar facts never carried it either.
+    let app: Value = studio
+        .client
+        .get(studio.url("/api/app"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!app.to_string().contains("sk-must-not-come-back"), "{app}");
+}
+
+#[tokio::test]
+async fn a_nonsense_provider_is_refused_rather_than_stored() {
+    let studio = Studio::start().await;
+    let response = studio
+        .client
+        .post(studio.url("/api/model"))
+        .json(&json!({ "provider": "not-a-thing", "model": "m" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success(), "got {}", response.status());
 }

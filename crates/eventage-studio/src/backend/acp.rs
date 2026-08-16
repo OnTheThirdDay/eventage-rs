@@ -866,6 +866,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[cfg(unix)]
     fn a_symlink_out_of_the_workspace_is_not_a_way_round_the_check() {
         // A prefix comparison on the requested string is not a boundary: a
         // link inside the workspace is the obvious way past it.

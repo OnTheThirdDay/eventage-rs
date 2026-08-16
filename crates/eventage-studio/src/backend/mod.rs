@@ -22,6 +22,15 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    /// The model settings a settings screen edits, when this backend has any.
+    ///
+    /// `None` for the ACP backend: the connected agent owns its own model and
+    /// credentials, and offering a form that silently changed nothing would
+    /// be worse than not offering one.
+    fn model_settings(&self) -> Option<Arc<crate::model_settings::ModelSettings>> {
+        None
+    }
+
     /// Title-bar facts: which agent, which model, what the trace can show.
     fn info(&self) -> AppInfo;
 

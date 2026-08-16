@@ -34,23 +34,25 @@ use cowork::session::{CoworkConfig, CoworkSession};
 use cowork::steering::Steering;
 use eventage::event::kinds;
 use eventage::Event;
-use eventage_code::config::ModelConfig;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub struct CoworkBackend {
-    model: ModelConfig,
+    settings: Arc<crate::model_settings::ModelSettings>,
     default_folder: String,
     max_parallel: usize,
     max_workstreams: usize,
 }
 
 impl CoworkBackend {
-    pub fn new(model: ModelConfig, default_folder: String) -> Self {
+    pub fn new(
+        settings: Arc<crate::model_settings::ModelSettings>,
+        default_folder: String,
+    ) -> Self {
         Self {
-            model,
+            settings,
             default_folder,
             max_parallel: 3,
             max_workstreams: 5,
@@ -66,15 +68,20 @@ impl CoworkBackend {
 
 #[async_trait]
 impl Backend for CoworkBackend {
+    fn model_settings(&self) -> Option<Arc<crate::model_settings::ModelSettings>> {
+        Some(Arc::clone(&self.settings))
+    }
+
     fn info(&self) -> AppInfo {
+        let model = self.settings.get();
         AppInfo {
             backend: "cowork",
             backend_detail: format!(
                 "up to {} workstreams, {} at a time",
                 self.max_workstreams, self.max_parallel
             ),
-            model: self.model.model.clone(),
-            provider: format!("{:?}", self.model.provider),
+            model: model.model.clone(),
+            provider: model.provider.label().to_string(),
             default_cwd: self.default_folder.clone(),
             modes: vec![
                 ModeInfo {
@@ -97,11 +104,11 @@ impl Backend for CoworkBackend {
             full_trace: true,
             // The same profile field, for the same reason. `api_key` is not
             // the test: the keyless fallback fills in a placeholder.
-            credentials_hint: match self.model.credentialed {
+            credentials_hint: match model.credentialed {
                 false => Some(format!(
                     "No API key found, so cowork is pointed at {}. Set ANTHROPIC_API_KEY, \
                      QWEN_API_KEY, or OPENAI_API_KEY (with OPENAI_BASE_URL) and restart.",
-                    self.model.base_url()
+                    model.base_url()
                 )),
                 true => None,
             },
@@ -120,7 +127,7 @@ impl Backend for CoworkBackend {
             config.steering = mode;
         }
 
-        let llm = eventage_code::agent::provider_for(&self.model);
+        let llm = eventage_code::agent::provider_for(&self.settings.get());
         let session = match req.resume.as_deref() {
             Some(id) => CoworkSession::resume(id.to_string(), llm, config).await?,
             None => CoworkSession::open(uuid::Uuid::new_v4().to_string(), llm, config).await?,
@@ -409,7 +416,15 @@ mod tests {
     async fn the_steering_modes_are_coworks_own() {
         // Not the coding agent's plan/auto/yolo. These are the words users of
         // Cowork and the Codex app already have for the same control.
-        let backend = CoworkBackend::new(ModelConfig::from_env(Some("m".into())), "/tmp".into());
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Arc::new(
+            crate::model_settings::ModelSettings::load(
+                eventage_code::config::ModelConfig::from_env(Some("m".into())),
+                dir.path(),
+            )
+            .await,
+        );
+        let backend = CoworkBackend::new(settings, "/tmp".into());
         let ids: Vec<String> = backend.info().modes.iter().map(|m| m.id.clone()).collect();
         assert_eq!(ids, vec!["manual", "auto", "skip"]);
         assert!(backend.info().full_trace);

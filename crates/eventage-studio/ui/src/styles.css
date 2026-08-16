@@ -2360,3 +2360,42 @@ button.loc:hover {
   color: var(--text);
   border-color: var(--border-strong);
 }
+
+/* ── model settings ────────────────────────────────────────────────────────
+   A short form, so it reads as a list of decisions rather than a panel. */
+.model-settings { max-width: 30rem; }
+.model-form { display: grid; gap: 0.9rem; margin-top: 0.5rem; }
+.model-form label { display: grid; gap: 0.3rem; }
+.model-form label > span { font-size: 0.85rem; color: var(--text); }
+.model-form input,
+.model-form select {
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font: inherit;
+  width: 100%;
+}
+.model-form small.muted { font-size: 0.78rem; line-height: 1.35; }
+.model-form label.checkbox {
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 0.5rem;
+}
+.model-form label.checkbox input { width: auto; margin-top: 0.2rem; }
+.model-form label.checkbox > span { display: grid; gap: 0.15rem; }
+.model-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.85rem;
+}
+.model-note { margin: 0; font-size: 0.8rem; }
+
+/* The chip is a button now; it must not look like a different control. */
+button.model-chip {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+button.model-chip:hover { border-color: var(--border-strong); }

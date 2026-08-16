@@ -16,6 +16,21 @@ export interface ModeInfo {
   description: string;
 }
 
+/**
+ * The model configuration, as a settings screen sees it.
+ *
+ * No credential, ever — `has_key` says whether one is configured and that is
+ * all the form needs to render correctly.
+ */
+export interface ModelView {
+  provider: string;
+  model: string;
+  base_url: string;
+  has_key: boolean;
+  key_remembered: boolean;
+  providers: { id: string; label: string; endpoint_hint: string }[];
+}
+
 export interface AppInfo {
   backend: "local" | "acp";
   backend_detail: string;

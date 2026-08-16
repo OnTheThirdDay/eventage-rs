@@ -31,27 +31,39 @@ use tracing::{info, warn};
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub struct LocalBackend {
-    model: ModelConfig,
+    /// Read at every `open`, so a change in the settings screen reaches the
+    /// next session without restarting Studio — and never the running one,
+    /// whose provider is already built into its agent.
+    settings: Arc<crate::model_settings::ModelSettings>,
     default_cwd: String,
     index: Arc<SessionIndex>,
     state_dir: PathBuf,
 }
 
 impl LocalBackend {
-    pub async fn new(model: ModelConfig, default_cwd: String) -> Self {
+    pub async fn new(
+        settings: Arc<crate::model_settings::ModelSettings>,
+        default_cwd: String,
+    ) -> Self {
+        let model = settings.get();
         let state_dir = SessionConfig::new(default_cwd.clone(), model.clone()).state_dir();
         tokio::fs::create_dir_all(&state_dir).await.ok();
         let index = Arc::new(SessionIndex::load(&state_dir).await);
         Self {
-            model,
+            settings,
             default_cwd,
             index,
             state_dir,
         }
     }
 
-    fn config_for(&self, cwd: &str, mode: Option<&str>) -> Result<SessionConfig> {
-        let mut config = SessionConfig::new(cwd.to_string(), self.model.clone());
+    fn config_for(
+        &self,
+        cwd: &str,
+        mode: Option<&str>,
+        model: ModelConfig,
+    ) -> Result<SessionConfig> {
+        let mut config = SessionConfig::new(cwd.to_string(), model);
         if let Some(id) = mode {
             config.mode = PermissionMode::from_id(id)
                 .ok_or_else(|| anyhow!("unknown permission mode '{id}' (plan|ask|auto|yolo)"))?;
@@ -95,12 +107,19 @@ fn provider_name(provider: Provider) -> &'static str {
 
 #[async_trait]
 impl Backend for LocalBackend {
+    fn model_settings(&self) -> Option<Arc<crate::model_settings::ModelSettings>> {
+        Some(Arc::clone(&self.settings))
+    }
+
     fn info(&self) -> AppInfo {
+        // Read fresh, so the title bar reflects a change made in settings
+        // rather than whatever was configured when Studio started.
+        let model = self.settings.get();
         AppInfo {
             backend: "local",
             backend_detail: "eventage-code, hosted in this process".into(),
-            model: self.model.model.clone(),
-            provider: provider_name(self.model.provider).into(),
+            model: model.model.clone(),
+            provider: provider_name(model.provider).into(),
             default_cwd: self.default_cwd.clone(),
             modes: PermissionMode::ALL
                 .iter()
@@ -112,7 +131,7 @@ impl Backend for LocalBackend {
                 .collect(),
             version: env!("CARGO_PKG_VERSION"),
             full_trace: true,
-            credentials_hint: credentials_hint(&self.model),
+            credentials_hint: credentials_hint(&model),
         }
     }
 
@@ -122,7 +141,7 @@ impl Backend for LocalBackend {
             .map_err(|e| anyhow!("cannot open workspace '{cwd}': {e}"))?
             .display()
             .to_string();
-        let config = self.config_for(&cwd, req.mode.as_deref())?;
+        let config = self.config_for(&cwd, req.mode.as_deref(), self.settings.get())?;
 
         let (id, session) = match &req.resume {
             Some(id) => {
@@ -172,7 +191,7 @@ impl Backend for LocalBackend {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let config = self.config_for(&info.cwd, Some(&info.mode))?;
+        let config = self.config_for(&info.cwd, Some(&info.mode), self.settings.get())?;
 
         // Written to the new session's own log, then opened as a resume: the
         // branch is a real session from birth, with a history it can replay,

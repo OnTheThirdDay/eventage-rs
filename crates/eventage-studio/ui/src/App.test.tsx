@@ -87,6 +87,20 @@ beforeEach(() => {
       });
 
     if (url.startsWith("/api/app")) return json(APP_INFO);
+    // No `api_key` field: the server never sends one back, and a fixture that
+    // did would let a leak pass the test that exists to catch it.
+    if (url.startsWith("/api/model"))
+      return json({
+        provider: "anthropic",
+        model: "test-model",
+        base_url: "",
+        has_key: true,
+        key_remembered: false,
+        providers: [
+          { id: "anthropic", label: "Anthropic", endpoint_hint: "hint" },
+          { id: "openai-chat", label: "OpenAI-compatible", endpoint_hint: "hint" },
+        ],
+      });
     if (url.startsWith("/api/sessions?") || url === "/api/sessions") {
       if (method === "POST") return json(SESSION);
       return json({ open: [SESSION], stored: [] });
@@ -252,6 +266,23 @@ describe("permission prompts", () => {
 
     const answer = calls.find((c) => c.url.includes("/permission"));
     expect(answer?.body).toMatchObject({ request_id: "r1", approve: true });
+  });
+
+  it("opens model settings from the chip, and never shows the key", async () => {
+    // The chip already names the model, so it is where someone goes to change
+    // it. The dialog is given `has_key` and never the key itself.
+    await mount();
+    await act(async () => {
+      screen.getByTitle(/click to change/).click();
+    });
+    // "Model" is both the dialog heading and a field label; ask for the one
+    // that means the dialog opened.
+    expect(await screen.findByRole("heading", { name: "Model" })).toBeTruthy();
+    // The field is empty with a placeholder, because a key it was never given
+    // cannot be pre-filled — and leaving it blank must keep the current one.
+    const key = screen.getByPlaceholderText(/leave blank to keep it|no key configured/);
+    expect((key as HTMLInputElement).value).toBe("");
+    expect((key as HTMLInputElement).type).toBe("password");
   });
 
   it("shows how many rewound attempts are still steering the agent", async () => {

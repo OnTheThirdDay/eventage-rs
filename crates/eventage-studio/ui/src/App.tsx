@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Chat } from "./components/Chat";
+import { ModelSettings } from "./components/ModelSettings";
 import { Workstreams } from "./components/Workstreams";
 import { Composer } from "./components/Composer";
 import { RewindDialog } from "./components/RewindDialog";
@@ -54,6 +55,7 @@ export default function App() {
   const [live, setLive] = useState(true);
 
   const [showTrace, setShowTrace] = useStored("studio.trace", true);
+  const [showModelSettings, setShowModelSettings] = useState(false);
   const [showSidebar, setShowSidebar] = useStored("studio.sidebar", true);
   const [traceWidth, setTraceWidth] = useStored("studio.traceWidth", 520);
   const [sidebarWidth, setSidebarWidth] = useStored("studio.sidebarWidth", 248);
@@ -110,6 +112,16 @@ export default function App() {
     setOpen(listing.open);
     setStored(listing.stored);
     return listing;
+  }, []);
+
+  /** Re-read the app's facts after the model changes. */
+  const refreshApp = useCallback(async () => {
+    try {
+      setApp(await api.app());
+    } catch {
+      // The title bar keeping a stale model name is not worth an error
+      // banner; the next reload fixes it.
+    }
   }, []);
 
   useEffect(() => {
@@ -464,9 +476,23 @@ export default function App() {
           </button>
         )}
 
-        <span className="model-chip" title={`${app.provider} · ${app.model}`}>
-          {app.backend === "local" ? app.model : "ACP"}
-        </span>
+        {/* The chip already names the model, so it is the obvious place to
+            go to change it. ACP sessions have no button: the connected agent
+            owns its own model and a form that changed nothing would be worse
+            than none. */}
+        {app.backend === "acp" ? (
+          <span className="model-chip" title={`${app.provider} · ${app.model}`}>
+            ACP
+          </span>
+        ) : (
+          <button
+            className="model-chip"
+            title={`${app.provider} · ${app.model} — click to change`}
+            onClick={() => setShowModelSettings(true)}
+          >
+            {app.model}
+          </button>
+        )}
 
         <Menu
           align="right"
@@ -505,7 +531,25 @@ export default function App() {
         <div className="setup-banner">
           <span aria-hidden>!</span>
           <span>{app.credentials_hint}</span>
+          {app.backend !== "acp" && (
+            <button
+              className="btn sm"
+              onClick={() => setShowModelSettings(true)}
+            >
+              Set up a model
+            </button>
+          )}
         </div>
+      )}
+
+      {showModelSettings && (
+        <ModelSettings
+          onClose={() => setShowModelSettings(false)}
+          // The title bar and the setup banner both read from `app`, so it is
+          // refetched rather than patched — one source, no chance of the chip
+          // and the banner disagreeing.
+          onSaved={() => void refreshApp()}
+        />
       )}
 
       <div

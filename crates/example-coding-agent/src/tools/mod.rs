@@ -1153,13 +1153,25 @@ fn apply_resource_limits() {
     /// so never trips an idle timeout.
     const MAX_CPU_SECONDS: u64 = 3600;
 
-    let set = |resource: libc::__rlimit_resource_t, value: u64| {
+    // The first argument to `setrlimit` is spelled differently per platform:
+    // glibc has its own `__rlimit_resource_t`, the BSDs (macOS included) take
+    // a plain `c_int`. Naming the Linux type unconditionally compiled fine on
+    // the machine it was written on and failed the macOS CI job.
+    #[cfg(target_os = "linux")]
+    type RlimitResource = libc::__rlimit_resource_t;
+    #[cfg(not(target_os = "linux"))]
+    type RlimitResource = libc::c_int;
+
+    let set = |resource: RlimitResource, value: u64| {
         let limit = libc::rlimit {
             rlim_cur: value,
             rlim_max: value,
         };
         unsafe { libc::setrlimit(resource, &limit) };
     };
+    // On macOS `RLIMIT_AS` shares its value with `RLIMIT_RSS` and is advisory
+    // rather than enforced, so the memory cap is a Linux guarantee and a
+    // best-effort elsewhere. Setting it costs nothing either way.
     set(libc::RLIMIT_AS, MAX_MEMORY_BYTES);
     set(libc::RLIMIT_FSIZE, MAX_FILE_BYTES);
     set(libc::RLIMIT_CPU, MAX_CPU_SECONDS);

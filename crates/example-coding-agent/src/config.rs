@@ -252,6 +252,50 @@ pub enum Provider {
     OpenAiChat,
 }
 
+impl Provider {
+    /// Every provider, for a chooser.
+    pub const ALL: [Provider; 4] = [
+        Provider::Anthropic,
+        Provider::OpenAiResponses,
+        Provider::Qwen,
+        Provider::OpenAiChat,
+    ];
+
+    /// The stable identifier used in APIs and settings files.
+    pub fn id(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAiResponses => "openai-responses",
+            Provider::Qwen => "qwen",
+            Provider::OpenAiChat => "openai-chat",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.id() == id)
+    }
+
+    /// What to call it in front of a person.
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "Anthropic",
+            Provider::OpenAiResponses => "OpenAI (Responses)",
+            Provider::Qwen => "Qwen",
+            Provider::OpenAiChat => "OpenAI-compatible",
+        }
+    }
+
+    /// What the endpoint field means for this provider, for a form.
+    pub fn endpoint_hint(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "Leave blank for api.anthropic.com, or point at a gateway",
+            Provider::OpenAiResponses => "Leave blank for api.openai.com/v1",
+            Provider::Qwen => "Leave blank for DashScope's compatible-mode endpoint",
+            Provider::OpenAiChat => "Any OpenAI-compatible endpoint: Ollama, vLLM, a gateway",
+        }
+    }
+}
+
 impl ModelConfig {
     /// Resolve provider and credentials from the environment.
     ///
