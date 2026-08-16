@@ -94,6 +94,8 @@ beforeEach(() => {
         provider: "anthropic",
         model: "test-model",
         base_url: "",
+        source: "manual",
+        claude_settings_available: true,
         has_key: true,
         key_remembered: false,
         providers: [
@@ -283,6 +285,9 @@ describe("permission prompts", () => {
     const key = screen.getByPlaceholderText(/leave blank to keep it|no key configured/);
     expect((key as HTMLInputElement).value).toBe("");
     expect((key as HTMLInputElement).type).toBe("password");
+
+    // And the file can be chosen as the source instead of typing anything.
+    expect(screen.getByText(/~\/\.claude\/settings\.json/)).toBeTruthy();
   });
 
   it("shows how many rewound attempts are still steering the agent", async () => {

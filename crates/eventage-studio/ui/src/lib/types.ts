@@ -22,7 +22,12 @@ export interface ModeInfo {
  * No credential, ever — `has_key` says whether one is configured and that is
  * all the form needs to render correctly.
  */
+export type ModelSource = "manual" | "claude-settings";
+
 export interface ModelView {
+  source: ModelSource;
+  /** Whether ~/.claude/settings.json currently resolves to a usable profile. */
+  claude_settings_available: boolean;
   provider: string;
   model: string;
   base_url: string;

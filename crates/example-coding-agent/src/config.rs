@@ -297,6 +297,49 @@ impl Provider {
 }
 
 impl ModelConfig {
+    /// Build a profile from a Claude Code settings `env` block.
+    ///
+    /// Pure: it reads the map it is given and does not touch the process
+    /// environment. That matters because this runs *after* startup — a user
+    /// can point Studio at `~/.claude/settings.json` from the settings
+    /// screen, long after the runtime and its threads exist, and `set_var` is
+    /// unsound there.
+    ///
+    /// Anthropic-shaped, because that is what the file is for: Claude Code
+    /// writes `ANTHROPIC_*` into it, and every gateway's setup guide is
+    /// phrased in those variables.
+    ///
+    /// `None` when the block names no credential — an empty settings file
+    /// should leave the previous choice alone rather than silently
+    /// deconfiguring the app.
+    pub fn from_claude_env(
+        env: &std::collections::BTreeMap<String, String>,
+        model_override: Option<String>,
+    ) -> Option<Self> {
+        let get = |key: &str| env.get(key).filter(|v| !v.trim().is_empty()).cloned();
+
+        // Same precedence as the environment path: a gateway's bearer token
+        // is checked before a stray key.
+        let bearer = get("ANTHROPIC_AUTH_TOKEN");
+        let key = bearer.clone().or_else(|| get("ANTHROPIC_API_KEY"))?;
+
+        Some(Self {
+            provider: Provider::Anthropic,
+            model: model_override
+                .or_else(|| get("ANTHROPIC_MODEL"))
+                .unwrap_or_else(|| "claude-sonnet-4-5".into()),
+            api_key: key,
+            thinking_tokens: Some(8_000),
+            max_tokens: 32_000,
+            bearer_auth: bearer.is_some(),
+            credentialed: true,
+            base_url: get("ANTHROPIC_BASE_URL"),
+            headers: get("ANTHROPIC_CUSTOM_HEADERS")
+                .map(|raw| crate::settings::parse_custom_headers(&raw))
+                .unwrap_or_default(),
+        })
+    }
+
     /// Resolve provider and credentials from the environment.
     ///
     /// Prefers Anthropic, then the OpenAI Responses API, then any

@@ -1,6 +1,7 @@
 /** Typed client for the Studio server. */
 
 import type {
+  ModelSource,
   ModelView,
   AppInfo,
   PromptBlock,
@@ -139,6 +140,7 @@ export const api = {
    * the user out every time they renamed a model.
    */
   setModelSettings: (body: {
+    source: ModelSource;
     provider: string;
     model: string;
     base_url: string;

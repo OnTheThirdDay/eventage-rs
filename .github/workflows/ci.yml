@@ -16,6 +16,10 @@ jobs:
   check:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # A test that hangs otherwise runs until the six-hour default and tells
+    # you nothing. The suite takes about two minutes; twenty is generous and
+    # still fails while somebody is looking.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +55,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # `--all-features` matters: it is the only place several features are
+      # compiled, and it is what caught a hang that a plain `cargo test` did
+      # not run at all.
       - name: Test
         run: cargo test --workspace --all-features
 
@@ -73,6 +80,7 @@ jobs:
   ui:
     name: studio ui
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: crates/eventage-studio/ui

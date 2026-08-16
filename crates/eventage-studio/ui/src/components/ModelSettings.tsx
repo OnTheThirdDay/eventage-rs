@@ -11,7 +11,7 @@
  */
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { ModelView } from "../lib/types";
+import type { ModelSource, ModelView } from "../lib/types";
 
 export function ModelSettings({
   onClose,
@@ -26,6 +26,7 @@ export function ModelSettings({
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [remember, setRemember] = useState(false);
+  const [source, setSource] = useState<ModelSource>("manual");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -40,6 +41,7 @@ export function ModelSettings({
         setModel(v.model);
         setBaseUrl(v.base_url);
         setRemember(v.key_remembered);
+        setSource(v.source);
       })
       .catch((e: unknown) => !cancelled && setError(String(e)));
     return () => {
@@ -54,6 +56,7 @@ export function ModelSettings({
     setError(null);
     try {
       await api.setModelSettings({
+        source,
         provider,
         model,
         base_url: baseUrl,
@@ -90,10 +93,42 @@ export function ModelSettings({
               void save();
             }}
           >
+            {/* Offered first, because choosing it makes every field below
+                irrelevant — and the file stays authoritative, so editing it
+                later still works without coming back here. */}
+            <fieldset className="model-source">
+              <legend>Where settings come from</legend>
+              <label className="radio">
+                <input
+                  type="radio"
+                  checked={source === "claude-settings"}
+                  disabled={!view.claude_settings_available}
+                  onChange={() => setSource("claude-settings")}
+                />
+                <span>
+                  Claude Code — <code>~/.claude/settings.json</code>
+                  <small className="muted">
+                    {view.claude_settings_available
+                      ? "Read fresh each session, so edits to that file take effect. Nothing is copied here."
+                      : "No Anthropic credential in that file yet."}
+                  </small>
+                </span>
+              </label>
+              <label className="radio">
+                <input
+                  type="radio"
+                  checked={source === "manual"}
+                  onChange={() => setSource("manual")}
+                />
+                <span>Configure here</span>
+              </label>
+            </fieldset>
+
             <label>
               <span>Provider</span>
               <select
                 value={provider}
+                disabled={source === "claude-settings"}
                 onChange={(e) => setProvider(e.target.value)}
               >
                 {view.providers.map((p) => (
@@ -108,6 +143,7 @@ export function ModelSettings({
               <span>Model</span>
               <input
                 value={model}
+                disabled={source === "claude-settings"}
                 onChange={(e) => setModel(e.target.value)}
                 placeholder="e.g. claude-sonnet-4-5"
                 autoFocus
@@ -118,6 +154,7 @@ export function ModelSettings({
               <span>Endpoint</span>
               <input
                 value={baseUrl}
+                disabled={source === "claude-settings"}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder={chosen?.endpoint_hint ?? ""}
               />
@@ -129,6 +166,7 @@ export function ModelSettings({
               <input
                 type="password"
                 value={apiKey}
+                disabled={source === "claude-settings"}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={
                   view.has_key

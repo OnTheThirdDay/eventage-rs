@@ -28,9 +28,34 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+/// Where the model configuration comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelSource {
+    /// Typed into this screen.
+    Manual,
+    /// Read from `~/.claude/settings.json`, the file Claude Code uses.
+    ///
+    /// Re-read on every session rather than copied once, so editing that file
+    /// takes effect without restarting Studio — and so the credential is not
+    /// duplicated into a second place on disk.
+    ClaudeSettings,
+}
+
+impl Default for ModelSource {
+    fn default() -> Self {
+        Self::Manual
+    }
+}
+
 /// What a settings screen is shown. Deliberately without the credential.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelView {
+    pub source: ModelSource,
+    /// Whether `~/.claude/settings.json` currently resolves to a usable
+    /// Anthropic profile, so the screen can offer that choice honestly
+    /// instead of letting someone pick a source that turns out to be empty.
+    pub claude_settings_available: bool,
     pub provider: String,
     pub model: String,
     /// Empty when the provider's default endpoint is in use.
@@ -53,6 +78,8 @@ pub struct ProviderChoice {
 /// A change from the settings screen.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelUpdate {
+    #[serde(default)]
+    pub source: ModelSource,
     pub provider: String,
     pub model: String,
     #[serde(default)]
@@ -68,6 +95,8 @@ pub struct ModelUpdate {
 /// What is written to disk. The credential only if asked for.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Stored {
+    #[serde(default)]
+    source: ModelSource,
     provider: String,
     model: String,
     #[serde(default)]
@@ -81,6 +110,7 @@ struct Stored {
 /// small struct, and `info()` on the backend trait is synchronous. The only
 /// slow thing here is writing the file, and that happens with no lock held.
 pub struct ModelSettings {
+    source: RwLock<ModelSource>,
     current: RwLock<ModelConfig>,
     /// True when the credential in `current` came from — and stays on — disk.
     remembered: RwLock<bool>,
@@ -98,10 +128,12 @@ impl ModelSettings {
         let path = state_dir.join("model.json");
         let mut current = fallback;
         let mut remembered = false;
+        let mut source = ModelSource::Manual;
 
         if let Ok(text) = tokio::fs::read_to_string(&path).await {
             match serde_json::from_str::<Stored>(&text) {
                 Ok(stored) => {
+                    source = stored.source;
                     if let Some(provider) = Provider::from_id(&stored.provider) {
                         current.provider = provider;
                     }
@@ -125,15 +157,37 @@ impl ModelSettings {
         }
 
         Self {
+            source: RwLock::new(source),
             current: RwLock::new(current),
             remembered: RwLock::new(remembered),
             path,
         }
     }
 
+    /// What `~/.claude/settings.json` resolves to right now, if anything.
+    ///
+    /// Read each time rather than cached: the point of choosing this source
+    /// is that the file stays authoritative, so editing it — or having Claude
+    /// Code rewrite it — takes effect on the next session without restarting.
+    fn from_claude_settings() -> Option<ModelConfig> {
+        // An empty path is fine: `load` only reads `<dir>/.claude` for the
+        // project layer, and the user layer comes from the home directory
+        // regardless.
+        let settings = eventage_code::settings::ClaudeSettings::load("");
+        ModelConfig::from_claude_env(&settings.user_env, settings.model)
+    }
+
     /// The configuration a new session should be opened with.
     pub fn get(&self) -> ModelConfig {
-        self.read().clone()
+        match *self.source.read().unwrap_or_else(|e| e.into_inner()) {
+            ModelSource::Manual => self.read().clone(),
+            // Falls back to the manual profile if the file has since been
+            // emptied or removed, rather than handing out a session with no
+            // credential and letting the first request explain it.
+            ModelSource::ClaudeSettings => {
+                Self::from_claude_settings().unwrap_or_else(|| self.read().clone())
+            }
+        }
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, ModelConfig> {
@@ -142,8 +196,20 @@ impl ModelSettings {
 
     /// What the settings screen shows.
     pub fn view(&self) -> ModelView {
-        let current = self.read();
+        let source = *self.source.read().unwrap_or_else(|e| e.into_inner());
+        let from_claude = Self::from_claude_settings();
+        // Describe what is actually in force, so the screen shows the
+        // resolved model and endpoint rather than a stale manual profile the
+        // session is not using.
+        let effective = match source {
+            ModelSource::ClaudeSettings => from_claude.clone(),
+            ModelSource::Manual => None,
+        };
+        let manual = self.read();
+        let current = effective.as_ref().unwrap_or(&manual);
         ModelView {
+            source,
+            claude_settings_available: from_claude.is_some(),
             provider: current.provider.id().to_string(),
             model: current.model.clone(),
             base_url: current.base_url.clone().unwrap_or_default(),
@@ -171,6 +237,7 @@ impl ModelSettings {
             anyhow::bail!("give a model name");
         }
 
+        *self.source.write().unwrap_or_else(|e| e.into_inner()) = update.source;
         {
             let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
             current.provider = provider;
@@ -199,6 +266,7 @@ impl ModelSettings {
         let stored = {
             let current = self.read();
             Stored {
+                source: update.source,
                 provider: current.provider.id().to_string(),
                 model: current.model.clone(),
                 base_url: current.base_url.clone().unwrap_or_default(),
@@ -265,6 +333,7 @@ mod tests {
 
         let view = settings
             .set(ModelUpdate {
+                source: ModelSource::Manual,
                 provider: "qwen".into(),
                 model: "qwen3-max".into(),
                 base_url: "https://gateway.example/v1/".into(),
@@ -294,6 +363,7 @@ mod tests {
         let settings = ModelSettings::load(bare(), dir.path()).await;
         settings
             .set(ModelUpdate {
+                source: ModelSource::Manual,
                 provider: "qwen".into(),
                 model: "qwen3-max".into(),
                 base_url: String::new(),
@@ -318,6 +388,7 @@ mod tests {
             let settings = ModelSettings::load(bare(), dir.path()).await;
             settings
                 .set(ModelUpdate {
+                    source: ModelSource::Manual,
                     provider: "openai-chat".into(),
                     model: "qwen3:4b".into(),
                     base_url: "http://localhost:11434/v1".into(),
@@ -361,6 +432,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings = ModelSettings::load(bare(), dir.path()).await;
         let base = |key: Option<String>| ModelUpdate {
+            source: ModelSource::Manual,
             provider: "qwen".into(),
             model: "qwen3-max".into(),
             base_url: String::new(),
@@ -379,11 +451,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn choosing_claude_settings_keeps_the_file_authoritative() {
+        // The point of the choice is that `~/.claude/settings.json` stays the
+        // source of truth: editing it, or letting Claude Code rewrite it,
+        // takes effect on the next session. Copying its values into our own
+        // file once would duplicate the credential onto disk and then go
+        // stale.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"env":{"ANTHROPIC_API_KEY":"sk-from-claude-code",
+                       "ANTHROPIC_BASE_URL":"https://gw.example"},
+                "model":"claude-sonnet-4-5"}"#,
+        )
+        .unwrap();
+
+        // SAFETY: this test binary runs alone against the environment.
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings = ModelSettings::load(bare(), dir.path()).await;
+        assert!(settings.view().claude_settings_available);
+
+        settings
+            .set(ModelUpdate {
+                source: ModelSource::ClaudeSettings,
+                provider: "qwen".into(),
+                model: "ignored-while-that-source-is-chosen".into(),
+                base_url: String::new(),
+                api_key: None,
+                remember_key: false,
+            })
+            .await
+            .unwrap();
+
+        // Sessions get what the file says, not what the form said.
+        let config = settings.get();
+        assert_eq!(config.provider, Provider::Anthropic);
+        assert_eq!(config.api_key, "sk-from-claude-code");
+        assert_eq!(config.base_url.as_deref(), Some("https://gw.example"));
+
+        // Editing the file is picked up without restarting.
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"env":{"ANTHROPIC_API_KEY":"sk-rotated"},"model":"claude-opus-4-6"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.get().api_key, "sk-rotated");
+        assert_eq!(settings.view().model, "claude-opus-4-6");
+
+        // And the credential was never copied into our own file.
+        let on_disk = std::fs::read_to_string(dir.path().join("model.json")).unwrap();
+        assert!(!on_disk.contains("sk-from-claude-code"), "{on_disk}");
+        assert!(!on_disk.contains("sk-rotated"), "{on_disk}");
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[tokio::test]
     async fn a_nonsense_provider_or_empty_model_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let settings = ModelSettings::load(bare(), dir.path()).await;
         assert!(settings
             .set(ModelUpdate {
+                source: ModelSource::Manual,
                 provider: "not-a-provider".into(),
                 model: "m".into(),
                 base_url: String::new(),
@@ -394,6 +530,7 @@ mod tests {
             .is_err());
         assert!(settings
             .set(ModelUpdate {
+                source: ModelSource::Manual,
                 provider: "qwen".into(),
                 model: "   ".into(),
                 base_url: String::new(),

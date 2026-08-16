@@ -1091,6 +1091,9 @@ impl Bash {
                     .into(),
             ));
         }
+        // Whether the trampoline is doing the work decides where `setsid` and
+        // the resource limits are applied — see below.
+        let via_helper = confined.is_some();
         let mut cmd: tokio::process::Command = match confined {
             Some(helper) => helper.into(),
             None => {
@@ -1106,20 +1109,30 @@ impl Bash {
             .env_clear()
             .envs(scrubbed_env());
 
+        // Nothing at all runs between fork and exec when the trampoline is
+        // used: it is single-threaded by construction, so it does `setsid`
+        // and the limits itself, before it execs.
+        //
+        // This is the same reasoning that moved the Landlock ruleset out of
+        // `pre_exec`, applied to what was left behind. `setsid` and
+        // `setrlimit` are bare syscalls and *should* be safe in a forked
+        // child — but a hung child with one thread parked on a futex says
+        // otherwise, and the fork-in-a-threaded-process hazard is not worth
+        // arguing with when a process that cannot have it is already there.
+        //
+        // The unconfined path keeps `pre_exec`, because it has no trampoline
+        // to delegate to.
         #[cfg(unix)]
-        unsafe {
-            // SAFETY: `pre_exec` runs in the forked child before exec. Only
-            // async-signal-safe work is permitted there, so this is limited
-            // to bare syscalls that allocate nothing — the filesystem
-            // confinement that used to be here is why, see `shell_sandbox`.
-            cmd.pre_exec(move || {
-                // Its own process group, so a timeout or a cancellation can
-                // kill the whole tree rather than the shell alone and leave
-                // its children running.
-                libc::setsid();
-                apply_resource_limits();
-                Ok(())
-            });
+        if !via_helper {
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Its own process group, so a timeout or a cancellation
+                    // kills the whole tree rather than the shell alone.
+                    libc::setsid();
+                    apply_resource_limits();
+                    Ok(())
+                });
+            }
         }
         Ok(cmd)
     }
@@ -1144,7 +1157,7 @@ impl Bash {
 /// Not a substitute for one either way: there is still no network isolation
 /// and no accounting across the process tree.
 #[cfg(unix)]
-fn apply_resource_limits() {
+pub fn apply_resource_limits() {
     /// Address space. A large Rust build links with a lot of memory.
     const MAX_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
     /// A single file. Enough for any artifact, not enough to fill a disk.
@@ -1180,7 +1193,7 @@ fn apply_resource_limits() {
 }
 
 #[cfg(not(unix))]
-fn apply_resource_limits() {}
+pub fn apply_resource_limits() {}
 
 // Filesystem confinement of the shell is **not** applied here, and the reason
 // is worth recording so nobody puts it back the same way.

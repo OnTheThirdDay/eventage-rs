@@ -82,6 +82,11 @@ pub const HELPER_ARG: &str = "__eventage-confine-exec";
 /// A confinement that broke `cargo build` would be switched off within the
 /// day, so the toolchain caches are writable by name. Everything else on the
 /// filesystem stays readable and unwritable.
+// Linux-only: the only readers are the Landlock helper and the Linux
+// `confined_argv`. Elsewhere `confined_argv` returns `None` before any of this
+// is reached, so leaving it unguarded is dead code — which CI treats as an
+// error, and rightly: an unused path set is usually a wiring mistake.
+#[cfg(target_os = "linux")]
 fn writable_paths(root: &Path) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf(), std::env::temp_dir()];
     // The device files every shell expects to be able to write to. Landlock
@@ -146,6 +151,7 @@ fn writable_paths(root: &Path) -> Vec<PathBuf> {
 /// `/run` is omitted too, because `/run/user/$UID` holds the ssh-agent and
 /// keyring sockets. `/proc` is *not* omitted — too much ordinary machinery
 /// reads it — and the module docs say what that costs.
+#[cfg(target_os = "linux")]
 fn readable_paths(root: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = [
         "/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/proc",
@@ -199,6 +205,9 @@ pub enum Reads {
 }
 
 impl Reads {
+    /// Written only by the Linux command builder; `parse` is read everywhere,
+    /// so the argument list is validated the same way on every platform.
+    #[cfg(target_os = "linux")]
     fn token(self) -> &'static str {
         match self {
             Reads::Everywhere => "read-all",
@@ -463,6 +472,8 @@ pub enum Network {
 }
 
 impl Network {
+    /// See [`Reads::token`].
+    #[cfg(target_os = "linux")]
     fn token(self) -> &'static str {
         match self {
             Network::Allow => "net-allow",
@@ -525,6 +536,15 @@ pub fn run_if_helper() {
         eprintln!("{HELPER_ARG}: no command given");
         std::process::exit(70);
     }
+
+    // Done here rather than in the caller's `pre_exec`, because this process
+    // is single-threaded and has not forked: there is no inherited lock to
+    // deadlock on. The caller's fork/exec window is then completely empty.
+    #[cfg(unix)]
+    unsafe {
+        libc::setsid();
+    }
+    crate::tools::apply_resource_limits();
 
     #[cfg(target_os = "linux")]
     {
@@ -605,6 +625,8 @@ mod tests {
         assert_ne!(HELPER_ARG, "");
     }
 
+    // The path sets exist only on Linux; elsewhere there is no ruleset to build.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_writable_set_covers_the_workspace_and_nothing_imaginary() {
         let dir = tempfile::tempdir().unwrap();
@@ -632,6 +654,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_narrow_read_set_excludes_the_home_directory_itself() {
         // The claim the module docs make about `Reads::Workspace` is that
@@ -657,6 +680,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_helper_argument_order_round_trips() {
         // The helper parses positionally, so a change to the builder that is

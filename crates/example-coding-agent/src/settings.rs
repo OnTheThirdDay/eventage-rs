@@ -44,6 +44,22 @@
 //! gitignored by convention. Gitignoring a path does not stop a repository
 //! from shipping it, and a rule that can be defeated by `git add -f` is not
 //! a trust boundary.
+//!
+//! # Two layers, trusted differently
+//!
+//! `~/.claude/settings.json` is the operator's own file. Nothing a `git
+//! clone` brings can change it, so its `env` block is applied without asking
+//! — gating it would be demanding permission to read your own configuration,
+//! and a prompt that fires on the ordinary case teaches people to dismiss it.
+//! This is where a gateway you use everywhere belongs.
+//!
+//! The project's `.claude/` arrives with the repository and stays gated.
+//!
+//! Values follow Claude Code's precedence — a project overrides the user —
+//! while *trust* runs the other way. The two are not in conflict: the
+//! question "which value wins" and the question "may this file speak at all"
+//! have different answers, and conflating them is how a repository ends up
+//! silently redirecting a credential.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -65,7 +81,15 @@ struct SettingsFile {
 /// The subset of `.claude/settings.json` we act on.
 #[derive(Debug, Default)]
 pub struct ClaudeSettings {
-    /// Environment variables the repository asks for.
+    /// Environment variables from `~/.claude/settings.json`.
+    ///
+    /// Applied without asking. This file is the operator's own — it did not
+    /// arrive with a repository, and nothing a `git clone` brings can change
+    /// it. Gating it would be asking someone for permission to read their own
+    /// configuration, and would make the trust prompt meaningless by firing
+    /// on the ordinary case.
+    pub user_env: BTreeMap<String, String>,
+    /// Environment variables the *repository* asks for.
     ///
     /// Read but not trusted. [`apply_env`](Self::apply_env) applies them only
     /// when the operator has marked the repository trusted; see the module
@@ -100,8 +124,31 @@ impl ClaudeSettings {
     /// gateway API key lives in. Both are repository files and neither is
     /// trusted on its own; see the module docs.
     pub fn load(dir: impl AsRef<Path>) -> Self {
-        let claude = dir.as_ref().join(".claude");
         let mut merged = Self::default();
+
+        // The user's own settings first, so a project can override the model
+        // — which is Claude Code's own precedence — while the *trust* of the
+        // two layers runs the other way: yours is trusted, the repository's
+        // is not.
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(".claude/settings.json");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                match serde_json::from_str::<SettingsFile>(&text) {
+                    Ok(settings) => {
+                        debug!(path = %path.display(), "read user Claude settings");
+                        merged.user_env.extend(settings.env);
+                        if settings.model.is_some() {
+                            merged.model = settings.model;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), "ignoring unreadable settings: {e}")
+                    }
+                }
+            }
+        }
+
+        let claude = dir.as_ref().join(".claude");
         for name in ["settings.json", "settings.local.json"] {
             let path = claude.join(name);
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -145,6 +192,15 @@ impl ClaudeSettings {
     /// would be a value in it that does nothing.
     pub fn apply_env(&self) -> AppliedEnv {
         let mut result = AppliedEnv::default();
+
+        // Yours, applied whatever the repository is.
+        for (key, value) in &self.user_env {
+            // SAFETY: called once during startup, before any threads that
+            // read the environment have been spawned.
+            unsafe { std::env::set_var(key, value) };
+            result.applied.push(key.clone());
+        }
+
         if self.env.is_empty() {
             return result;
         }
@@ -329,6 +385,41 @@ mod tests {
         let result = ClaudeSettings::load(dir.path()).apply_env();
         assert!(result.needs_trust);
         assert!(std::env::var_os("EVENTAGE_TEST_FROM_LOCAL").is_none());
+    }
+
+    #[test]
+    fn a_users_own_settings_need_no_trust() {
+        // `~/.claude/settings.json` did not arrive with a repository. Gating
+        // it would ask someone for permission to read their own file, and
+        // would fire the trust prompt on the ordinary case — which is how a
+        // security prompt becomes something people click through.
+        let mut settings = ClaudeSettings::default();
+        settings
+            .user_env
+            .insert("EVENTAGE_TEST_USER_LAYER".into(), "mine".into());
+        settings
+            .env
+            .insert("EVENTAGE_TEST_PROJECT_LAYER".into(), "theirs".into());
+
+        let result = settings.apply_env();
+
+        assert!(result
+            .applied
+            .contains(&"EVENTAGE_TEST_USER_LAYER".to_string()));
+        assert_eq!(
+            std::env::var("EVENTAGE_TEST_USER_LAYER").as_deref(),
+            Ok("mine")
+        );
+
+        // The repository's layer is still withheld in the same call.
+        assert!(result.needs_trust);
+        assert!(result
+            .withheld
+            .contains(&"EVENTAGE_TEST_PROJECT_LAYER".to_string()));
+        assert!(std::env::var_os("EVENTAGE_TEST_PROJECT_LAYER").is_none());
+
+        // SAFETY: this test binary is the only reader of this variable.
+        unsafe { std::env::remove_var("EVENTAGE_TEST_USER_LAYER") };
     }
 
     #[test]

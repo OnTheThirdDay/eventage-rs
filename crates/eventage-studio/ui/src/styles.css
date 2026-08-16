@@ -2399,3 +2399,28 @@ button.model-chip {
   border: 1px solid transparent;
 }
 button.model-chip:hover { border-color: var(--border-strong); }
+
+/* The source choice sits above the fields it makes irrelevant, so the
+   disabled state below reads as a consequence rather than a fault. */
+.model-source {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.75rem;
+  margin: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+.model-source legend {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  padding: 0 0.3rem;
+}
+.model-form label.radio {
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 0.5rem;
+}
+.model-form label.radio input { width: auto; margin-top: 0.2rem; }
+.model-form label.radio > span { display: grid; gap: 0.15rem; font-size: 0.85rem; }
+.model-form input:disabled,
+.model-form select:disabled { opacity: 0.5; cursor: not-allowed; }
