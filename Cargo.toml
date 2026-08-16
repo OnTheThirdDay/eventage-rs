@@ -5,7 +5,7 @@ members = [
     "crates/example-coding-agent",
     "crates/eventage-studio",
     "crates/example-clang-agent",
-    "crates/example-eventage-claw",
+    "crates/example-cowork",
 ]
 resolver = "2"
 

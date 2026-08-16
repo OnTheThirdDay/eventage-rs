@@ -31,6 +31,20 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      # Studio embeds its front-end at compile time from `ui/dist`, which is a
+      # build artifact and so is not in the checkout. Without this the Rust
+      # job compiled a Studio with no UI in it, and the test that asks the
+      # deep-link route for an HTML document failed with nothing to say about
+      # why. Building it here means the binary CI tests is the binary we ship.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/eventage-studio/ui/package-lock.json
+      - name: Build the Studio front-end
+        working-directory: crates/eventage-studio/ui
+        run: npm ci && npm run build
+
       - name: Format
         run: cargo fmt --all --check
 

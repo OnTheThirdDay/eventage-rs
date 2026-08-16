@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 eventage = { path = "../..", features = ["observability", "sqlite-bundled", "mcp", "sandbox"] }
+cowork             = { package = "example-cowork", path = "../example-cowork" }
 eventage_code = { package = "example-coding-agent", path = "../example-coding-agent" }
 
 axum               = { version = "0.7", features = ["macros"] }

@@ -8,6 +8,7 @@
 //! what the protocol carries.
 
 pub mod acp;
+pub mod cowork;
 pub mod local;
 
 use crate::feed::EventFeed;

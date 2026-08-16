@@ -202,7 +202,12 @@ For a deep dive into the framework's mechanics — from low-level bus routing, t
 Full applications live in `crates/`:
 *   `example-coding-agent` — `eventage-code`, an LSP-aware coding agent that speaks the Agent Client Protocol, so it runs inside Zed, JetBrains, or any ACP-capable editor.
 *   `eventage-studio` — a desktop app for that agent: the conversation on one side, a live trace of the event log on the other. See [its README](crates/eventage-studio/README.md).
-*   `example-eventage-claw` — a general-purpose work agent, not a coding one.
+*   `example-cowork` — a working session you can *navigate*. A goal fans into
+    parallel workstreams, each on its own branch and its own copy of a folder;
+    you compare what they produced and keep one, and the rest stay in the graph
+    as evidence a later attempt reads back. A shadow git repository, kept
+    outside the folder, gives a pile of documents the same branch-and-compare
+    a repository gets for free.
 *   `example-clang-agent` — C programming against the sandboxed executors.
 *   `eventage-replay-cli` — replay a recorded event log.
 

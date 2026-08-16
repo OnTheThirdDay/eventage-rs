@@ -1041,7 +1041,7 @@ pub enum ShellContainment {
 /// hostile, and the parent process holds the credential for the very model
 /// that proposed it. Matching on shape rather than an allow-list of known
 /// names, because the next provider's variable is not in any list.
-pub(crate) fn is_credential(name: &str) -> bool {
+pub fn is_credential(name: &str) -> bool {
     const MARKERS: [&str; 7] = [
         "KEY",
         "TOKEN",
@@ -1073,7 +1073,7 @@ pub(crate) fn is_credential(name: &str) -> bool {
 /// filter. It stays because the filter is the guarantee and the scrub is an
 /// optimisation of it: the library is usable without `main` ever running, and
 /// a tool that leaked the key when embedded would be a strange thing to ship.
-pub(crate) fn scrubbed_env() -> Vec<(String, String)> {
+pub fn scrubbed_env() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(name, _)| !is_credential(name))
         .collect()

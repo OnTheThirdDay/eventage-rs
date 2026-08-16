@@ -14,7 +14,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::kinds::{CLAW_SCHEDULE_CREATE, CLAW_SCHEDULE_UPDATE};
+use crate::kinds::{
+    SCHEDULE_CREATE as CLAW_SCHEDULE_CREATE, SCHEDULE_UPDATE as CLAW_SCHEDULE_UPDATE,
+};
 
 // ── ScheduledTask ─────────────────────────────────────────────────────────────
 

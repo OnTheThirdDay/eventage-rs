@@ -1,16 +1,24 @@
 [package]
-name = "example-eventage-claw"
-version = "0.1.0"
+name = "example-cowork"
+version = "0.2.0"
 edition = "2021"
 publish = false
-description = "Personal assistant"
+description = "Cowork — a working session you can navigate, not just steer"
+
+[lib]
+name = "cowork"
+path = "src/lib.rs"
 
 [[bin]]
-name = "claw"
+name = "cowork"
 path = "src/main.rs"
 
 [dependencies]
-eventage           = { path = "../..", features = ["observability", "scheduler", "replay"] }
+eventage           = { path = "../..", features = ["observability", "scheduler", "replay", "sqlite-bundled"] }
+# Workspace confinement, credential handling, sandboxing and working-tree
+# snapshots already exist there and are not coding-specific. Studio depends on
+# the same crate for the same reason.
+eventage_code      = { package = "example-coding-agent", path = "../example-coding-agent" }
 tokio              = { version = "1", features = ["full"] }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
@@ -25,9 +33,6 @@ clap               = { version = "4", features = ["derive"] }
 dirs               = "5"
 reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util       = "0.3"
-ratatui            = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm          = { version = "0.28", features = ["event-stream"] }
-rustyline          = "14"
 axum               = "0.7"
 tower              = "0.4"
 tokio-util         = { version = "0.7", features = ["io"] }
@@ -37,3 +42,6 @@ walkdir            = "2"
 serde_yaml         = "0.9"
 cron               = "0.12"
 toml               = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

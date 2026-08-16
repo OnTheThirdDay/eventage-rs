@@ -89,6 +89,50 @@ async fn connect_mcp(
     )
 }
 
+/// Build the provider a [`ModelConfig`](crate::config::ModelConfig) describes.
+///
+/// Free-standing because it is not the coding agent's: cowork resolves a model
+/// the same way, and two copies of the gateway handling would drift the first
+/// time one of them learned something. Every provider is wrapped in
+/// `RetryProvider`, since a transient 429 in the middle of a long session is
+/// the most likely failure any of them will see.
+pub fn provider_for(model: &crate::config::ModelConfig) -> Arc<dyn LlmProvider> {
+    match model.provider {
+        Provider::Anthropic => {
+            let mut p = AnthropicProvider::new(&model.api_key, &model.model)
+                .with_max_tokens(model.max_tokens)
+                // A gateway is the same API at a different address with
+                // its own routing headers, so it needs no provider of its
+                // own — Portkey, LiteLLM, Helicone and Bedrock proxies all
+                // configure exactly this way.
+                .with_bearer_auth(model.bearer_auth)
+                .with_headers(model.headers.clone());
+            if let Some(url) = &model.base_url {
+                p = p.with_base_url(url.trim_end_matches('/'));
+            }
+            if let Some(budget) = model.thinking_tokens {
+                p = p.with_thinking(budget);
+            }
+            Arc::new(eventage::RetryProvider::new(p))
+        }
+        Provider::OpenAiResponses => Arc::new(eventage::RetryProvider::new(
+            OpenAiResponsesProvider::new(&model.api_key, &model.model)
+                .with_base_url(model.base_url())
+                .with_reasoning_effort("high"),
+        )),
+        Provider::Qwen => Arc::new(eventage::RetryProvider::new(
+            eventage::llm::QwenProvider::new(&model.api_key, &model.model)
+                .with_base_url(model.base_url())
+                .with_thinking(true),
+        )),
+        Provider::OpenAiChat => Arc::new(eventage::RetryProvider::new(OpenAiProvider::new(
+            model.base_url(),
+            &model.api_key,
+            &model.model,
+        ))),
+    }
+}
+
 /// One live coding session.
 pub struct CodingSession {
     pub id: String,
@@ -234,40 +278,7 @@ impl CodingSession {
         let persistence = tokio::spawn(observer.run_with(events));
 
         // ── Model ────────────────────────────────────────────────────────────
-        let llm: Arc<dyn LlmProvider> = match config.model.provider {
-            Provider::Anthropic => {
-                let mut p = AnthropicProvider::new(&config.model.api_key, &config.model.model)
-                    .with_max_tokens(config.model.max_tokens)
-                    // A gateway is the same API at a different address with
-                    // its own routing headers, so it needs no provider of its
-                    // own — Portkey, LiteLLM, Helicone and Bedrock proxies all
-                    // configure exactly this way.
-                    .with_bearer_auth(config.model.bearer_auth)
-                    .with_headers(config.model.headers.clone());
-                if let Some(url) = &config.model.base_url {
-                    p = p.with_base_url(url.trim_end_matches('/'));
-                }
-                if let Some(budget) = config.model.thinking_tokens {
-                    p = p.with_thinking(budget);
-                }
-                Arc::new(eventage::RetryProvider::new(p))
-            }
-            Provider::OpenAiResponses => Arc::new(eventage::RetryProvider::new(
-                OpenAiResponsesProvider::new(&config.model.api_key, &config.model.model)
-                    .with_base_url(config.model.base_url())
-                    .with_reasoning_effort("high"),
-            )),
-            Provider::Qwen => Arc::new(eventage::RetryProvider::new(
-                eventage::llm::QwenProvider::new(&config.model.api_key, &config.model.model)
-                    .with_base_url(config.model.base_url())
-                    .with_thinking(true),
-            )),
-            Provider::OpenAiChat => Arc::new(eventage::RetryProvider::new(OpenAiProvider::new(
-                config.model.base_url(),
-                &config.model.api_key,
-                &config.model.model,
-            ))),
-        };
+        let llm: Arc<dyn LlmProvider> = provider_for(&config.model);
 
         // ── Context: project instructions + skills, then editing + summarizing ──
         let mut system_prompt = build_system_prompt(&config.cwd);
