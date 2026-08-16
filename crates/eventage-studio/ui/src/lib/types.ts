@@ -193,4 +193,11 @@ export interface ChatState {
   workstreams: Workstream[];
   /** Paths of the folder cowork is not tracking, and why it said so. */
   untracked: string[];
+  /**
+   * Rolled-back attempts being fed back into the agent's context.
+   *
+   * The agent is told about these on every request, which is invisible from
+   * the transcript — the warning goes to the model, not the screen.
+   */
+  sealedAttempts: number;
 }

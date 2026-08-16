@@ -580,6 +580,7 @@ export default function App() {
               disabled={!activeId}
               running={fullChat.running}
               modes={app.modes}
+              sealedAttempts={fullChat.sealedAttempts}
               mode={active?.mode ?? app.modes[0]?.id ?? "ask"}
               onSend={send}
               onInterrupt={() =>

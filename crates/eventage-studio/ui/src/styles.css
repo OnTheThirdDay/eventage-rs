@@ -2232,3 +2232,131 @@ button.loc:hover {
 .ctx-pinned .spacer {
   flex: 1;
 }
+
+/* ── workstreams ───────────────────────────────────────────────────────────
+   A fan-out shown as a comparison. The rows are deliberately plain: what
+   matters is which files each stream touched, and decoration competes with
+   that. */
+.workstreams {
+  border-top: 1px solid var(--border);
+  padding: 1rem 1.25rem 1.5rem;
+}
+.workstreams-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.workstreams-head h2 {
+  font-size: 0.9rem;
+  margin: 0;
+  color: var(--text);
+}
+.workstreams-head .hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.workstreams > ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+.workstream {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 0.9rem;
+  background: var(--bg-raised);
+}
+.workstream.sealed {
+  opacity: 0.65;
+}
+.workstream-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.workstream-head .glyph {
+  font-family: var(--mono);
+  color: var(--text-muted);
+}
+.workstream-head .title {
+  font-weight: 600;
+  color: var(--text);
+}
+.workstream-head .count {
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.workstream .brief,
+.workstream .report {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.workstream .epitaph {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+.workstream .changes {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.15rem;
+  font-size: 0.8rem;
+  font-family: var(--mono);
+}
+.workstream .changes li {
+  display: flex;
+  gap: 0.5rem;
+}
+.workstream .changes .status {
+  min-width: 4.5rem;
+  color: var(--text-faint);
+}
+.workstream .changes .status.added { color: var(--diff-add-text); }
+.workstream .changes .status.deleted { color: var(--diff-del-text); }
+.workstream .actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+.workstream .seal {
+  margin-top: 0.6rem;
+  display: grid;
+  gap: 0.35rem;
+}
+.workstream .seal label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.workstream .seal input {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font: inherit;
+}
+
+/* A rolled-back attempt keeps steering the agent long after it left the
+   transcript. Quiet by default — it is context, not an alert. */
+.sealed-badge {
+  font-size: 0.72rem;
+  padding: 0.14rem 0.44rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+  cursor: help;
+  font-variant-numeric: tabular-nums;
+}
+.sealed-badge:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}

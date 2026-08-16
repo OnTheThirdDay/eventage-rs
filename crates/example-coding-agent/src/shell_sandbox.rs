@@ -61,6 +61,16 @@
 
 use std::path::{Path, PathBuf};
 
+/// Whether *this* program handles [`HELPER_ARG`].
+///
+/// Set by [`run_if_helper`], and calling it is the proof: a binary that
+/// invokes it before parsing its own arguments will trampoline correctly, and
+/// one that never calls it will not. A test harness links the library without
+/// ever calling it, so the flag stays false there and no fallback is taken —
+/// which is the case that made re-executing `current_exe` unsafe in general.
+static SELF_HANDLES_HELPER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The marker that tells a fresh process it is the sandbox helper.
 ///
 /// Prefixed and unlikely to collide with a real subcommand; both binaries
@@ -88,8 +98,13 @@ fn writable_paths(root: &Path) -> Vec<PathBuf> {
         "/dev/shm",
         "/dev/ptmx",
         "/dev/pts",
-        "/dev/stdout",
-        "/dev/stderr",
+        // Deliberately *not* `/dev/stdout` or `/dev/stderr`. They are
+        // symlinks to `/proc/self/fd/{1,2}`, so what they resolve to depends
+        // on what the caller attached — and when stdout is a pipe, adding a
+        // rule for one fails with EBADFD and takes the whole ruleset down
+        // with it. Every confined command would then refuse to run, on
+        // exactly the kernels where confinement works. Writing to them needs
+        // no rule anyway: the descriptor is already open.
     ] {
         paths.push(PathBuf::from(dev));
     }
@@ -233,14 +248,17 @@ impl Policy {
 /// both an installed layout (`bin/eventage-code`, `bin/eventage-confine`) and
 /// cargo's (`target/debug/deps/some-test`, `target/debug/eventage-confine`).
 ///
-/// Falling back to `current_exe` with the marker argument — which is what
-/// this used to do unconditionally — is not safe in general: a binary that
-/// does not call [`run_if_helper`] first will hand the marker to its own
-/// argument parser. A test binary does exactly that, and libtest reads it as
-/// a filter, runs nothing, and exits 0. The caller sees a command that
-/// succeeded and produced no output, which is a sandbox failing in the one
-/// way you cannot notice. So: no helper, no confinement, and the caller is
-/// told rather than misled.
+/// If neither is there, the running executable is used — but **only** when it
+/// has declared it handles the marker by calling [`run_if_helper`]. That
+/// matters for a released single binary, which ships without a sibling and
+/// would otherwise silently run every "confined" command unconfined.
+///
+/// The declaration is not decoration. Re-executing `current_exe`
+/// unconditionally is unsafe: a binary that does not handle the marker hands
+/// it to its own argument parser, and a test binary does exactly that —
+/// libtest reads it as a filter, runs nothing, and exits 0, so the caller
+/// sees a command that succeeded and produced no output. That is a sandbox
+/// failing in the one way nobody notices.
 #[cfg(target_os = "linux")]
 fn helper_binary() -> Option<PathBuf> {
     use std::sync::OnceLock;
@@ -250,13 +268,20 @@ fn helper_binary() -> Option<PathBuf> {
             let exe = std::env::current_exe().ok()?;
             let mut dir = exe.parent()?;
             for _ in 0..2 {
-                let candidate = dir.join("eventage-confine");
-                if candidate.is_file() {
-                    return Some(candidate);
+                for name in ["eventage-confine", "eventage-confine.exe"] {
+                    let candidate = dir.join(name);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
                 }
                 dir = dir.parent()?;
             }
-            None
+            // No sibling: a single-binary install. Safe only because the
+            // program said it handles the marker.
+            match SELF_HANDLES_HELPER.load(std::sync::atomic::Ordering::Relaxed) {
+                true => Some(exe),
+                false => None,
+            }
         })
         .clone()
 }
@@ -466,6 +491,10 @@ impl Network {
 /// whichever one spawned the command, so the helper has to be reachable from
 /// all of them.
 pub fn run_if_helper() {
+    // Calling this *is* the declaration that this program handles the marker,
+    // which is what lets a single shipped binary trampoline through itself.
+    SELF_HANDLES_HELPER.store(true, std::sync::atomic::Ordering::Relaxed);
+
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) != Some(HELPER_ARG) {
         return;
@@ -546,10 +575,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_binary_that_never_declared_itself_gets_no_self_fallback() {
+        // The guard that makes the single-binary fallback safe. A test
+        // harness links this library and never calls `run_if_helper`, so
+        // re-executing itself would hand the marker to libtest — which reads
+        // it as a filter, runs nothing, and exits 0. The caller would see a
+        // command that succeeded with no output: a sandbox failing in the one
+        // way nobody notices.
+        //
+        // Ordering note: this asserts the *default*, so it must not run after
+        // `a_process_that_is_not_the_helper_is_left_alone`, which sets the
+        // flag. They are in one test to keep that ordering explicit rather
+        // than depending on the harness.
+        assert!(
+            !SELF_HANDLES_HELPER.load(std::sync::atomic::Ordering::Relaxed),
+            "the library declared itself helper-capable without being asked"
+        );
+
+        // Calling it is the declaration.
+        run_if_helper();
+        assert!(SELF_HANDLES_HELPER.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
     fn a_process_that_is_not_the_helper_is_left_alone() {
         // The guard has to be exact: a stray argument that merely resembles
-        // the marker must not turn an ordinary run into a trampoline.
-        run_if_helper();
+        // the marker must not turn an ordinary run into a trampoline. Covered
+        // by the test above, which calls it and returns.
+        assert_ne!(HELPER_ARG, "");
     }
 
     #[test]
@@ -563,6 +616,20 @@ mod tests {
         );
         // `cmd > /dev/null` is not an exotic thing to write.
         assert!(paths.contains(&PathBuf::from("/dev/null")));
+
+        // But never these two. They are symlinks to `/proc/self/fd/{1,2}`, so
+        // adding a Landlock rule for one fails with EBADFD whenever stdout is
+        // a pipe — which takes the whole ruleset down and makes every
+        // confined command refuse to run, on exactly the kernels where
+        // confinement works. Found by running a release binary with its
+        // output piped; unreachable on a machine without Landlock, which is
+        // why it survived every test.
+        for fd_alias in ["/dev/stdout", "/dev/stderr"] {
+            assert!(
+                !paths.contains(&PathBuf::from(fd_alias)),
+                "{fd_alias} is back in the writable set"
+            );
+        }
     }
 
     #[test]

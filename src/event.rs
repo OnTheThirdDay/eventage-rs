@@ -83,6 +83,20 @@ pub mod kinds {
     /// Payload: `{ "evicted_branches": usize, "evicted_nodes": usize }`.
     pub const SYSTEM_PRUNED: &str = "system.pruned";
 
+    /// A one-line summary of a rejected branch, written as it was evicted.
+    ///
+    /// Durable, unlike the eviction notice itself. The events are gone; this
+    /// sentence is what a later attempt — and anyone reading the trace — has
+    /// left of them, so it has to survive reopening the session.
+    pub const SYSTEM_EPITAPH: &str = "system.epitaph";
+
+    /// Plugins loaded at session start. Payload: `{ plugins: [{ name, description }] }`.
+    ///
+    /// A plugin silently changes the system prompt and the tool list, which
+    /// is exactly the kind of thing a user should be able to see rather than
+    /// infer from behaviour.
+    pub const SYSTEM_PLUGINS: &str = "system.plugins";
+
     // ── Multi-agent ───────────────────────────────────────────────────────────
     /// Directed message to an agent (or broadcast if `TO_AGENT_ID` is missing).
     pub const AGENT_MESSAGE: &str = "agent.message";

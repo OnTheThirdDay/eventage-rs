@@ -129,6 +129,32 @@ impl Default for ToolExecOptions {
     }
 }
 
+/// How many rejected branches an assembler is shown.
+///
+/// Bounded because they are injected into *every* request for the rest of the
+/// session: a long session that rewound repeatedly would otherwise spend a
+/// growing share of its context describing attempts nobody is making any
+/// more. The newest are the ones still worth avoiding.
+pub const MAX_REJECTED_BRANCHES_IN_CONTEXT: usize = 3;
+
+/// The most recent rejected branches, newest last.
+async fn recent_rejected_branches(ctx: &AgentContext) -> Vec<Vec<Event>> {
+    let mut branches: Vec<Vec<Event>> = ctx
+        .bus
+        .all_rejected_branches()
+        .await
+        .into_iter()
+        .map(|(_, events)| events)
+        .collect();
+    // Empty branches carry nothing to learn from and would still cost a
+    // heading in the summary.
+    branches.retain(|b| !b.is_empty());
+    if branches.len() > MAX_REJECTED_BRANCHES_IN_CONTEXT {
+        branches.drain(..branches.len() - MAX_REJECTED_BRANCHES_IN_CONTEXT);
+    }
+    branches
+}
+
 /// Middle-truncate `s` to at most `max_chars`, keeping the head and tail
 /// (where the useful signal of most tool outputs lives) and inserting a
 /// marker stating how much was elided.
@@ -684,7 +710,13 @@ pub async fn run_react_step(
 
     // ── Assemble context ──────────────────────────────────────────────
     let events = ctx.bus.log().await;
-    let assembly_ctx = AssemblyContext::new(&events);
+    // Rejected branches are handed to the assembler, not just kept in the
+    // DAG. Without this `AssemblyContext::rejected_branches` was always empty,
+    // so `NegativeAwareContextAssembler` — whose entire job is to read it —
+    // was a no-op wrapper: a rollback sealed the failed attempt and the next
+    // one repeated it, which is the opposite of what sealing is for.
+    let assembly_ctx =
+        AssemblyContext::new(&events).with_rejected_branches(recent_rejected_branches(ctx).await);
     let mut messages = ctx.assembler.assemble(&assembly_ctx).await;
     if messages.is_empty() {
         return Ok(StepOutcome::Done);

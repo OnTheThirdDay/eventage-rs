@@ -175,8 +175,24 @@ fn apply_landlock(readable: &[PathBuf], writable: &[PathBuf]) -> Result<(), Stri
         if !path.exists() {
             continue;
         }
-        let fd = PathFd::new(path)
-            .map_err(|e| format!("landlock open writable path {}: {e}", path.display()))?;
+        // A path that exists but cannot be opened is skipped, not fatal.
+        //
+        // `/dev/stdout` is the case that taught this: it is a symlink to
+        // `/proc/self/fd/1`, so opening it fails with EBADFD whenever stdout
+        // is a pipe. Treating that as fatal meant one odd device node
+        // disabled the entire sandbox and every confined command refused to
+        // run — a far worse outcome than granting one fewer write.
+        let fd = match PathFd::new(path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::debug!(path = %path.display(), "skipping unopenable writable path: {e}");
+                continue;
+            }
+        };
+        // `add_rule` takes the ruleset by value, so a failure here cannot be
+        // skipped without losing it — the writable list is curated precisely
+        // so this does not happen. `/dev/stdout` is the one that got in and
+        // showed why: see the note on the exclusion in `shell_sandbox`.
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
             .map_err(|e| format!("landlock add write rule for {}: {e}", path.display()))?;

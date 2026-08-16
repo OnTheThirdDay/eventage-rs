@@ -84,7 +84,10 @@ jobs:
           cache: npm
           cache-dependency-path: crates/eventage-studio/ui/package-lock.json
       - run: npm ci
-      - run: npx tsc -b --noEmit
+      # `--force`: build mode is incremental, and an up-to-date build info
+      # lets it report success for a file it never rechecked. A type error
+      # once reached CI from a machine where the local check had just passed.
+      - run: npm run check
       - run: npx vitest run
       # The built assets are embedded in the Rust binary, so a broken build
       # here is a broken release.

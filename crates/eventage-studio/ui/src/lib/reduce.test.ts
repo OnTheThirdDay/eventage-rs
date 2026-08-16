@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { reduce } from "./reduce";
-import type { AssistantItem, StudioEvent, ToolItem } from "./types";
+import type {
+  AssistantItem,
+  ChatItem,
+  NoticeItem,
+  StudioEvent,
+  ToolItem,
+} from "./types";
 
 let seq = 0;
 const ev = (
@@ -18,6 +24,20 @@ const ev = (
 
 const only = <T extends { type: string }>(items: T[], type: string) =>
   items.filter((i) => i.type === type);
+
+/**
+ * The one notice a case produced, narrowed to `NoticeItem`.
+ *
+ * `only` returns `ChatItem[]`, and `ChatItem` is a union — so reading `title`
+ * or `detail` off an element never typechecks, and indexing it is possibly
+ * `undefined` under `noUncheckedIndexedAccess`. Asserting here keeps the
+ * cases themselves readable.
+ */
+function soleNotice(items: ChatItem[]): NoticeItem {
+  const notices = items.filter((i): i is NoticeItem => i.type === "notice");
+  expect(notices).toHaveLength(1);
+  return notices[0]!;
+}
 
 describe("a turn marker that overtakes the reply it follows", () => {
   it("keeps one bubble when studio.turn.ended arrives before assistant.message", () => {
@@ -548,8 +568,8 @@ describe("a blocked adoption", () => {
         ],
       }),
     ]);
-    const notice = only(chat.items, "notice")[0];
-    expect(notice).toMatchObject({ level: "warn" });
+    const notice = soleNotice(chat.items);
+    expect(notice.level).toBe("warn");
     expect(notice.title).toContain("summary");
     expect(notice.detail).toContain("report.md");
     expect(notice.detail).toContain("data.csv");
@@ -565,6 +585,56 @@ describe("a blocked adoption", () => {
         changes: [{ path: "report.md", status: "modified" }],
       }),
     ]);
-    expect(only(chat.items, "notice")[0].detail).toContain("overriding your own changes");
+    expect(soleNotice(chat.items).detail).toContain("overriding your own changes");
+  });
+})
+
+describe("what the harness is doing behind the transcript", () => {
+  it("names the plugins that are active", () => {
+    // A plugin changes the system prompt and the tool list and appears
+    // nowhere else — the user would otherwise infer it from behaviour they
+    // did not ask for.
+    const chat = reduce([
+      ev("system.plugins", {
+        plugins: [
+          { name: "house-style", description: "conventions", skills: 1 },
+          { name: "deploy", description: "release steps", skills: 0 },
+        ],
+      }),
+    ]);
+    const notice = soleNotice(chat.items);
+    expect(notice.title).toContain("2 plugins active");
+    expect(notice.detail).toContain("house-style");
+    expect(notice.detail).toContain("deploy");
+  });
+
+  it("says nothing when no plugin is loaded", () => {
+    const chat = reduce([ev("system.plugins", { plugins: [] })]);
+    expect(only(chat.items, "notice")).toHaveLength(0);
+  });
+
+  it("shows the epitaph left by an attempt whose detail was dropped", () => {
+    const chat = reduce([
+      ev("system.epitaph", {
+        branch_id: "b1",
+        events_lost: 12,
+        epitaph: "Rewriting the lexer broke the date parser tests.",
+      }),
+    ]);
+    expect(soleNotice(chat.items).detail).toContain("broke the date parser");
+  });
+
+  it("counts the rolled-back attempts still steering the agent", () => {
+    // Injected into every request from here on, which is invisible in the
+    // transcript: the warning goes to the model, not the screen.
+    const chat = reduce([
+      ev("user.message", { text: "go" }),
+      ev("system.rollback", { to_event_id: "e1" }),
+      ev("system.rollback", { to_event_id: "e2" }),
+    ]);
+    expect(chat.sealedAttempts).toBe(2);
+
+    const none = reduce([ev("user.message", { text: "go" })]);
+    expect(none.sealedAttempts).toBe(0);
   });
 })

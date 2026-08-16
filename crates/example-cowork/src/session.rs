@@ -231,6 +231,13 @@ impl CoworkSession {
         // A resumed session keeps the mode it was left in; the configured
         // one is only a starting point for a session that has none.
         let mode = restored_steering.unwrap_or(config.steering);
+        // Announced on the session bus, so Studio shows what is loaded rather
+        // than leaving the user to infer it from a changed system prompt.
+        let host = eventage_code::agent::load_plugins(&config.folder.display().to_string());
+        if !host.plugins().is_empty() {
+            eventage_code::agent::announce_plugins(&bus, &host).await;
+        }
+
         let steering = Arc::new(SharedSteering::new(mode));
         crate::steering::announce(&bus, mode).await;
 
@@ -995,7 +1002,24 @@ async fn work(
         stream.brief
     );
 
-    let agent = AgentBuilder::new()
+    // Plugins apply here as much as to a coding session: a house-style
+    // plugin is as relevant to writing a report as to writing code. Installed
+    // per workstream because each has its own registry.
+    let plugin_tools = eventage::agent::ToolRegistry::new();
+    let host = eventage_code::agent::load_plugins(&worktree.display().to_string());
+    let mut system = system;
+    if !host.plugins().is_empty() {
+        match host.install(&plugin_tools).await {
+            Ok(fragment) if !fragment.trim().is_empty() => {
+                system.push_str("\n\n");
+                system.push_str(fragment.trim());
+            }
+            Ok(_) => {}
+            Err(e) => warn!("could not install a plugin: {e:#}"),
+        }
+    }
+
+    let mut agent = AgentBuilder::new()
         .agent_id(format!("ws-{}", stream.id))
         .bus(bus.clone())
         .llm_arc(Arc::clone(&llm))
@@ -1033,8 +1057,11 @@ async fn work(
         })
         .tool(eventage::WebSearchTool::new())
         .tool(eventage::WebFetchTool::new())
-        .strategy(ReactStrategy::default())
-        .build();
+        .strategy(ReactStrategy::default());
+    for tool in plugin_tools.all_tools() {
+        agent = agent.tool_arc(tool);
+    }
+    let agent = agent.build();
 
     bus.publish(Event::new(
         ev::USER_MESSAGE,

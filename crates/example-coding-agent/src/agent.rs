@@ -9,8 +9,8 @@ use crate::workspace::Workspace;
 use anyhow::Result;
 use eventage::agent::recovery::{reconcile_interrupted_tools, ToolRecovery};
 use eventage::agent::{
-    load_project_context_walkup, DefaultContextAssembler, DynamicHookChain, SkillTool,
-    SkillsLibrary, ToolResultClearingAssembler,
+    load_project_context_walkup, DefaultContextAssembler, DynamicHookChain,
+    NegativeAwareContextAssembler, SkillTool, SkillsLibrary, ToolResultClearingAssembler,
 };
 use eventage::event::kinds;
 use eventage::llm::{AnthropicProvider, LlmProvider, OpenAiProvider, OpenAiResponsesProvider};
@@ -47,6 +47,101 @@ struct Checkpoint {
 /// files and led an agent to report a capability missing because the file
 /// defining it had been dropped.
 const REPO_MAP_TOKENS: usize = 8_000;
+
+/// How many rolled-back attempts stay in memory as events.
+///
+/// Small on purpose. Beyond this they are evicted, and `EpitaphStrategy`
+/// leaves a one-line summary in their place — which is what a later attempt
+/// actually needs from an old failure. Unbounded retention was the previous
+/// default and meant a long session held every trajectory it had ever
+/// abandoned.
+const MAX_RETAINED_BRANCHES: usize = 8;
+
+/// Put the loaded plugins on the log, so a surface can show them.
+pub async fn announce_plugins(bus: &EventBus, host: &eventage::PluginHost) {
+    let plugins: Vec<serde_json::Value> = host
+        .plugins()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "description": p.description,
+                "skills": p.skills.len(),
+                "mcp_servers": p.mcp_servers.len(),
+                "adds_prompt": p.prompt_fragment.is_some(),
+            })
+        })
+        .collect();
+    let _ = bus
+        .publish(Event::new(
+            kinds::SYSTEM_PLUGINS,
+            serde_json::json!({ "plugins": plugins }),
+        ))
+        .await;
+}
+
+/// Find and load the plugins available to a session.
+///
+/// Two places, in this order: the workspace's own `.eventage/plugins/`, then
+/// the user's `~/.eventage/plugins/`. A repository's plugins come first so a
+/// project can pin the version of a tool its instructions assume.
+///
+/// A directory without a manifest is not a plugin and is skipped in silence —
+/// people keep all sorts of things in a plugins folder. A directory *with* a
+/// manifest that fails to load is reported, because that one was meant to
+/// work.
+pub fn load_plugins(cwd: &str) -> eventage::PluginHost {
+    let mut host = eventage::PluginHost::new();
+    let roots = [
+        std::path::PathBuf::from(cwd).join(".eventage/plugins"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".eventage/plugins"),
+    ];
+
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() || !dir.join(eventage::plugin::MANIFEST_NAME).is_file() {
+                continue;
+            }
+            if let Err(e) = host.load(&dir) {
+                warn!(path = %dir.display(), "could not load plugin: {e}");
+            }
+        }
+    }
+    host
+}
+
+/// How the agent is told about attempts that were rolled back.
+///
+/// Two sources of different weight. Retained branches are rendered as events
+/// by the framework's own formatter, so the agent sees what it did; branches
+/// evicted earlier survive only as epitaphs, one sentence each, written by
+/// the model when they aged out. Recent mistakes in detail, older ones as a
+/// line — which is roughly how a person remembers their own.
+fn negative_summary(branches: &[Vec<Event>], epitaphs: &eventage::EpitaphStore) -> String {
+    let mut summary = eventage::agent::default_negative_context_format(branches);
+
+    let older: Vec<String> = epitaphs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    if !older.is_empty() {
+        summary.push_str("\n\nEarlier attempts, summarised:\n");
+        for lesson in older {
+            summary.push_str("  - ");
+            summary.push_str(lesson.trim());
+            summary.push('\n');
+        }
+    }
+    summary
+}
 
 /// Published when a rewind leaves edited files on disk.
 ///
@@ -188,7 +283,28 @@ impl CodingSession {
         restore: bool,
         client: Option<ClientFs>,
     ) -> Result<Self> {
-        let bus = EventBus::new();
+        // Resolved first: the bus's eviction strategy needs a model to write
+        // epitaphs with, and building the provider is pure.
+        let llm: Arc<dyn LlmProvider> = provider_for(&config.model);
+
+        // Rejected branches are bounded, and what falls off the end leaves a
+        // sentence behind rather than vanishing.
+        //
+        // Unbounded retention meant a long session accumulated every attempt
+        // it had ever rolled back; `EpitaphStrategy` asks the model to
+        // summarise each branch as it is evicted, so the lesson outlives the
+        // events. `PruneStrategy` — the default — simply deletes them.
+        let epitaphs = eventage::EpitaphStrategy::new(Arc::clone(&llm));
+        let epitaph_store = epitaphs.epitaphs();
+        let strategy = Arc::new(epitaphs);
+        let bus = EventBus::with_config(eventage::BusConfig {
+            max_retained_branches: MAX_RETAINED_BRANCHES,
+            eviction_strategy: Arc::clone(&strategy) as Arc<dyn eventage::BranchEvictionStrategy>,
+            ..Default::default()
+        });
+        // Now that the bus exists, epitaphs go onto it as well as into the
+        // store — so they survive reopening and the trace shows them.
+        strategy.publish_to(bus.clone());
         let ws = Arc::new(Workspace::open(&config.cwd)?);
         let lsp = Arc::new(LspPool::new(&config.cwd));
 
@@ -278,8 +394,6 @@ impl CodingSession {
         let persistence = tokio::spawn(observer.run_with(events));
 
         // ── Model ────────────────────────────────────────────────────────────
-        let llm: Arc<dyn LlmProvider> = provider_for(&config.model);
-
         // ── Context: project instructions + skills, then editing + summarizing ──
         let mut system_prompt = build_system_prompt(&config.cwd);
 
@@ -319,12 +433,47 @@ impl CodingSession {
             system_prompt.push_str(&skills.system_prompt_section());
         }
 
+        // ── Plugins ──────────────────────────────────────────────────────
+        //
+        // A plugin bundles a prompt fragment, skills and MCP servers in one
+        // directory, which is how somebody extends the agent without forking
+        // it. Installed into a registry of its own rather than the agent's,
+        // because `install` returns the prompt fragment and the system prompt
+        // has to be finished before the assembler is built — the agent does
+        // not exist yet at this point. Its tools are handed to the builder
+        // below.
+        let plugin_tools = eventage::agent::ToolRegistry::new();
+        let plugin_prompt = match load_plugins(&config.cwd) {
+            host if host.plugins().is_empty() => String::new(),
+            host => match host.install(&plugin_tools).await {
+                Ok(prompt) => {
+                    info!(plugins = host.plugins().len(), "plugins installed");
+                    // A plugin silently changes the system prompt and the
+                    // tool list. Announcing it is the difference between the
+                    // user being able to see that and having to infer it from
+                    // behaviour they did not expect.
+                    announce_plugins(&bus, &host).await;
+                    prompt
+                }
+                Err(e) => {
+                    // A broken plugin is not a reason to refuse to start; the
+                    // session is still perfectly usable without it.
+                    warn!("could not install a plugin: {e}");
+                    String::new()
+                }
+            },
+        };
+        if !plugin_prompt.trim().is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(plugin_prompt.trim());
+        }
+
         let base = DefaultContextAssembler::new(system_prompt);
         let clearing = ToolResultClearingAssembler::new(
             Arc::new(base),
             (config.context_tokens as f64 * 0.6) as usize,
         );
-        let assembler = SummarizingContextAssembler::new(
+        let summarizing = SummarizingContextAssembler::new(
             Arc::new(clearing),
             Arc::clone(&llm),
             config.context_tokens,
@@ -334,6 +483,18 @@ impl CodingSession {
         // trace shows what was folded away, and a summary that lost something
         // can be replaced without restarting.
         .with_bus(bus.clone());
+
+        // Outermost, so what it injects is not summarised away by the layer
+        // below: a warning about an approach that failed is worth more than
+        // the transcript of the approach.
+        //
+        // Two sources, deliberately different in weight. Branches still
+        // retained are shown as events, so the agent sees what it actually
+        // did; branches long since evicted are one line each, written by
+        // `EpitaphStrategy` when they aged out. Recent mistakes in detail,
+        // old ones as a sentence.
+        let assembler = NegativeAwareContextAssembler::new(summarizing)
+            .with_formatter(move |branches| negative_summary(branches, &epitaph_store));
 
         // ── Tools ────────────────────────────────────────────────────────────
         let jobs = Arc::new(tools::BackgroundJobs::default());
@@ -477,6 +638,9 @@ impl CodingSession {
 
         if !skills.is_empty() {
             builder = builder.tool(SkillTool::new(skills));
+        }
+        for tool in plugin_tools.all_tools() {
+            builder = builder.tool_arc(tool);
         }
 
         let registry = builder.tool_registry();
@@ -928,5 +1092,63 @@ impl CodingSession {
 
     pub fn was_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_failures_are_a_line_and_recent_ones_are_the_events() {
+        // Two sources of different weight. A branch still retained is shown
+        // as what the agent actually did; one evicted long ago survives only
+        // as the sentence `EpitaphStrategy` wrote when it aged out. Showing
+        // only one of the two would either flood the context with old
+        // transcripts or lose the lesson entirely.
+        let retained = vec![vec![Event::new(
+            kinds::ASSISTANT_MESSAGE,
+            serde_json::json!({ "content": "I will rewrite the parser from scratch." }),
+        )]];
+
+        let store: eventage::EpitaphStore = Default::default();
+        store.lock().unwrap().insert(
+            uuid::Uuid::new_v4(),
+            "rewriting the lexer broke the tests".into(),
+        );
+
+        let summary = negative_summary(&retained, &store);
+
+        // The recent attempt, in its own words.
+        assert!(summary.contains("rewrite the parser"), "{summary}");
+        // The old one, as a line under its own heading.
+        assert!(
+            summary.contains("Earlier attempts, summarised:"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("rewriting the lexer broke the tests"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_evicted_no_summary_section_appears() {
+        // The heading is worth nothing on its own, and an empty section in
+        // every request is exactly the kind of thing that gets ignored.
+        let store: eventage::EpitaphStore = Default::default();
+        let summary = negative_summary(&[], &store);
+        assert!(!summary.contains("Earlier attempts"), "{summary}");
+    }
+
+    #[test]
+    fn plugins_are_looked_for_in_the_workspace_first() {
+        // A project pinning its own version of a tool has to win over one the
+        // user happens to have installed globally.
+        let dir = tempfile::tempdir().unwrap();
+        let host = load_plugins(dir.path().to_str().unwrap());
+        // Nothing there: an absent plugins directory is the normal case and
+        // must not be an error.
+        assert!(host.plugins().is_empty());
     }
 }

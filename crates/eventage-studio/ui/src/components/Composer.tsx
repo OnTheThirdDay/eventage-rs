@@ -22,6 +22,7 @@ export function Composer({
   running,
   modes,
   mode,
+  sealedAttempts,
   onSend,
   onInterrupt,
   onModeChange,
@@ -30,6 +31,8 @@ export function Composer({
   running: boolean;
   modes: ModeInfo[];
   mode: string;
+  /** Rolled-back attempts being fed back into every request. */
+  sealedAttempts: number;
   onSend: (blocks: PromptBlock[]) => void;
   onInterrupt: () => void;
   onModeChange: (mode: string) => void;
@@ -151,6 +154,21 @@ export function Composer({
               ))
             }
           </Menu>
+
+          {sealedAttempts > 0 && (
+            // Beside the mode selector because it belongs to the same
+            // question: what is shaping the next request. The agent is told
+            // about these every time, and nothing else on screen says so —
+            // the warning goes to the model, not to the transcript.
+            <span
+              className="sealed-badge"
+              title={`${sealedAttempts} rolled-back attempt${
+                sealedAttempts === 1 ? "" : "s"
+              } are described to the agent on every request, so it does not repeat them.`}
+            >
+              {sealedAttempts} rewound
+            </span>
+          )}
 
           <button
             className="btn sm ghost"

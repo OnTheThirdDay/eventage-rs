@@ -1,0 +1,184 @@
+# Release binaries.
+#
+# One self-contained executable per tool per platform, attached to a GitHub
+# release. No archive to unpack and nothing to install beside them: download,
+# `chmod +x`, run.
+#
+# That "nothing beside them" is a property the code has to hold up, not just
+# the packaging. On Linux the coding agent confines shell commands by
+# re-executing a trampoline that installs the Landlock ruleset in a fresh
+# single-threaded process. In a source checkout that trampoline is a sibling
+# binary, `eventage-confine`; a lone downloaded executable has no sibling, and
+# would otherwise find no helper and run every "confined" command unconfined —
+# silently, which is the worst way for a sandbox to fail. `run_if_helper`
+# declares that the program handles the marker, so a shipped binary
+# trampolines through itself. `eventage-confine` is still published for
+# packagers who split things up.
+#
+# Studio embeds its front-end at compile time, so the UI is built before cargo
+# runs — the same reason the CI workflow does it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # So a release can be rehearsed without cutting a tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish as (leave blank to build only)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than latest: binaries link against the runner's
+          # glibc, and building on the newest image produces something that
+          # refuses to start on anything older.
+          - label: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - label: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - label: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Studio's front-end is embedded at compile time from `ui/dist`, which
+      # is a build artifact and not in the checkout.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/eventage-studio/ui/package-lock.json
+      - name: Build the Studio front-end
+        working-directory: crates/eventage-studio/ui
+        run: npm ci && npm run build
+
+      - name: Build
+        run: >
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p example-coding-agent -p eventage-studio -p example-cowork
+
+      # Named by platform so several can sit in one downloads folder, which is
+      # what actually happens when somebody tries two machines.
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release"
+          ext=""
+          [[ "${{ matrix.os }}" == windows-* ]] && ext=".exe"
+          for name in eventage-code eventage-studio cowork eventage-confine; do
+            src="$bin/$name$ext"
+            if [[ ! -f "$src" ]]; then
+              echo "missing expected binary: $src" >&2
+              exit 1
+            fi
+            cp "$src" "dist/$name-${{ matrix.label }}$ext"
+          done
+          ls -l dist
+
+      # Proof the artefact starts, on the machine that built it. A binary that
+      # cannot run is the one failure a build log will not show you.
+      - name: Smoke-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          ext=""
+          [[ "${{ matrix.os }}" == windows-* ]] && ext=".exe"
+          # Cross-compiled x86_64 will not run on an arm64 runner.
+          if [[ "${{ matrix.label }}" == "macos-x86_64" ]]; then
+            echo "cross-compiled; skipping execution"
+            exit 0
+          fi
+          for name in eventage-code eventage-studio cowork; do
+            "./dist/$name-${{ matrix.label }}$ext" --version
+          done
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum * > "SHA256SUMS-${{ matrix.label }}.txt"
+          else
+            shasum -a 256 * > "SHA256SUMS-${{ matrix.label }}.txt"
+          fi
+          cat "SHA256SUMS-${{ matrix.label }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    # Only a tag produces a release; a manual run stops at the artefacts
+    # unless it was given a tag on purpose.
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -l dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Download the binary for your platform, make it executable, and run it.
+
+            | Tool | What it is |
+            |---|---|
+            | `eventage-code` | The coding agent. ACP server by default; `run` for one headless prompt. |
+            | `eventage-studio` | Web UI over a session — transcript, event trace, timeline, rewind. |
+            | `cowork` | Parallel workstreams over a folder, compared before anything is kept. |
+            | `eventage-confine` | The Linux sandbox trampoline. Only needed if you split the binaries up; each tool can act as its own. |
+
+            ```sh
+            chmod +x eventage-code-linux-x86_64
+            ./eventage-code-linux-x86_64 --help
+            ```
+
+            Verify with `SHA256SUMS-<platform>.txt`.
+
+            Shell containment uses Landlock and seccomp, which are Linux only.
+            On macOS and Windows commands run with credentials scrubbed, their
+            own process group and resource limits, but no filesystem or
+            network confinement — `--sandbox container` is the portable
+            boundary.

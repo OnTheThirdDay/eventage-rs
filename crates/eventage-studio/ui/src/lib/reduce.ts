@@ -39,6 +39,9 @@ const K = {
   budgetWarning: "budget.warning",
   budgetExhausted: "budget.exhausted",
   rollback: "system.rollback",
+  pruned: "system.pruned",
+  epitaph: "system.epitaph",
+  plugins: "system.plugins",
   recovered: "system.recovered",
   systemMessage: "system.message",
   elicitation: "mcp.elicitation.request",
@@ -747,6 +750,39 @@ export function reduce(events: StudioEvent[]): ChatState {
         break;
       }
 
+      case K.plugins: {
+        // A plugin changes the system prompt and the tool list without
+        // appearing anywhere else. Saying which loaded is the difference
+        // between the user seeing that and inferring it from behaviour.
+        const loaded = Array.isArray(p.plugins) ? p.plugins : [];
+        if (loaded.length) {
+          const names = loaded.map((x) => str(asRecord(x)?.name)).filter(Boolean);
+          items.push(
+            notice(
+              event,
+              "info",
+              `${names.length} plugin${names.length === 1 ? "" : "s"} active`,
+              names.join(", "),
+            ),
+          );
+        }
+        break;
+      }
+
+      case K.epitaph: {
+        // The branch's events are gone; this sentence is what is left of
+        // them, and it is still steering the agent.
+        items.push(
+          notice(
+            event,
+            "info",
+            "An earlier attempt was summarised and its detail dropped",
+            str(p.epitaph),
+          ),
+        );
+        break;
+      }
+
       case K.modeChanged: {
         items.push(
           notice(event, "info", `Mode set to ${str(p.label) || str(p.mode)}`),
@@ -790,6 +826,11 @@ export function reduce(events: StudioEvent[]): ChatState {
     pendingPermissions: items.filter(
       (i): i is PermissionItem => i.type === "permission" && i.status === "pending",
     ),
+    // Rolled-back attempts are injected into every request from here on.
+    // Derived rather than announced: the reducer already knows which events
+    // a rollback sealed, and publishing a second event per turn to say so
+    // would be noise in the one place it should not be.
+    sealedAttempts: events.filter((e) => e.kind === K.rollback).length,
     workstreams: order.flatMap((key) => {
       const stream = workstreams.get(key);
       return stream ? [stream] : [];

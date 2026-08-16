@@ -254,6 +254,22 @@ describe("permission prompts", () => {
     expect(answer?.body).toMatchObject({ request_id: "r1", approve: true });
   });
 
+  it("shows how many rewound attempts are still steering the agent", async () => {
+    // A rolled-back attempt leaves the transcript but is described to the
+    // model on every subsequent request. Nothing else on screen says so, so
+    // without this the constraint is invisible to the person being
+    // constrained by it.
+    await mount();
+    expect(screen.queryByText(/rewound/)).toBeNull();
+
+    await push(ev("user.message", { text: "go" }));
+    await push(ev("system.rollback", { to_event_id: "e1" }));
+    expect(screen.getByText("1 rewound")).toBeTruthy();
+
+    await push(ev("system.rollback", { to_event_id: "e2" }));
+    expect(screen.getByText("2 rewound")).toBeTruthy();
+  });
+
   it("offers a standing approval for the same call", async () => {
     await mount();
     await push(ev("permission.request", { request_id: "r1", tool: "bash" }));

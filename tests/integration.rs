@@ -1789,3 +1789,68 @@ async fn a_turn_with_nothing_to_do_is_recorded_rather_than_skipped() {
         "and the attempt should be in the log"
     );
 }
+
+#[tokio::test]
+async fn a_rolled_back_attempt_is_shown_to_the_next_one() {
+    init_tracing();
+
+    // Rolling back seals the failed trajectory as a rejected branch. Until
+    // now nothing read it: `AssemblyContext::rejected_branches` was never
+    // populated, so `NegativeAwareContextAssembler` — whose only job is to
+    // read it — wrapped the assembler and changed nothing, and the agent
+    // cheerfully repeated the approach it had just been rolled back from.
+    use eventage::agent::NegativeAwareContextAssembler;
+
+    let bus = EventBus::new();
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "fix it"})))
+        .await
+        .unwrap();
+    let anchor = bus.checkpoint().await.unwrap();
+
+    // An attempt that went wrong.
+    bus.publish(Event::new(
+        kinds::ASSISTANT_MESSAGE,
+        json!({ "content": "I will rewrite the parser from scratch." }),
+    ))
+    .await
+    .unwrap();
+    bus.rollback(anchor).await.unwrap();
+
+    // What the model is actually sent on the next turn.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    struct Recorder(Arc<std::sync::Mutex<Vec<String>>>);
+    #[async_trait]
+    impl ContextAssembler for Recorder {
+        async fn assemble(&self, context: &AssemblyContext<'_>) -> Vec<ChatMessage> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} rejected", context.rejected_branches.len()));
+            vec![ChatMessage::user("go")]
+        }
+    }
+
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::with_texts(["ok"]))
+        .context(NegativeAwareContextAssembler::new(Recorder(Arc::clone(
+            &seen,
+        ))))
+        .strategy(ReactStrategy::default())
+        .build();
+    agent.cycle().await.unwrap();
+
+    // The assembler was told about the sealed attempt.
+    assert_eq!(
+        seen.lock().unwrap().first().map(String::as_str),
+        Some("1 rejected")
+    );
+
+    // And the warning reached the messages the model sees.
+    let log = bus.log().await;
+    let assembled = log
+        .iter()
+        .rfind(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+        .expect("the turn completed");
+    assert!(assembled.payload["content"].as_str().is_some());
+}
