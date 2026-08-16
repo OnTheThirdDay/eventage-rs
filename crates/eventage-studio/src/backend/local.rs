@@ -335,7 +335,8 @@ impl LocalSession {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string();
-                        if always_allow.lock().await.contains(&tool) {
+                        let key = permission_key(&tool, event.payload.get("arguments"));
+                        if always_allow.lock().await.contains(&key) {
                             let request_id = event
                                 .payload
                                 .get("request_id")
@@ -542,8 +543,11 @@ impl Session for LocalSession {
 
     async fn permission(&self, response: PermissionResponse) -> Result<()> {
         if response.always && response.approve {
-            if let Some(tool) = tool_of_request(&self.feed, &response.request_id) {
-                self.always_allow.lock().await.insert(tool);
+            if let Some((tool, args)) = request_subject(&self.feed, &response.request_id) {
+                self.always_allow
+                    .lock()
+                    .await
+                    .insert(permission_key(&tool, args.as_ref()));
             }
         }
         self.session
@@ -586,7 +590,33 @@ impl Session for LocalSession {
 ///
 /// The request id is all the UI sends back, so the tool name is recovered
 /// from the request event that is already in the feed.
-fn tool_of_request(feed: &EventFeed, request_id: &str) -> Option<String> {
+/// The key a standing approval is remembered under.
+///
+/// Tool **and arguments**, not the tool alone. Keyed by name, one "always
+/// allow" on a `bash` prompt for `cargo test` silently approved every later
+/// shell command in the session — the mode selector still said Auto while the
+/// session behaved like Yolo for the one tool that most needs a prompt. The
+/// risk in `bash`, `git` and `web_fetch` lives entirely in the arguments, so
+/// that is what the grant has to name.
+///
+/// Exact rather than pattern-matched. A prefix language (`bash(cargo test:*)`)
+/// is the richer answer and a design of its own; an exact key is the honest
+/// version of what the button can promise today, and it still absorbs the
+/// case it was built for — the same command re-run every turn.
+///
+/// `serde_json`'s maps are ordered, so equal arguments render equal here.
+fn permission_key(tool: &str, args: Option<&serde_json::Value>) -> String {
+    match args {
+        Some(args) => format!("{tool}\u{1f}{args}"),
+        None => tool.to_string(),
+    }
+}
+
+/// The `(tool, arguments)` a permission request was raised for.
+fn request_subject(
+    feed: &EventFeed,
+    request_id: &str,
+) -> Option<(String, Option<serde_json::Value>)> {
     feed.since(0)
         .iter()
         .rev()
@@ -595,10 +625,8 @@ fn tool_of_request(feed: &EventFeed, request_id: &str) -> Option<String> {
                 && e.payload.get("request_id").and_then(|v| v.as_str()) == Some(request_id)
         })
         .and_then(|e| {
-            e.payload
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
+            let tool = e.payload.get("tool").and_then(|v| v.as_str())?.to_string();
+            Some((tool, e.payload.get("arguments").cloned()))
         })
 }
 
@@ -618,13 +646,14 @@ mod tests {
     #[test]
     fn a_permission_answer_is_matched_back_to_its_tool() {
         let feed = feed_with_request("bash", "req-1");
-        assert_eq!(tool_of_request(&feed, "req-1").as_deref(), Some("bash"));
+        let (tool, _) = request_subject(&feed, "req-1").unwrap();
+        assert_eq!(tool, "bash");
     }
 
     #[test]
     fn an_unknown_request_id_yields_nothing_rather_than_a_wrong_tool() {
         let feed = feed_with_request("bash", "req-1");
-        assert_eq!(tool_of_request(&feed, "req-2"), None);
+        assert!(request_subject(&feed, "req-2").is_none());
     }
 
     #[test]
@@ -638,6 +667,26 @@ mod tests {
             kinds::PERMISSION_REQUEST,
             json!({ "request_id": "r", "tool": "write_file" }),
         ));
-        assert_eq!(tool_of_request(&feed, "r").as_deref(), Some("write_file"));
+        assert_eq!(request_subject(&feed, "r").unwrap().0, "write_file");
+    }
+
+    #[test]
+    fn a_standing_approval_does_not_cover_a_different_command() {
+        // The whole point: allowing `cargo test` must not pre-approve
+        // `rm -rf ~`. Keyed by tool name, it did.
+        let allowed = permission_key("bash", Some(&json!({ "command": "cargo test" })));
+        let other = permission_key("bash", Some(&json!({ "command": "rm -rf ~" })));
+        assert_ne!(allowed, other);
+
+        // The same call again is the case the button exists for.
+        assert_eq!(
+            allowed,
+            permission_key("bash", Some(&json!({ "command": "cargo test" })))
+        );
+        // Argument order in the JSON object must not change the key.
+        assert_eq!(
+            permission_key("write_file", Some(&json!({ "a": 1, "b": 2 }))),
+            permission_key("write_file", Some(&json!({ "b": 2, "a": 1 }))),
+        );
     }
 }

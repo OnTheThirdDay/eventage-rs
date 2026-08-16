@@ -47,6 +47,9 @@ const K = {
   modeChanged: "studio.mode.changed",
   rewound: "studio.rewound",
   backendLost: "studio.backend.lost",
+  fsRefused: "studio.fs.refused",
+  treeRestored: "session.working_tree_restored",
+  treeUnchanged: "session.working_tree_unchanged",
   plan: "studio.plan",
 } as const;
 
@@ -551,6 +554,44 @@ export function reduce(events: StudioEvent[]): ChatState {
         running = false;
         items.push(
           notice(event, "error", "The agent process exited", str(p.reason)),
+        );
+        break;
+      }
+
+      case K.fsRefused: {
+        items.push(
+          notice(
+            event,
+            "warn",
+            `Blocked: the agent tried to ${str(p.action)} outside the workspace`,
+            `${str(p.path)} — ${str(p.reason)}`,
+          ),
+        );
+        break;
+      }
+
+      case K.treeRestored: {
+        const paths = Array.isArray(p.paths) ? p.paths.length : 0;
+        items.push(
+          notice(
+            event,
+            "info",
+            `Working tree restored (${paths} file${paths === 1 ? "" : "s"})`,
+            `Recover what the rewound turns wrote with: git checkout ${str(p.undo)} -- .`,
+          ),
+        );
+        break;
+      }
+
+      case K.treeUnchanged: {
+        const paths = Array.isArray(p.paths) ? (p.paths as unknown[]) : [];
+        items.push(
+          notice(
+            event,
+            "warn",
+            "The files on disk were not rewound",
+            `${str(p.detail)}${paths.length ? `: ${paths.join(", ")}` : ""}`,
+          ),
         );
         break;
       }

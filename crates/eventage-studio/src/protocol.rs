@@ -88,6 +88,8 @@ pub mod studio_kinds {
     pub const REWOUND: &str = "studio.rewound";
     /// The backend connection dropped (ACP mode: the child process exited).
     pub const BACKEND_LOST: &str = "studio.backend.lost";
+    /// The connected agent asked to read or write outside the workspace.
+    pub const FS_REFUSED: &str = "studio.fs.refused";
 }
 
 // ── Requests ──────────────────────────────────────────────────────────────────

@@ -13,6 +13,12 @@ path = "src/lib.rs"
 name = "eventage-code"
 path = "src/main.rs"
 
+# The sandbox trampoline. A binary rather than a mode of the others so that
+# every caller — including a test binary — can reach it; see its module docs.
+[[bin]]
+name = "eventage-confine"
+path = "src/bin/eventage-confine.rs"
+
 [dependencies]
 # Capability-based filesystem access: the workspace is confined by an open
 # directory handle (openat2/RESOLVE_BENEATH on Linux), not by path strings.

@@ -108,3 +108,44 @@ async fn two_prompts_do_not_run_against_one_session_at_once() {
     session.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), first).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_prompt_cannot_join_the_running_turn() {
+    // `submit_prompt` is ungated: it publishes the user message and clears
+    // the cancellation flag, and only `run_cycle` takes the gate. A caller
+    // that did the two separately — the ACP server did — left a window where
+    // a pipelined `session/prompt` published a second user message into the
+    // conversation already in flight and reset the cancellation of the turn
+    // the user was in the middle of stopping.
+    let state = tempfile::tempdir().unwrap();
+    let (session, _ws) = stalled_session(&state).await;
+
+    let first = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.prompt_turn(&[ContentBlock::text("first")]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(session.is_busy());
+
+    let refused = session.prompt_turn(&[ContentBlock::text("second")]).await;
+    assert!(
+        refused.is_err(),
+        "the second prompt joined the running turn"
+    );
+
+    // And it published nothing: one user message, not two.
+    let users = session
+        .bus
+        .log()
+        .await
+        .iter()
+        .filter(|e| e.kind == eventage::event::kinds::USER_MESSAGE)
+        .count();
+    assert_eq!(users, 1);
+
+    // The refusal must not have cleared the running turn's cancellation.
+    session.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), first).await;
+    assert!(session.was_cancelled());
+}

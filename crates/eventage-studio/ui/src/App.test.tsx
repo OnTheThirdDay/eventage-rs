@@ -254,11 +254,11 @@ describe("permission prompts", () => {
     expect(answer?.body).toMatchObject({ request_id: "r1", approve: true });
   });
 
-  it("offers a standing approval for the same tool", async () => {
+  it("offers a standing approval for the same call", async () => {
     await mount();
     await push(ev("permission.request", { request_id: "r1", tool: "bash" }));
     await act(async () => {
-      screen.getByText("Always allow bash").click();
+      screen.getByText("Always allow this call").click();
     });
     expect(calls.find((c) => c.url.includes("/permission"))?.body).toMatchObject(
       { approve: true, always: true },

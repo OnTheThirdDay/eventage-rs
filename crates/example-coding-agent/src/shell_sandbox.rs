@@ -18,11 +18,41 @@
 //! the same: it is the only way to get a real ruleset installed without
 //! doing forbidden work in a forked child.
 //!
-//! What it buys: a command that wanders out of the repository cannot read
-//! `~/.ssh` or write `~/.bashrc`. What it does not buy: network isolation or
-//! resource accounting across a process tree. Landlock is filesystem-only —
-//! a seatbelt, not a boundary. A genuinely untrusted repository wants
-//! [`ShellContainment::Strict`](crate::tools::ShellContainment), and beyond that a container.
+//! What it buys depends on the [`Reads`] policy, and the difference matters:
+//!
+//! * [`Reads::ExceptSecrets`] — reads everything **except** a named list of
+//!   credential stores: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.npmrc`,
+//!   `~/.git-credentials`, `~/.config/gh` and their neighbours.
+//!
+//!   Landlock has no deny rules — you can only grant — so "everything except"
+//!   is built by granting siblings: every entry of `/` but `/home`, then
+//!   every entry of `$HOME` but the denied ones, and so on down to each
+//!   denied path. It costs a directory listing at startup and it keeps every
+//!   toolchain working, because toolchains live in unpredictable places under
+//!   `$HOME` and a policy that guesses wrong makes `node` or `cargo` vanish.
+//!
+//!   It fails closed in a useful way: because `$HOME` itself is never
+//!   granted, a directory created there *after* the ruleset is built is
+//!   unreadable rather than quietly allowed.
+//! * [`Reads::Workspace`] — reads narrowed to the system directories, the
+//!   toolchain locations we can name, and the workspace. Your other
+//!   repositories go too. This is what makes
+//!   [`ShellContainment::Strict`](crate::tools::ShellContainment) worth
+//!   choosing, and it is allowed to break an exotic toolchain — a repository
+//!   you do not trust is one you would rather fail loudly on.
+//!
+//! Neither buys network isolation or resource accounting across a process
+//! tree; the network is a separate seccomp filter ([`Network`]), and nothing
+//! here bounds a process tree. Landlock is filesystem-only — a seatbelt, not
+//! a boundary. Beyond `Strict` lies a container.
+//!
+//! `/proc` stays readable under both, because too much ordinary machinery
+//! reads it. That used to mean a command could open `/proc/<agent pid>/environ`
+//! and recover the API key that `scrubbed_env` had kept out of its own
+//! environment; [`secrets::capture_and_scrub`](crate::secrets) closes that by
+//! wiping the value out of the block the kernel serves. What remains is
+//! `/proc` for *other* processes of the same user, which no filesystem
+//! sandbox can fix — that needs a PID namespace, which means a container.
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +69,25 @@ pub const HELPER_ARG: &str = "__eventage-confine-exec";
 /// filesystem stays readable and unwritable.
 fn writable_paths(root: &Path) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf(), std::env::temp_dir()];
+    // The device files every shell expects to be able to write to. Landlock
+    // governs these like any other path, so without them `cmd > /dev/null`
+    // fails with EACCES — which reads as the tool being broken rather than as
+    // a sandbox doing its job.
+    for dev in [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+        "/dev/shm",
+        "/dev/ptmx",
+        "/dev/pts",
+        "/dev/stdout",
+        "/dev/stderr",
+    ] {
+        paths.push(PathBuf::from(dev));
+    }
     for var in [
         "CARGO_HOME",
         "RUSTUP_HOME",
@@ -65,40 +114,322 @@ fn writable_paths(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Build the command that runs `script` confined to `root`.
+/// What a [`Reads::Workspace`] command may read.
+///
+/// Everything a compiler, linker and test runner touches that is not the
+/// repository, and nothing that belongs to the person running it. The
+/// omissions are the point: `$HOME` is absent except for the toolchain
+/// locations named here, so `~/.ssh`, `~/.aws`, `~/.netrc`,
+/// `~/.git-credentials`, the shell history and every other checkout on the
+/// machine are unreadable.
+///
+/// `/run` is omitted too, because `/run/user/$UID` holds the ssh-agent and
+/// keyring sockets. `/proc` is *not* omitted — too much ordinary machinery
+/// reads it — and the module docs say what that costs.
+fn readable_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = [
+        "/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/proc",
+        "/sys", "/dev", "/var", "/nix", "/snap",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home = Path::new(&home);
+        for entry in [
+            // Git needs its config or `git commit` cannot name an author.
+            // `~/.git-credentials` is deliberately not here.
+            ".gitconfig",
+            ".config/git",
+            // Language toolchains that install under $HOME by convention.
+            ".rustup",
+            ".cargo",
+            ".nvm",
+            ".pyenv",
+            ".rbenv",
+            ".asdf",
+            ".volta",
+            ".sdkman",
+            ".bun",
+            ".deno",
+            ".local/bin",
+            ".local/lib",
+            ".local/share/virtualenvs",
+            "go",
+        ] {
+            paths.push(home.join(entry));
+        }
+    }
+
+    // Anything writable is necessarily readable.
+    paths.extend(writable_paths(root));
+    paths.retain(|p| p.exists());
+    paths
+}
+
+/// Credential stores a command has no business reading, relative to `$HOME`.
+///
+/// The list is the policy, so it is written out rather than pattern-matched:
+/// a rule like "anything starting with a dot" would take `~/.cargo` with it,
+/// and one like "anything with `key` in the name" would miss every entry
+/// here. Adding to it is cheap; each entry costs one directory listing.
+pub const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".netrc",
+    ".authinfo",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".docker/config.json",
+    ".config/gh",
+    ".config/gcloud",
+    ".config/op",
+    ".config/containers/auth.json",
+    ".password-store",
+    ".local/share/keyrings",
+];
+
+/// Grant everything under `base` except `deny`, by granting siblings.
+///
+/// Landlock only grants. Excluding one directory therefore means naming
+/// everything beside it: to withhold `~/.ssh` you grant every other entry of
+/// `$HOME` and never `$HOME` itself. `deny` entries may be nested
+/// (`.config/gh`), in which case the walk descends — `.config` is not granted
+/// whole, its children are, minus `gh`.
+///
+/// Paths that do not exist are skipped; a denied path that is not there costs
+/// nothing but also grants nothing extra.
+fn grant_except(base: &Path, deny: &[&str]) -> Vec<PathBuf> {
+    // Split each denied path into its first component and the rest, so the
+    // walk can decide per directory: grant it, or descend into it.
+    let mut here: Vec<&str> = Vec::new();
+    let mut deeper: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for entry in deny {
+        match entry.split_once('/') {
+            None => here.push(entry),
+            Some((head, rest)) => deeper.entry(head).or_default().push(rest),
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(base) else {
+        // Unreadable or not a directory: nothing to enumerate, and granting
+        // `base` itself would defeat the exclusion.
+        return Vec::new();
+    };
+
+    let mut granted = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            // A non-UTF-8 name cannot match a denied path, so it is granted
+            // like any other neighbour.
+            granted.push(entry.path());
+            continue;
+        };
+        if here.contains(&name) {
+            continue;
+        }
+        match deeper.get(name) {
+            None => granted.push(entry.path()),
+            Some(nested) => granted.extend(grant_except(&entry.path(), nested)),
+        }
+    }
+    granted
+}
+
+/// The credential stores git itself needs, and only git.
+///
+/// `git push` over SSH reads `~/.ssh`; over HTTPS with the `store` helper it
+/// reads `~/.git-credentials`. Denying them to the `git` tool would confine
+/// it by breaking it, which is not the same thing.
+///
+/// The exception is narrow and earned rather than convenient: the `git` tool
+/// runs a known binary with `core.hooksPath` pointed at nothing, so the one
+/// repository-controlled execution path it had is already gone. A shell
+/// command gets no such allowance, and neither does git under `Strict`.
+pub const GIT_CREDENTIALS: &[&str] = &[".ssh", ".git-credentials"];
+
+/// Everything except the credential stores, for [`Reads::ExceptSecrets`].
+fn readable_except_secrets(root: &Path, allow_git: bool) -> Vec<PathBuf> {
+    // `/home` is withheld and `$HOME` re-granted child by child below, so
+    // other users' home directories are excluded too.
+    let mut paths = grant_except(Path::new("/"), &["home", "root"]);
+
+    if let Ok(home) = std::env::var("HOME") {
+        let denied: Vec<&str> = HOME_SECRETS
+            .iter()
+            .copied()
+            .filter(|s| !allow_git || !GIT_CREDENTIALS.contains(s))
+            .collect();
+        paths.extend(grant_except(Path::new(&home), &denied));
+    }
+
+    // The workspace, in case it lives somewhere the walk did not reach.
+    paths.push(root.to_path_buf());
+    paths.extend(writable_paths(root));
+    paths.retain(|p| p.exists());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// How much of the filesystem a confined command may read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    /// Everything but the named credential stores. Keeps every toolchain
+    /// working. See the module docs for how "except" is built.
+    ExceptSecrets,
+    /// As [`ExceptSecrets`](Self::ExceptSecrets), plus the two stores git
+    /// needs to reach a remote. For the `git` tool alone — see
+    /// [`GIT_CREDENTIALS`].
+    ExceptSecretsAllowingGit,
+    /// Reads narrowed to the system, the named toolchains and the workspace.
+    Workspace,
+}
+
+impl Reads {
+    fn token(self) -> &'static str {
+        match self {
+            Reads::ExceptSecrets => "read-except-secrets",
+            Reads::ExceptSecretsAllowingGit => "read-git",
+            Reads::Workspace => "read-workspace",
+        }
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "read-except-secrets" => Some(Reads::ExceptSecrets),
+            "read-git" => Some(Reads::ExceptSecretsAllowingGit),
+            "read-workspace" => Some(Reads::Workspace),
+            _ => None,
+        }
+    }
+}
+
+/// The confinement a command is to run under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Policy {
+    pub network: Network,
+    pub reads: Reads,
+}
+
+impl Policy {
+    /// Writes confined, credential stores unreadable, network open. The
+    /// default for a repository you are working on rather than inspecting.
+    pub const fn permissive() -> Self {
+        Self {
+            network: Network::Allow,
+            reads: Reads::ExceptSecrets,
+        }
+    }
+
+    /// Reads narrowed and the network refused. For a repository you do not
+    /// trust.
+    pub const fn strict() -> Self {
+        Self {
+            network: Network::Deny,
+            reads: Reads::Workspace,
+        }
+    }
+
+    /// As [`permissive`](Self::permissive), with git's own credential stores
+    /// readable so it can reach a remote.
+    pub const fn for_git() -> Self {
+        Self {
+            network: Network::Allow,
+            reads: Reads::ExceptSecretsAllowingGit,
+        }
+    }
+}
+
+/// The trampoline binary that installs the ruleset, if it can be found.
+///
+/// Looked for beside the running executable and one level up, which covers
+/// both an installed layout (`bin/eventage-code`, `bin/eventage-confine`) and
+/// cargo's (`target/debug/deps/some-test`, `target/debug/eventage-confine`).
+///
+/// Falling back to `current_exe` with the marker argument — which is what
+/// this used to do unconditionally — is not safe in general: a binary that
+/// does not call [`run_if_helper`] first will hand the marker to its own
+/// argument parser. A test binary does exactly that, and libtest reads it as
+/// a filter, runs nothing, and exits 0. The caller sees a command that
+/// succeeded and produced no output, which is a sandbox failing in the one
+/// way you cannot notice. So: no helper, no confinement, and the caller is
+/// told rather than misled.
+#[cfg(target_os = "linux")]
+fn helper_binary() -> Option<PathBuf> {
+    use std::sync::OnceLock;
+    static HELPER: OnceLock<Option<PathBuf>> = OnceLock::new();
+    HELPER
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let mut dir = exe.parent()?;
+            for _ in 0..2 {
+                let candidate = dir.join("eventage-confine");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                dir = dir.parent()?;
+            }
+            None
+        })
+        .clone()
+}
+
+/// Build the command that runs `program` with `args`, confined to `root`.
 ///
 /// Returns `None` when confinement is unavailable — no Landlock in the
-/// kernel, or the executable cannot locate itself — so the caller can decide
-/// whether to run unconfined or refuse, rather than silently doing one.
+/// kernel, or no trampoline binary to install the ruleset — so the caller can
+/// decide whether to run unconfined or refuse, rather than silently doing
+/// one.
 #[cfg(target_os = "linux")]
-pub fn confined_command(
+pub fn confined_argv(
     root: &Path,
-    script: &str,
-    network: Network,
+    policy: Policy,
+    program: &str,
+    args: &[String],
 ) -> Option<std::process::Command> {
     if !available() {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = std::process::Command::new(helper_binary()?);
     cmd.arg(HELPER_ARG)
         .arg(root)
-        .arg(network.token())
-        .arg("bash")
-        // `-c`, not `-lc`: a login shell sources the user's profile, which
-        // re-imports the credentials the caller just scrubbed.
-        .arg("-c")
-        .arg(script);
+        .arg(policy.network.token())
+        .arg(policy.reads.token())
+        .arg(program)
+        .args(args);
     Some(cmd)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn confined_command(
+pub fn confined_argv(
     _root: &Path,
-    _script: &str,
-    _network: Network,
+    _policy: Policy,
+    _program: &str,
+    _args: &[String],
 ) -> Option<std::process::Command> {
     None
+}
+
+/// Build the command that runs a shell `script` confined to `root`.
+pub fn confined_command(
+    root: &Path,
+    script: &str,
+    policy: Policy,
+) -> Option<std::process::Command> {
+    // `-c`, not `-lc`: a login shell sources the user's profile, which
+    // re-imports the credentials the caller just scrubbed.
+    confined_argv(
+        root,
+        policy,
+        "bash",
+        &["-c".to_string(), script.to_string()],
+    )
 }
 
 /// Does this kernel actually enforce Landlock?
@@ -262,12 +593,25 @@ pub fn run_if_helper() {
         eprintln!("{HELPER_ARG}: no workspace root given");
         std::process::exit(70);
     };
+    // Only Landlock reads it, but the argument is required everywhere so a
+    // wrong invocation fails the same way on every platform.
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
     let network = args.get(3).map(String::as_str).and_then(Network::parse);
     let Some(network) = network else {
         eprintln!("{HELPER_ARG}: no network policy given");
         std::process::exit(70);
     };
-    if args.len() < 5 {
+    // Validated on every platform even though only Landlock acts on it: a
+    // malformed argument list should fail here, not silently on Linux only.
+    let reads = args.get(4).map(String::as_str).and_then(Reads::parse);
+    let Some(reads) = reads else {
+        eprintln!("{HELPER_ARG}: no read policy given");
+        std::process::exit(70);
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = reads;
+    if args.len() < 6 {
         eprintln!("{HELPER_ARG}: no command given");
         std::process::exit(70);
     }
@@ -275,12 +619,14 @@ pub fn run_if_helper() {
     #[cfg(target_os = "linux")]
     {
         let root = PathBuf::from(root);
-        // Everything readable, the workspace and the build caches writable.
         // Allocation and file opening are fine here: this process is
         // single-threaded and has not forked.
-        if let Err(e) =
-            eventage::sandbox::landlock_confine(&[PathBuf::from("/")], &writable_paths(&root))
-        {
+        let readable = match reads {
+            Reads::ExceptSecrets => readable_except_secrets(&root, false),
+            Reads::ExceptSecretsAllowingGit => readable_except_secrets(&root, true),
+            Reads::Workspace => readable_paths(&root),
+        };
+        if let Err(e) = eventage::sandbox::landlock_confine(&readable, &writable_paths(&root)) {
             // Refuse rather than run unconfined. The caller asked for a
             // confined command and got a helper that could not confine it;
             // running anyway would be the one outcome nobody asked for.
@@ -301,8 +647,8 @@ pub fn run_if_helper() {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let error = std::process::Command::new(&args[4]).args(&args[5..]).exec();
-        eprintln!("{HELPER_ARG}: could not run '{}': {error}", args[4]);
+        let error = std::process::Command::new(&args[5]).args(&args[6..]).exec();
+        eprintln!("{HELPER_ARG}: could not run '{}': {error}", args[5]);
         std::process::exit(72);
     }
 
@@ -333,5 +679,121 @@ mod tests {
             paths.iter().all(|p| p.exists()),
             "a path that does not exist would fail the whole ruleset: {paths:?}"
         );
+        // `cmd > /dev/null` is not an exotic thing to write.
+        assert!(paths.contains(&PathBuf::from("/dev/null")));
+    }
+
+    /// Is `path` reachable through any granted hierarchy?
+    fn reachable(granted: &[PathBuf], path: &Path) -> bool {
+        granted.iter().any(|g| path.starts_with(g))
+    }
+
+    #[test]
+    fn granting_siblings_excludes_a_path_and_keeps_its_neighbours() {
+        // Landlock only grants, so "everything except `.ssh`" means naming
+        // every other entry of the directory and never the directory itself.
+        let home = tempfile::tempdir().unwrap();
+        for dir in [".ssh", ".cargo", ".config", "projects"] {
+            std::fs::create_dir(home.path().join(dir)).unwrap();
+        }
+        std::fs::create_dir(home.path().join(".config/gh")).unwrap();
+        std::fs::create_dir(home.path().join(".config/pip")).unwrap();
+
+        let granted = grant_except(home.path(), &[".ssh", ".config/gh"]);
+
+        assert!(!reachable(&granted, &home.path().join(".ssh/id_ed25519")));
+        assert!(!reachable(
+            &granted,
+            &home.path().join(".config/gh/hosts.yml")
+        ));
+        // The neighbours survive, which is the whole reason for the walk.
+        assert!(reachable(&granted, &home.path().join(".cargo/config.toml")));
+        assert!(reachable(&granted, &home.path().join("projects/repo/src")));
+        assert!(reachable(
+            &granted,
+            &home.path().join(".config/pip/pip.conf")
+        ));
+        // And the parent itself is never granted, or the exclusion is void.
+        assert!(!granted.contains(&home.path().to_path_buf()));
+        assert!(!granted.contains(&home.path().join(".config")));
+    }
+
+    #[test]
+    fn a_denied_path_that_does_not_exist_costs_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("work")).unwrap();
+        let granted = grant_except(home.path(), &[".ssh", ".config/gh"]);
+        assert!(reachable(&granted, &home.path().join("work/file")));
+        assert!(!reachable(&granted, &home.path().join(".ssh")));
+    }
+
+    #[test]
+    fn the_default_read_policy_still_hides_the_credential_stores() {
+        // The `Confined` default. It reads almost everything — that is what
+        // keeps toolchains working — but not these.
+        let dir = tempfile::tempdir().unwrap();
+        let granted = readable_except_secrets(dir.path(), false);
+
+        assert!(reachable(&granted, Path::new("/usr/bin/cc")));
+        assert!(reachable(&granted, dir.path()));
+        assert!(
+            !granted.contains(&PathBuf::from("/")),
+            "granting / makes every exclusion below it meaningless"
+        );
+
+        if let Ok(home) = std::env::var("HOME") {
+            let home = Path::new(&home);
+            assert!(!granted.contains(&home.to_path_buf()));
+            for secret in [".ssh", ".aws", ".gnupg", ".config/gh"] {
+                assert!(
+                    !reachable(&granted, &home.join(secret)),
+                    "{} is reachable",
+                    home.join(secret).display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_narrow_read_set_excludes_the_home_directory_itself() {
+        // The claim the module docs make about `Reads::Workspace` is that
+        // `~/.ssh` is unreadable. Landlock grants a whole hierarchy, so that
+        // claim holds only if no ancestor of it is in the set.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = readable_paths(dir.path());
+        assert!(paths.contains(&dir.path().to_path_buf()));
+
+        let home = std::env::var("HOME").expect("HOME is set in the test environment");
+        let home = Path::new(&home);
+        for secret in [".ssh", ".aws", ".git-credentials", ".config/gh", ".netrc"] {
+            let secret = home.join(secret);
+            assert!(
+                !paths.iter().any(|granted| secret.starts_with(granted)),
+                "{} is reachable through a granted path in {paths:?}",
+                secret.display()
+            );
+        }
+        assert!(
+            !paths.iter().any(|p| p == home || p == Path::new("/")),
+            "granting $HOME or / defeats the whole set: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn the_helper_argument_order_round_trips() {
+        // The helper parses positionally, so a change to the builder that is
+        // not matched in the parser silently runs the wrong command.
+        let dir = tempfile::tempdir().unwrap();
+        let Some(cmd) = confined_argv(dir.path(), Policy::strict(), "echo", &["hello".to_string()])
+        else {
+            return; // No Landlock on this kernel; nothing to check.
+        };
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(args[0], HELPER_ARG);
+        assert_eq!(args[1], dir.path().to_string_lossy());
+        assert_eq!(Network::parse(&args[2]), Some(Network::Deny));
+        assert_eq!(Reads::parse(&args[3]), Some(Reads::Workspace));
+        assert_eq!(args[4], "echo");
+        assert_eq!(args[5], "hello");
     }
 }

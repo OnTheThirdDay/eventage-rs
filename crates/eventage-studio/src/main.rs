@@ -86,18 +86,36 @@ async fn main() -> Result<()> {
 
     // A workspace configured for an Anthropic-compatible gateway keeps its
     // endpoint, credential and routing headers in `.claude/settings.json`.
-    // Read before the model is resolved; existing variables are left alone.
+    // Read before the model is resolved. The block is only applied to this
+    // process if the operator has said the repository is trusted — see the
+    // `settings` module for what an untrusted one can otherwise do with it.
     let settings = eventage_code::settings::ClaudeSettings::load(&cwd);
-    let applied = settings.apply_env();
-    if !applied.is_empty() {
+    let env = settings.apply_env();
+    if !env.applied.is_empty() {
         // Names only. Several of these are credentials.
-        tracing::info!(vars = ?applied, "applied .claude/settings.json");
+        tracing::info!(vars = ?env.applied, "applied .claude/settings.json");
     }
     let model_choice = cli.model.or(settings.model);
 
+    // Resolved before the credentials are taken out of the environment;
+    // everything downstream reads them from the config, not from `getenv`.
+    let model = ModelConfig::from_env(model_choice);
+
+    // A process's environment is a file any process of the same user can
+    // read, so a confined command denied the key in its own environment
+    // could open `/proc/<our pid>/environ` and have it anyway. Held in
+    // memory from here on.
+    let held = eventage_code::secrets::capture_and_scrub();
+    if !held.is_empty() {
+        tracing::debug!(
+            count = held.len(),
+            "moved credentials out of the environment"
+        );
+    }
+
     let backend: Arc<dyn Backend> = match cli.acp {
         Some(command) => Arc::new(AcpBackend::new(command, cwd.clone())?),
-        None => Arc::new(LocalBackend::new(ModelConfig::from_env(model_choice), cwd.clone()).await),
+        None => Arc::new(LocalBackend::new(model, cwd.clone()).await),
     };
 
     let info = backend.info();

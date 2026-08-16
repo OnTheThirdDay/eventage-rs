@@ -91,12 +91,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Read before the model is resolved: this is where a workspace configured
-    // for a gateway keeps its endpoint, credential and routing headers.
-    // Existing environment variables are left alone.
+    // for a gateway keeps its endpoint, credential and routing headers. The
+    // block is applied only if the operator has marked the repository
+    // trusted; `apply_env` says what it withheld and why.
     let settings =
         eventage_code::settings::ClaudeSettings::load(std::env::current_dir().unwrap_or_default());
     let _applied = settings.apply_env();
     let model = ModelConfig::from_env(cli.model.or(settings.model));
+
+    // Everything that reads a credential out of the environment has now run,
+    // so take them out of it. A process's environment is a file that any
+    // process of the same user can read — `scrubbed_env` kept the key out of
+    // the child's own environment and the child could read the parent's.
+    let held = eventage_code::secrets::capture_and_scrub();
+    if !held.is_empty() {
+        tracing::debug!(
+            count = held.len(),
+            "moved credentials out of the environment"
+        );
+    }
     let container_image = cli.container_image.clone();
     let shell = eventage_code::tools::ShellContainment::from_id(&cli.sandbox).ok_or_else(|| {
         anyhow::anyhow!(

@@ -407,6 +407,7 @@ async fn verify_runs_the_projects_tests_and_refuses_anything_else() {
     let tool = tools::Verify {
         ws,
         containment: tools::ShellContainment::Confined,
+        container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
     };
 
     // Not on the list.
@@ -462,6 +463,7 @@ async fn verify_states_how_it_ran() {
     let out = (tools::Verify {
         ws,
         containment: tools::ShellContainment::Confined,
+        container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
     })
     .execute(json!({ "command": ["make", "test"], "timeout_secs": 30 }))
     .await;
@@ -489,6 +491,7 @@ async fn strict_verify_refuses_rather_than_running_unconfined() {
     let out = (tools::Verify {
         ws,
         containment: tools::ShellContainment::Strict,
+        container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
     })
     .execute(json!({ "command": ["cargo", "check"] }))
     .await;

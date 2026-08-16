@@ -13,10 +13,59 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// Run a git command in the workspace, returning stdout on success.
-pub async fn git(ws: &Workspace, args: &[&str]) -> Result<String, AgentError> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
+///
+/// Two things this does that a bare `Command::new("git")` does not, both
+/// because git is not an inert program — it runs scripts out of the
+/// repository it is pointed at.
+///
+/// **Credentials are scrubbed.** `git commit` executes `.git/hooks/pre-commit`
+/// and `commit-msg`, `git checkout` executes `post-checkout`; every one of
+/// them is a shell script the repository supplies. Inheriting this process's
+/// environment handed each of them `ANTHROPIC_API_KEY`, in a tool whose whole
+/// job is to run on a repository somebody else wrote.
+///
+/// **Hooks are disabled.** `core.hooksPath` is pointed at a directory that
+/// does not exist, so git finds no hooks to run. This is a real cost — a
+/// `pre-commit` that runs `cargo fmt` will not — and it is worth paying,
+/// because executing a repository's scripts is incidental to recording a
+/// commit rather than the point of it. Contrast `verify`, which exists to run
+/// the project's own code and so is confined instead of neutered. A user who
+/// wants their hooks can run `git commit` through `bash`, where the shell
+/// containment applies.
+///
+/// **And it runs under the session's containment**, like every other tool
+/// that starts a process. `git` is on the risky list precisely because it
+/// reaches outside the workspace — `push` talks to a remote, `checkout`
+/// rewrites the tree — and it was the last thing here still running with the
+/// host's full filesystem. Belt and braces with the hook suppression above:
+/// hooks are the known execution path, and containment covers the ones nobody
+/// has thought of.
+pub async fn git(
+    ws: &Workspace,
+    containment: crate::tools::ShellContainment,
+    args: &[&str],
+) -> Result<String, AgentError> {
+    // Before the subcommand: `git -c ... commit` is configuration,
+    // `git commit -c ...` is a different flag entirely.
+    let mut argv: Vec<String> = vec![
+        "-c".into(),
+        "core.hooksPath=/nonexistent/eventage-hooks-disabled".into(),
+    ];
+    argv.extend(args.iter().map(|a| a.to_string()));
+
+    let mut cmd = match containment.confined_command("git", &argv, ws.root())? {
+        Some(helper) => helper,
+        None => {
+            let mut plain = tokio::process::Command::new("git");
+            plain.args(&argv);
+            plain
+        }
+    };
+
+    let output = cmd
         .current_dir(ws.root())
+        .env_clear()
+        .envs(crate::tools::scrubbed_env())
         .output()
         .await
         .map_err(|e| AgentError::Tool(format!("git not available: {e}")))?;
@@ -53,6 +102,9 @@ pub fn is_conventional(subject: &str) -> bool {
 
 pub struct Git {
     pub ws: Arc<Workspace>,
+    /// The session's shell containment, applied to git like any other
+    /// process the agent starts.
+    pub containment: crate::tools::ShellContainment,
 }
 
 #[async_trait]
@@ -104,7 +156,12 @@ impl Tool for Git {
 
         match action {
             "status" => {
-                let porcelain = git(&self.ws, &["status", "--porcelain=v1", "-b"]).await?;
+                let porcelain = git(
+                    &self.ws,
+                    self.containment,
+                    &["status", "--porcelain=v1", "-b"],
+                )
+                .await?;
                 let files: Vec<Value> = porcelain
                     .lines()
                     .skip_while(|l| l.starts_with("##"))
@@ -129,7 +186,7 @@ impl Tool for Git {
                 }
                 let mut owned: Vec<&str> = argv;
                 owned.extend(paths.iter().map(String::as_str));
-                let diff = git(&self.ws, &owned).await?;
+                let diff = git(&self.ws, self.containment, &owned).await?;
                 Ok(json!({
                     "diff": diff.chars().take(60_000).collect::<String>(),
                     "truncated": diff.len() > 60_000,
@@ -139,6 +196,7 @@ impl Tool for Git {
             "log" => {
                 let log = git(
                     &self.ws,
+                    self.containment,
                     &["log", "--oneline", "--decorate", "-20", "--no-color"],
                 )
                 .await?;
@@ -147,11 +205,11 @@ impl Tool for Git {
 
             "branch" => match args.get("name").and_then(|v| v.as_str()) {
                 Some(name) => {
-                    git(&self.ws, &["checkout", "-b", name]).await?;
+                    git(&self.ws, self.containment, &["checkout", "-b", name]).await?;
                     Ok(json!({ "created": name }))
                 }
                 None => Ok(
-                    json!({ "current": git(&self.ws, &["branch", "--show-current"]).await?.trim() }),
+                    json!({ "current": git(&self.ws, self.containment, &["branch", "--show-current"]).await?.trim() }),
                 ),
             },
 
@@ -162,7 +220,7 @@ impl Tool for Git {
                 }
                 let mut owned: Vec<&str> = argv;
                 owned.extend(paths.iter().map(String::as_str));
-                git(&self.ws, &owned).await?;
+                git(&self.ws, self.containment, &owned).await?;
                 Ok(
                     json!({ "staged": if paths.is_empty() { vec!["<all>".to_string()] } else { paths } }),
                 )
@@ -182,12 +240,22 @@ impl Tool for Git {
                     )));
                 }
                 // Refuse an empty commit rather than producing a confusing error.
-                let staged = git(&self.ws, &["diff", "--cached", "--name-only"]).await?;
+                let staged = git(
+                    &self.ws,
+                    self.containment,
+                    &["diff", "--cached", "--name-only"],
+                )
+                .await?;
                 if staged.trim().is_empty() {
                     return Err(AgentError::Tool("nothing staged; run git add first".into()));
                 }
-                git(&self.ws, &["commit", "-m", message]).await?;
-                let sha = git(&self.ws, &["rev-parse", "--short", "HEAD"]).await?;
+                git(&self.ws, self.containment, &["commit", "-m", message]).await?;
+                let sha = git(
+                    &self.ws,
+                    self.containment,
+                    &["rev-parse", "--short", "HEAD"],
+                )
+                .await?;
                 Ok(json!({
                     "commit": sha.trim(),
                     "subject": subject,
@@ -196,9 +264,14 @@ impl Tool for Git {
             }
 
             "push" => {
-                let branch = git(&self.ws, &["branch", "--show-current"]).await?;
+                let branch = git(&self.ws, self.containment, &["branch", "--show-current"]).await?;
                 let branch = branch.trim();
-                git(&self.ws, &["push", "-u", "origin", branch]).await?;
+                git(
+                    &self.ws,
+                    self.containment,
+                    &["push", "-u", "origin", branch],
+                )
+                .await?;
                 Ok(json!({ "pushed": branch }))
             }
 
@@ -246,6 +319,18 @@ impl Tool for CreatePullRequest {
         let output = tokio::process::Command::new("gh")
             .args(&argv)
             .current_dir(self.ws.root())
+            // `gh` authenticates with its own token; every other credential
+            // in this process — the model provider's above all — is nothing
+            // to do with opening a pull request. The token is fetched from
+            // `secrets` rather than inherited, because startup takes it out
+            // of the environment entirely.
+            .env_clear()
+            .envs(crate::tools::scrubbed_env())
+            .envs(
+                ["GH_TOKEN", "GITHUB_TOKEN"]
+                    .into_iter()
+                    .filter_map(|name| crate::secrets::get(name).map(|v| (name.to_string(), v))),
+            )
             .output()
             .await
             .map_err(|e| {
@@ -267,6 +352,7 @@ impl Tool for CreatePullRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ShellContainment;
 
     #[test]
     fn recognises_conventional_subjects() {
@@ -285,10 +371,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repository_hook_does_not_run_and_does_not_see_the_api_key() {
+        // `git commit` executes `.git/hooks/pre-commit`, a shell script the
+        // repository supplies. It used to run with this process's whole
+        // environment, so a cloned repository got the model provider's
+        // credential handed to it the first time the agent committed
+        // anything.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Arc::new(Workspace::open(dir.path()).unwrap());
+
+        if git(&ws, ShellContainment::Host, &["init", "-q"])
+            .await
+            .is_err()
+        {
+            return; // No git on this machine; nothing to assert.
+        }
+        let _ = git(
+            &ws,
+            ShellContainment::Host,
+            &["config", "user.email", "t@example.invalid"],
+        )
+        .await;
+        let _ = git(
+            &ws,
+            ShellContainment::Host,
+            &["config", "user.name", "Test"],
+        )
+        .await;
+
+        let hooks = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s' \"${EVENTAGE_TEST_FAKE_KEY-unset}\" > \"$(dirname \"$0\")/../../ran\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // SAFETY: set before the child is spawned; no other thread in this
+        // test reads it.
+        unsafe { std::env::set_var("EVENTAGE_TEST_FAKE_KEY", "sk-should-not-leak") };
+
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        git(&ws, ShellContainment::Host, &["add", "a.txt"])
+            .await
+            .unwrap();
+        let committed = git(
+            &ws,
+            ShellContainment::Host,
+            &["commit", "-m", "feat: add a"],
+        )
+        .await;
+
+        unsafe { std::env::remove_var("EVENTAGE_TEST_FAKE_KEY") };
+        committed.unwrap();
+
+        let marker = dir.path().join("ran");
+        assert!(
+            !marker.exists(),
+            "the repository's pre-commit hook ran: {:?}",
+            std::fs::read_to_string(&marker)
+        );
+    }
+
+    #[tokio::test]
     async fn commit_rejects_bad_subject_before_touching_git() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Arc::new(Workspace::open(dir.path()).unwrap());
-        let tool = Git { ws };
+        let tool = Git {
+            ws,
+            containment: ShellContainment::Host,
+        };
         let err = tool
             .execute(json!({ "action": "commit", "message": "just some changes" }))
             .await

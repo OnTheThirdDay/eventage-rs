@@ -1008,6 +1008,80 @@ async fn deny_hook_surfaces_reason_to_model() {
 }
 
 #[tokio::test]
+async fn abort_cycle_from_a_tool_hook_ends_the_cycle() {
+    init_tracing();
+
+    // `AbortCycle` used to be folded into the generic skip: the hook vetoed
+    // one call, the step reported "continue", and the agent went round again
+    // — which is the opposite of the variant's name, and worst precisely when
+    // it matters, since a hook aborts on something alarming.
+    struct AbortHook;
+    #[async_trait]
+    impl CycleHook for AbortHook {
+        async fn before_tool(
+            &self,
+            _ctx: &HookContext<'_>,
+            _name: &str,
+            _args: &Value,
+        ) -> HookAction {
+            HookAction::AbortCycle
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bus = EventBus::new();
+    let agent = AgentBuilder::new()
+        .bus(bus.clone())
+        .llm(MockLlmProvider::new(vec![
+            tool_call_response("counter", "{}"),
+            // Only reached if the cycle carries on past the abort.
+            tool_call_response("counter", "{}"),
+            text_response("kept going"),
+        ]))
+        .tool(CounterTool {
+            name: "counter".into(),
+            calls: Arc::clone(&calls),
+        })
+        .hook(AbortHook)
+        .strategy(ReactStrategy::default())
+        .build();
+
+    bus.publish(Event::new(kinds::USER_MESSAGE, json!({"text": "go"})))
+        .await
+        .unwrap();
+    agent.cycle().await.unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "aborted tool must not run"
+    );
+
+    let log = bus.log().await;
+    // Every proposed call still has a result: a `tool_calls` message with a
+    // missing result is a history the next assembly cannot repair.
+    let proposed = log
+        .iter()
+        .filter(|e| e.kind == kinds::TOOL_CALL_PROPOSED)
+        .count();
+    let results: Vec<_> = log
+        .iter()
+        .filter(|e| e.kind == kinds::TOOL_RESULT)
+        .collect();
+    assert_eq!(results.len(), proposed);
+    assert_eq!(results[0].payload["result"]["aborted"], true);
+
+    // One assistant message, so exactly one step ran.
+    assert_eq!(
+        log.iter()
+            .filter(|e| e.kind == kinds::ASSISTANT_MESSAGE)
+            .count(),
+        1,
+        "the cycle continued past the abort"
+    );
+}
+
+#[tokio::test]
 async fn oversized_tool_results_are_middle_truncated() {
     init_tracing();
 

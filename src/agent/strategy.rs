@@ -100,7 +100,8 @@ pub trait ExecutionStrategy: Send + Sync {
 /// Runtime guardrails applied by [`execute_tools`] to every tool call.
 #[derive(Debug, Clone)]
 pub struct ToolExecOptions {
-    /// Maximum tools executing concurrently in one step.
+    /// Maximum tools executing concurrently in one step. Zero is treated as
+    /// one — see [`execute_tools`].
     pub max_concurrent: usize,
     /// Wall-clock limit per tool call. A tool exceeding it produces an error
     /// `tool.result` (visible to the model) instead of hanging the cycle.
@@ -174,17 +175,36 @@ fn cap_result_value(value: Value, max_chars: Option<usize>) -> Value {
     Value::String(truncate_middle(&rendered, max))
 }
 
-/// Executes tool calls concurrently, returning `true` if any tool was terminal.
+/// What a batch of tool calls did, beyond producing results.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ToolExecOutcome {
+    /// A tool that ends the cycle ran and succeeded.
+    pub had_terminal: bool,
+    /// A `before_tool` hook returned [`HookAction::AbortCycle`].
+    ///
+    /// Distinct from `had_terminal`, which is the agent finishing its work.
+    /// This is a hook stopping it, and the two used to be indistinguishable:
+    /// `AbortCycle` was folded into the generic skip, so a hook written to
+    /// halt a run vetoed one call and the cycle carried on to the next step —
+    /// which is the opposite of what the variant is named for, and worst
+    /// exactly when it matters, since a hook aborts on something alarming.
+    pub aborted: bool,
+}
+
+/// Executes tool calls concurrently.
 pub async fn execute_tools(
     ctx: &AgentContext,
     calls: &[ToolCall],
     hook_ctx: &HookContext<'_>,
     opts: &ToolExecOptions,
-) -> Result<bool, AgentError> {
+) -> Result<ToolExecOutcome, AgentError> {
     /// Why a planned call will not be executed.
     enum Veto {
-        /// Hook returned `Skip`/`AbortCycle` — generic veto.
+        /// Hook returned `Skip` — generic veto.
         Skipped,
+        /// Hook returned `AbortCycle` — this call and every one after it is
+        /// vetoed, and the cycle ends once the results are published.
+        Aborted,
         /// Hook returned `Deny(reason)` — reason is surfaced to the model.
         Denied(String),
         /// Arguments were not valid JSON — parse error surfaced to the model.
@@ -205,6 +225,7 @@ pub async fn execute_tools(
 
     // ── Phase 1: sequential pre-flight ────────────────────────────────────
     let mut plan: Vec<ToolPlan> = Vec::with_capacity(calls.len());
+    let mut aborted = false;
     for tc in calls {
         let proposed = ctx.event(
             kinds::TOOL_CALL_PROPOSED,
@@ -252,9 +273,22 @@ pub async fn execute_tools(
             {
                 HookAction::Continue => None,
                 HookAction::Deny(reason) => Some(Veto::Denied(reason)),
-                _ => Some(Veto::Skipped),
+                HookAction::AbortCycle => Some(Veto::Aborted),
+                HookAction::Skip => Some(Veto::Skipped),
             },
         };
+
+        // Once a hook has aborted, nothing further runs. The remaining calls
+        // are still planned and still get results published, because a
+        // `tool_calls` message whose results are missing is a message history
+        // the next assembly cannot repair.
+        let veto = match (veto, aborted) {
+            (None, true) => Some(Veto::Aborted),
+            (v, _) => v,
+        };
+        if matches!(veto, Some(Veto::Aborted)) {
+            aborted = true;
+        }
 
         let is_terminal = veto.is_none()
             && ctx
@@ -273,7 +307,10 @@ pub async fn execute_tools(
     }
 
     // ── Phase 2: bounded concurrent execution ─────────────────────────────
-    let sem = Arc::new(Semaphore::new(opts.max_concurrent));
+    // A limit of zero is not "run nothing", it is a permit that never
+    // arrives: every task parks on `acquire` and the cycle hangs with no
+    // error and no output. Read it as the only thing it can sensibly mean.
+    let sem = Arc::new(Semaphore::new(opts.max_concurrent.max(1)));
     let mut join_set: JoinSet<(usize, Value)> = JoinSet::new();
 
     for (i, p) in plan.iter().enumerate() {
@@ -374,6 +411,11 @@ pub async fn execute_tools(
                 "name": p.name,
                 "result": { "skipped": true, "reason": "vetoed by hook" }
             }),
+            Some(Veto::Aborted) => json!({
+                "tool_call_id": p.id,
+                "name": p.name,
+                "result": { "skipped": true, "aborted": true, "reason": "cycle aborted by hook" }
+            }),
             Some(Veto::Denied(reason)) => json!({
                 "tool_call_id": p.id,
                 "name": p.name,
@@ -410,7 +452,10 @@ pub async fn execute_tools(
         }
     }
 
-    Ok(had_terminal)
+    Ok(ToolExecOutcome {
+        had_terminal,
+        aborted,
+    })
 }
 
 // ── ReactStrategy ─────────────────────────────────────────────────────────────
@@ -676,9 +721,9 @@ pub async fn run_react_step(
     }
 
     // ── Execute tools (hooks + bounded concurrency) ───────────────────
-    let had_terminal = execute_tools(ctx, &response.tool_calls, &hook_ctx, opts).await?;
+    let outcome = execute_tools(ctx, &response.tool_calls, &hook_ctx, opts).await?;
 
-    Ok(if had_terminal {
+    Ok(if outcome.had_terminal || outcome.aborted {
         StepOutcome::Done
     } else {
         StepOutcome::Continue

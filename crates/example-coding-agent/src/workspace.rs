@@ -176,6 +176,45 @@ impl Workspace {
             .insert(path.to_path_buf(), fingerprint(bytes));
     }
 
+    /// Record what was last seen at `rel`, whatever route the text arrived by.
+    ///
+    /// A read served out of the editor's buffer never touched this, so
+    /// `observed` stayed empty and [`ensure_unchanged`](Self::ensure_unchanged)
+    /// was a no-op for every file the editor had open — which is precisely
+    /// the set of files a human is most likely to be editing at the same
+    /// time. The guard was present headless and absent where it mattered.
+    pub fn remember_source(&self, rel: &str, text: &str) {
+        if let Ok(path) = self.checked(rel) {
+            self.remember(&path, text.as_bytes());
+        }
+    }
+
+    /// Fail if `current` differs from what was last seen at `rel`.
+    ///
+    /// Takes the current contents rather than reading them, because the
+    /// comparison has to be made against whatever source the write will go
+    /// to. Reading from disk when the editor holds an unsaved buffer
+    /// compares two different things and refuses honest work.
+    pub fn ensure_matches(&self, rel: &str, current: &[u8]) -> Result<()> {
+        let path = self.checked(rel)?;
+        let seen = self
+            .observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&path)
+            .copied();
+        if let Some(seen) = seen {
+            if fingerprint(current) != seen {
+                bail!(
+                    "'{rel}' has changed since you last read it — something else \
+                     edited it. Read it again and reapply your change; writing now \
+                     would discard theirs."
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Fail if the file changed since we last saw it.
     ///
     /// Separate from the write, and called *before* anything else reads the
@@ -195,26 +234,13 @@ impl Workspace {
     /// read it, something else changes it, write it back.
     pub async fn ensure_unchanged(&self, rel: &str) -> Result<()> {
         let path = self.checked(rel)?;
-        let seen = self
-            .observed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&path)
-            .copied();
-
-        if let Some(seen) = seen {
-            let probe = path.clone();
-            if let Ok(current) = self.with_dir(move |dir| dir.read(&probe)).await {
-                if fingerprint(&current) != seen {
-                    bail!(
-                        "'{rel}' has changed since you last read it — something else \
-                         edited it. Read it again and reapply your change; writing now \
-                         would discard theirs."
-                    );
-                }
-            }
-        }
-        Ok(())
+        let probe = path.clone();
+        // A file that cannot be read now — deleted, or never there — is not
+        // a stale write; the write itself will report whatever is wrong.
+        let Ok(current) = self.with_dir(move |dir| dir.read(&probe)).await else {
+            return Ok(());
+        };
+        self.ensure_matches(rel, &current)
     }
 
     /// Read a file as bytes, confined to the workspace.

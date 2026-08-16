@@ -256,3 +256,40 @@ async fn an_edit_is_not_blocked_by_an_unrelated_change_to_the_same_file() {
     );
     assert!(text.contains("fn renamed(){}"), "{text}");
 }
+
+#[tokio::test]
+async fn the_stale_write_guard_arms_from_an_editor_buffer_too() {
+    // Under ACP a read is served out of the editor's open buffer and never
+    // touches the disk, so nothing was recorded and `ensure_unchanged` had
+    // nothing to compare — the guard was fully present headless and fully
+    // absent in the deployment where a human is most likely to be editing
+    // the same file at the same time.
+    //
+    // The ACP client is a JSON-RPC peer and not constructible here, so this
+    // exercises the two primitives the fix is made of: a non-disk read arms
+    // the record, and a check against that source fires when it has moved.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::open(dir.path()).unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "on disk\n").unwrap();
+
+    // What the editor handed back, which is deliberately *not* what is on
+    // disk: an unsaved buffer is the normal case.
+    ws.remember_source("lib.rs", "fn a() {}\n");
+
+    // The same buffer again: nothing has moved, so the write may proceed.
+    assert!(ws.ensure_matches("lib.rs", b"fn a() {}\n").is_ok());
+
+    // The human typed. A blind overwrite now would discard their work.
+    let err = ws
+        .ensure_matches("lib.rs", b"fn a() { changed }\n")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("changed since you last read it"),
+        "{err}"
+    );
+
+    // And the disk-based check is not consulted for an editor-served file:
+    // comparing the remembered buffer against the unsaved file on disk would
+    // refuse every honest edit.
+    assert!(ws.ensure_unchanged("lib.rs").await.is_err());
+}

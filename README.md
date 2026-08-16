@@ -170,8 +170,8 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use eventage_provided_impl::Session;
-use eventage_llm::OpenAiProvider;
+use eventage::agent::Session;
+use eventage::llm::OpenAiProvider;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -191,6 +191,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+> This is [`examples/quickstart.rs`](examples/quickstart.rs) verbatim, so it is
+> compiled by CI rather than trusted to stay correct.
 
 ## 📚 Documentation & Examples
 

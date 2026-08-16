@@ -307,29 +307,41 @@ impl EventBus {
     pub async fn publish(&self, mut event: Event) -> Result<(), BusError> {
         debug!("publishing event");
 
-        {
-            let transforms = self
-                .inner
-                .transforms
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for transform in transforms.iter() {
-                event = transform(event);
-            }
-        }
+        event = self.transform(event);
 
-        {
-            let mut store = self.inner.store.write().await;
-            if event.parent_event_id.is_none() {
-                event.parent_event_id = store.active_tip();
-            }
-            let id = event.id;
-            store.nodes.insert(id, event.clone());
-            store.active_path.push(id);
+        // The store lock is held across the fan-out, so an event cannot reach
+        // a subscriber before — or in a different order than — it reaches the
+        // log. Released separately, two concurrent publishes could interleave
+        // between the two steps and a subscriber rebuilding state from the
+        // stream would disagree with the DAG about what happened when.
+        //
+        // `fan_out` never blocks: delivery is a `try_send` and a dropped
+        // subscriber is pruned rather than waited on. Nothing acquires the
+        // store lock while holding `subs`, so this ordering cannot cycle.
+        let mut store = self.inner.store.write().await;
+        if event.parent_event_id.is_none() {
+            event.parent_event_id = store.active_tip();
         }
+        let id = event.id;
+        store.nodes.insert(id, event.clone());
+        store.active_path.push(id);
+
         let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
         Self::fan_out(&mut subs, event);
         Ok(())
+    }
+
+    /// Apply every registered publish transform, in registration order.
+    fn transform(&self, mut event: Event) -> Event {
+        let transforms = self
+            .inner
+            .transforms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for transform in transforms.iter() {
+            event = transform(event);
+        }
+        event
     }
 
     /// Broadcasts an **ephemeral** event to subscribers without storing it in
@@ -338,9 +350,17 @@ impl EventBus {
     /// Use for high-frequency signals that must never enter the LLM context or
     /// the persisted history: streaming deltas (`assistant.delta`), progress
     /// ticks, UI hints. Durable facts belong in [`publish`](Self::publish).
+    ///
+    /// Publish transforms apply here too, despite the name. They did not, and
+    /// the omission pointed the wrong way: `secrets_masking_transform` is the
+    /// reason the mechanism exists, and the streaming deltas that skipped it
+    /// are the highest-volume text the system produces and the copy a user
+    /// actually watches. A mask that covers the archive but not the screen is
+    /// not a mask.
     pub fn broadcast(&self, event: Event) {
+        let event = Self::mark_ephemeral(self.transform(event));
         let mut subs = self.inner.subs.lock().unwrap_or_else(|e| e.into_inner());
-        Self::fan_out(&mut subs, Self::mark_ephemeral(event));
+        Self::fan_out(&mut subs, event);
     }
 
     /// Stamp an event as never having been on the active branch.
@@ -902,6 +922,36 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn masking_covers_the_streaming_path_too() {
+        // The delta stream is the highest-volume text the system produces and
+        // the copy the user actually watches. It went out untransformed, so
+        // an API key echoed by a tool was redacted in the archive and printed
+        // on screen.
+        let bus = EventBus::new();
+        bus.add_publish_transform(secrets_masking_transform(vec!["sk-live-42".to_string()]));
+        let mut rx = bus.subscribe();
+
+        bus.broadcast(Event::new(
+            kinds::ASSISTANT_DELTA,
+            json!({ "content": "the key is sk-live-42" }),
+        ));
+        let event = rx.recv().await.unwrap();
+        let text = event.payload["content"].as_str().unwrap();
+        assert!(!text.contains("sk-live-42"), "{text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+
+        // Still ephemeral: masking must not turn it into a durable event.
+        assert_eq!(
+            event
+                .metadata
+                .get(meta_keys::EPHEMERAL)
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(bus.log().await.is_empty());
     }
 
     #[tokio::test]

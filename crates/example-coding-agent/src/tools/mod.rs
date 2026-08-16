@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use eventage::agent::{AgentError, Tool};
 use eventage::llm::ToolDefinition;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -51,10 +51,43 @@ async fn read_source(
         .map_err(|e| AgentError::Tool(e.to_string()))?;
     if let Some(client) = client {
         if let Some(text) = client.read(&abs.display().to_string()).await {
+            // Recorded here as well as on the disk path. Without it the
+            // stale-write guard was inert for exactly the files the editor
+            // has open — the ones a human is most likely to be editing at
+            // the same moment.
+            ws.remember_source(rel, &text);
             return Ok(text);
         }
     }
     ws.read_to_string(rel)
+        .await
+        .map_err(|e| AgentError::Tool(format!("{e:#}")))
+}
+
+/// Fail if the file changed since it was last read, checking whichever
+/// source the write will actually go to.
+///
+/// `Workspace::ensure_unchanged` reads from disk, which is the wrong
+/// comparison when the editor holds an unsaved buffer: it would compare the
+/// agent's remembered text against a file the editor has not written yet and
+/// refuse a perfectly good edit. Asking the same source that will receive the
+/// write keeps the two halves talking about the same bytes.
+async fn ensure_unchanged_source(
+    ws: &Workspace,
+    client: &Option<ClientFs>,
+    rel: &str,
+) -> Result<(), AgentError> {
+    if let Some(client) = client {
+        let abs = ws
+            .resolve(rel)
+            .map_err(|e| AgentError::Tool(e.to_string()))?;
+        if let Some(text) = client.read(&abs.display().to_string()).await {
+            return ws
+                .ensure_matches(rel, text.as_bytes())
+                .map_err(|e| AgentError::Tool(format!("{e:#}")));
+        }
+    }
+    ws.ensure_unchanged(rel)
         .await
         .map_err(|e| AgentError::Tool(format!("{e:#}")))
 }
@@ -218,10 +251,7 @@ impl Tool for WriteFile {
         // change and report everything as fine. This replaces the whole file
         // without looking at what was in it; `edit_file` matches on
         // surrounding text instead, a finer check that does not need this.
-        self.ws
-            .ensure_unchanged(&path)
-            .await
-            .map_err(|e| AgentError::Tool(format!("{e:#}")))?;
+        ensure_unchanged_source(&self.ws, &self.client, &path).await?;
         let old = read_source(&self.ws, &self.client, &path)
             .await
             .unwrap_or_default();
@@ -634,6 +664,8 @@ const VERIFIABLE: &[&[&str]] = &[
 pub struct Verify {
     pub ws: Arc<Workspace>,
     pub containment: ShellContainment,
+    /// Image for [`ShellContainment::Container`]. Ignored otherwise.
+    pub container_image: String,
 }
 
 impl Verify {
@@ -704,13 +736,49 @@ impl Tool for Verify {
             .and_then(|v| v.as_u64())
             .unwrap_or(600);
 
+        // `verify` runs the repository's own build and tests, which means it
+        // executes `build.rs`, npm lifecycle scripts, Makefile recipes and
+        // test bodies — all of them repository-controlled — and it is on the
+        // read-only tool list, so it needs no approval in any mode. It must
+        // therefore honour the session's containment exactly as `bash` does.
+        // It did not: `Container` fell through to the host Landlock path,
+        // because the branch was written for three modes out of four.
+        if self.containment == ShellContainment::Container {
+            let output = container_exec(
+                &self.container_image,
+                self.ws.root(),
+                &argv[0],
+                argv[1..].to_vec(),
+                timeout,
+            )
+            .await?;
+            return Ok(json!({
+                "command": argv.join(" "),
+                "exit_code": output.exit_code,
+                "passed": output.exit_code == 0 && !output.timed_out,
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+                "timed_out": output.timed_out,
+                "containment": format!(
+                    "container ({}) — {}",
+                    self.container_image,
+                    ShellContainment::Container.describe(true),
+                ),
+            }));
+        }
+
         // The `containment` field was being ignored, so `Strict` silently ran
         // unconfined and every result reported `containment: null` — the tool
         // said nothing about how it had run, which is the property the shell
         // tool states explicitly.
-        let confined =
-            crate::shell_sandbox::available() && self.containment != ShellContainment::Host;
-        if self.containment == ShellContainment::Strict && !confined {
+        let confined = crate::shell_sandbox::confined_argv(
+            self.ws.root(),
+            self.containment.policy(),
+            &argv[0],
+            &argv[1..],
+        )
+        .filter(|_| self.containment != ShellContainment::Host);
+        if self.containment == ShellContainment::Strict && confined.is_none() {
             return Err(AgentError::Tool(
                 "this session requires filesystem confinement and the kernel does not \
                  provide it (Landlock unavailable); refusing to run the command"
@@ -718,28 +786,15 @@ impl Tool for Verify {
             ));
         }
 
-        let mut cmd = match confined {
-            // The same trampoline the shell uses: the ruleset is built in a
-            // fresh single-threaded process, never in a forked child.
-            true => {
-                let mut helper =
-                    tokio::process::Command::new(std::env::current_exe().map_err(|e| {
-                        AgentError::Tool(format!("cannot locate the sandbox helper: {e}"))
-                    })?);
-                helper
-                    .arg(crate::shell_sandbox::HELPER_ARG)
-                    .arg(self.ws.root())
-                    // Verification runs the project's own build, which
-                    // resolves dependencies; denying the network here would
-                    // fail honest work.
-                    .arg("net-allow")
-                    .args(&argv);
-                helper
-            }
-            false => {
-                let mut plain = tokio::process::Command::new(&argv[0]);
+        // The same trampoline the shell uses: the ruleset is built in a fresh
+        // single-threaded process, never in a forked child.
+        let is_confined = confined.is_some();
+        let mut cmd: tokio::process::Command = match confined {
+            Some(helper) => helper.into(),
+            None => {
+                let mut plain = std::process::Command::new(&argv[0]);
                 plain.args(&argv[1..]);
-                plain
+                plain.into()
             }
         };
         cmd.current_dir(self.ws.root())
@@ -771,13 +826,7 @@ impl Tool for Verify {
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr),
             // Stated rather than assumed, exactly as the shell tool does.
-            "containment": if confined {
-                "credentials scrubbed, own process group, resource limits, filesystem \
-                 confined to the workspace"
-            } else {
-                "credentials scrubbed, own process group, resource limits — the kernel \
-                 offers no Landlock, so the filesystem is NOT confined"
-            },
+            "containment": self.containment.describe(is_confined),
         }))
     }
 }
@@ -939,12 +988,26 @@ impl Drop for BackgroundJobs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellContainment {
     /// Scrub credentials, run in its own process group, apply resource
-    /// limits, and confine the filesystem with Landlock where the kernel
-    /// offers it. Still no network isolation.
+    /// limits, and confine **writes** to the workspace and the toolchain
+    /// caches with Landlock where the kernel offers it.
+    ///
+    /// Reads go everywhere except the credential stores — `~/.ssh`, `~/.aws`,
+    /// `~/.gnupg`, `~/.npmrc` and the rest of
+    /// [`HOME_SECRETS`](crate::shell_sandbox). Broad on purpose: toolchains
+    /// install themselves in unpredictable places under `$HOME`, and a read
+    /// policy that guesses wrong makes `node` or `cargo` disappear. The
+    /// network is open, so a command here can still reach out — it just has
+    /// nothing of yours to send. Use `Strict` when even that is too much.
     Confined,
-    /// As `Confined`, and refuse to run at all if the filesystem cannot be
-    /// confined. For a repository you do not trust, where running a command
-    /// unconfined is worse than not running it.
+    /// As `Confined`, and additionally: reads narrowed to the system, the
+    /// named toolchain locations and the workspace; the network refused at
+    /// the syscall; and a refusal to run at all if the kernel cannot enforce
+    /// any of it.
+    ///
+    /// For a repository you do not trust, where running a command unconfined
+    /// is worse than not running it. It is allowed to break an exotic
+    /// toolchain, and a build that needs to fetch dependencies will fail —
+    /// that is the mode working, not the mode broken.
     Strict,
     /// Run inside a throwaway container: **no network**, no host filesystem
     /// beyond the workspace, capabilities dropped, memory and pid capped.
@@ -978,7 +1041,7 @@ pub enum ShellContainment {
 /// hostile, and the parent process holds the credential for the very model
 /// that proposed it. Matching on shape rather than an allow-list of known
 /// names, because the next provider's variable is not in any list.
-fn is_credential(name: &str) -> bool {
+pub(crate) fn is_credential(name: &str) -> bool {
     const MARKERS: [&str; 7] = [
         "KEY",
         "TOKEN",
@@ -1003,7 +1066,14 @@ fn is_credential(name: &str) -> bool {
 /// anyone can enumerate — `PATH`, `HOME`, `CARGO_HOME`, locale, proxies — and
 /// a build that fails for want of an unlisted variable would push people
 /// straight back to the unconfined mode.
-fn scrubbed_env() -> Vec<(String, String)> {
+/// The environment a confined command gets: this process's, minus secrets.
+///
+/// Belt and braces since [`secrets::capture_and_scrub`](crate::secrets) —
+/// after startup there is no credential left in the environment for this to
+/// filter. It stays because the filter is the guarantee and the scrub is an
+/// optimisation of it: the library is usable without `main` ever running, and
+/// a tool that leaked the key when embedded would be a strange thing to ship.
+pub(crate) fn scrubbed_env() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(name, _)| !is_credential(name))
         .collect()
@@ -1040,24 +1110,136 @@ impl ShellContainment {
 
     /// What each one is, for `--help` and for the error when it is misspelt.
     pub const NAMES: &'static str = "host | confined | strict | container";
+
+    /// The Landlock and seccomp policy this mode asks for.
+    ///
+    /// One place, so a tool cannot accidentally disagree with another about
+    /// what `Strict` means — which is how `verify` came to run with the
+    /// network open in a mode whose entire purpose is to deny it.
+    fn policy(self) -> crate::shell_sandbox::Policy {
+        match self {
+            ShellContainment::Strict => crate::shell_sandbox::Policy::strict(),
+            _ => crate::shell_sandbox::Policy::permissive(),
+        }
+    }
+
+    /// Build a confined command for a trusted helper program, or `None` to
+    /// run it plainly.
+    ///
+    /// For `git`: a known binary, run with its hooks disabled, that still
+    /// needs the session's containment because a tool that starts a process
+    /// and ignores the policy is a hole whatever the process is. Errors when
+    /// the session demands confinement the kernel cannot give.
+    ///
+    /// `Container` falls back to the strongest *host* policy rather than a
+    /// container. Running git inside the image would need git in the image
+    /// and the repository's `.git` mounted into it, and a bare `ubuntu` has
+    /// neither — the honest options were the host sandbox or no git at all.
+    pub(crate) fn confined_command(
+        self,
+        program: &str,
+        args: &[String],
+        root: &Path,
+    ) -> Result<Option<tokio::process::Command>, AgentError> {
+        if self == ShellContainment::Host {
+            return Ok(None);
+        }
+        let policy = match self {
+            ShellContainment::Strict => crate::shell_sandbox::Policy::strict(),
+            _ => crate::shell_sandbox::Policy::for_git(),
+        };
+        match crate::shell_sandbox::confined_argv(root, policy, program, args) {
+            Some(helper) => Ok(Some(helper.into())),
+            None if self == ShellContainment::Strict => Err(AgentError::Tool(format!(
+                "this session requires filesystem confinement and it is unavailable \
+                 (no Landlock, or no sandbox helper alongside this binary); refusing to \
+                 run `{program}`"
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// How this mode should be described in a tool result.
+    ///
+    /// Stated rather than assumed, and stated accurately: a model told its
+    /// filesystem is confined when it is not will reason from that.
+    fn describe(self, confined: bool) -> String {
+        match self {
+            ShellContainment::Host => "none — running with full host access".into(),
+            ShellContainment::Container => {
+                "container — no network, no host filesystem beyond the workspace, \
+                 capabilities dropped"
+                    .into()
+            }
+            _ if !confined => "credentials scrubbed, own process group, memory/cpu/file-size \
+                 limits — the kernel offers no Landlock, so the filesystem is NOT \
+                 confined and there is no network isolation"
+                .into(),
+            ShellContainment::Confined => "credentials scrubbed, own process group, \
+                 memory/cpu/file-size limits, writes confined to the workspace, reads \
+                 allowed everywhere except credential stores (~/.ssh, ~/.aws, ~/.gnupg \
+                 and similar). The network is open."
+                .into(),
+            ShellContainment::Strict => "credentials scrubbed, own process group, \
+                 memory/cpu/file-size limits, writes confined to the workspace, reads \
+                 confined to the workspace and the system toolchain, network refused."
+                .into(),
+        }
+    }
+}
+
+/// Run one command inside a throwaway container.
+///
+/// A fresh container per command, which is the executor's own behaviour and
+/// the right default here: it means one command cannot leave anything behind
+/// for the next, and the only state that survives is what was written to the
+/// workspace — which is the thing the user actually wants to keep.
+///
+/// Free-standing rather than a method, because both `bash` and `verify` need
+/// it. `verify` reaching the host sandbox while the session asked for a
+/// container was the sharper half of the bug: it runs `cargo test` and `npm
+/// run`, so it executes `build.rs`, lifecycle scripts and test bodies — all
+/// repository-controlled — and it needs no approval in any mode.
+async fn container_exec(
+    image: &str,
+    root: &Path,
+    program: &str,
+    args: Vec<String>,
+    timeout_secs: u64,
+) -> Result<eventage::sandbox::SandboxOutput, AgentError> {
+    use eventage::sandbox::{DockerExecutor, SandboxExecutor, SandboxRequest};
+
+    DockerExecutor::new(image)
+        .execute(SandboxRequest {
+            program: program.into(),
+            args,
+            // Nothing from the host: the executor starts from an empty
+            // environment, and there is no profile to re-import from.
+            env: Default::default(),
+            stdin: None,
+            timeout_ms: timeout_secs * 1_000,
+            working_dir: root.to_path_buf(),
+            readable_paths: vec![],
+            writable_paths: vec![root.to_path_buf()],
+        })
+        .await
+        .map_err(|e| {
+            AgentError::Tool(format!(
+                "could not run the command in a container ({image}): {e}. Docker must be \
+                 running and the image present — `docker pull {image}` — or switch this \
+                 session away from container containment."
+            ))
+        })
 }
 
 impl Bash {
     /// Run the command inside a throwaway container.
-    ///
-    /// A fresh container per command, which is the executor's own behaviour
-    /// and the right default here: it means one command cannot leave anything
-    /// behind for the next, and the only state that survives is what was
-    /// written to the workspace — which is the thing the user actually wants
-    /// to keep.
     async fn run_in_container(
         &self,
         script: &str,
         timeout_secs: u64,
         background: bool,
     ) -> Result<Value, AgentError> {
-        use eventage::sandbox::{DockerExecutor, SandboxExecutor, SandboxRequest};
-
         if background {
             return Err(AgentError::Tool(
                 "background commands are not available inside a container: the container \
@@ -1066,30 +1248,14 @@ impl Bash {
             ));
         }
 
-        let executor = DockerExecutor::new(&self.container_image);
-        let root = self.ws.root().to_path_buf();
-        let output = executor
-            .execute(SandboxRequest {
-                program: "bash".into(),
-                args: vec!["-c".into(), script.to_string()],
-                // Nothing from the host: the executor starts from an empty
-                // environment, and there is no profile to re-import from.
-                env: Default::default(),
-                stdin: None,
-                timeout_ms: timeout_secs * 1_000,
-                working_dir: root.clone(),
-                readable_paths: vec![],
-                writable_paths: vec![root],
-            })
-            .await
-            .map_err(|e| {
-                AgentError::Tool(format!(
-                    "could not run the command in a container ({}): {e}. Docker must be \
-                     running and the image present — `docker pull {}` — or switch this \
-                     session away from container containment.",
-                    self.container_image, self.container_image
-                ))
-            })?;
+        let output = container_exec(
+            &self.container_image,
+            self.ws.root(),
+            "bash",
+            vec!["-c".into(), script.to_string()],
+            timeout_secs,
+        )
+        .await?;
 
         Ok(json!({
             "exit_code": output.exit_code,
@@ -1097,9 +1263,9 @@ impl Bash {
             "stderr": output.stderr,
             "timed_out": output.timed_out,
             "containment": format!(
-                "container ({}) — no network, no host filesystem beyond the workspace, \
-                 capabilities dropped. Only what the image contains is available.",
-                self.container_image
+                "container ({}) — {}",
+                self.container_image,
+                ShellContainment::Container.describe(true),
             ),
         }))
     }
@@ -1122,14 +1288,11 @@ impl Bash {
         // Re-executed through the sandbox helper where the kernel supports
         // it, so the ruleset is built in a fresh single-threaded process
         // rather than in the forked child — see `shell_sandbox`.
-        // Strict is for a repository you do not trust, so it also refuses the
-        // network. Confined leaves it open: resolving dependencies needs it,
-        // and a mode that breaks `cargo build` gets switched off.
-        let network = match self.containment {
-            ShellContainment::Strict => crate::shell_sandbox::Network::Deny,
-            _ => crate::shell_sandbox::Network::Allow,
-        };
-        let confined = crate::shell_sandbox::confined_command(self.ws.root(), script, network);
+        let confined = crate::shell_sandbox::confined_command(
+            self.ws.root(),
+            script,
+            self.containment.policy(),
+        );
         if confined.is_none() && self.containment == ShellContainment::Strict {
             return Err(AgentError::Tool(
                 "this session requires filesystem confinement and the kernel does not \
@@ -1321,19 +1484,7 @@ impl Tool for Bash {
             "stderr": String::from_utf8_lossy(&output.stderr),
             // Stated in the result so the containment is visible rather than
             // assumed — the Landlock half is best-effort by kernel.
-            "containment": match self.containment {
-                ShellContainment::Host => "none — running with full host access",
-                _ if crate::shell_sandbox::available() => {
-                    "credentials scrubbed, own process group, memory/cpu/file-size \
-                     limits, filesystem confined to the workspace — but no network \
-                     isolation"
-                }
-                _ => {
-                    "credentials scrubbed, own process group, memory/cpu/file-size \
-                     limits — the kernel offers no Landlock, so the filesystem is \
-                     NOT confined and there is no network isolation"
-                }
-            },
+            "containment": self.containment.describe(crate::shell_sandbox::available()),
         }))
     }
 }

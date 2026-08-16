@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use eventage::event::kinds;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
@@ -33,6 +34,99 @@ use tracing::{debug, warn};
 
 /// The protocol version Studio speaks.
 const PROTOCOL_VERSION: u32 = 1;
+
+/// Resolve a path the agent asked us to read or write, confined to `root`.
+///
+/// Studio advertises `fs/read_text_file` and `fs/write_text_file`, and used to
+/// service them by handing the requested string straight to `tokio::fs`. Any
+/// absolute path on the machine was fair game — `~/.ssh/id_ed25519` to read,
+/// `~/.bashrc` to write. This is the one place in the system where a path
+/// never passed through a `Workspace` handle, so the agent's own confinement
+/// counted for nothing: it resolves a path, finds a client is attached, and
+/// delegates, and the delegate had no boundary of its own.
+///
+/// It matters even though the agent is usually ours. Studio takes
+/// `--acp <command>` and will drive anything that speaks the protocol, and
+/// "the other end is trustworthy" is the assumption a client is not entitled
+/// to make.
+///
+/// Symlinks are resolved before the check, because a link inside the
+/// workspace pointing out of it is the obvious way past a prefix comparison.
+/// A path that does not exist yet — an ordinary thing for a write — is
+/// resolved as far as it does exist, and the remainder must not climb.
+fn confine(root: &Path, requested: &str) -> Result<PathBuf, String> {
+    if requested.is_empty() {
+        return Err("no path given".into());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("workspace '{}' is unreadable: {e}", root.display()))?;
+
+    let requested = Path::new(requested);
+    let joined = match requested.is_absolute() {
+        true => requested.to_path_buf(),
+        false => root.join(requested),
+    };
+
+    // Canonicalize the deepest part that exists — that is what resolves
+    // symlinks — and keep the rest as literal components.
+    let mut existing = joined.as_path();
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let resolved = loop {
+        match existing.canonicalize() {
+            Ok(real) => break real,
+            Err(_) => {
+                // `canonicalize` also fails on a symlink whose target does
+                // not exist — and a write through one lands wherever it
+                // points, which is the escape this whole function is for.
+                // Treating it as "does not exist yet" and appending the name
+                // back on would allow exactly that.
+                if existing
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    return Err(format!(
+                        "'{}' is a symlink whose target does not exist; writing through \
+                         it would land somewhere unknown",
+                        existing.display()
+                    ));
+                }
+                match (existing.parent(), existing.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        tail.push(name);
+                        existing = parent;
+                    }
+                    _ => return Err(format!("'{}' cannot be resolved", joined.display())),
+                }
+            }
+        }
+    };
+
+    let mut full = resolved;
+    for name in tail.iter().rev() {
+        // `..` in the part that does not exist cannot be resolved by the
+        // filesystem, so it is refused rather than guessed at.
+        if Path::new(name)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(format!(
+                "'{}' climbs out of the workspace",
+                joined.display()
+            ));
+        }
+        full.push(name);
+    }
+
+    if !full.starts_with(&root) {
+        return Err(format!(
+            "'{}' is outside this session's workspace ({})",
+            full.display(),
+            root.display()
+        ));
+    }
+    Ok(full)
+}
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
@@ -201,6 +295,11 @@ impl AcpSession {
         let mut child = tokio::process::Command::new(program)
             .args(args)
             .current_dir(&cwd)
+            // Startup takes credentials out of this process's environment, so
+            // a child would otherwise start without the key it needs to reach
+            // a model. This one is the agent itself, named by the operator on
+            // the command line.
+            .envs(eventage_code::secrets::all())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The agent's logs belong on our stderr, not mixed into the
@@ -224,12 +323,13 @@ impl AcpSession {
         let reader = {
             let peer = Arc::clone(&peer);
             let feed = Arc::clone(&feed);
+            let root = PathBuf::from(&cwd);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 loop {
                     match lines.next_line().await {
                         Ok(Some(line)) if !line.trim().is_empty() => {
-                            if let Err(e) = dispatch(&peer, &feed, &line).await {
+                            if let Err(e) = dispatch(&peer, &feed, &root, &line).await {
                                 warn!("could not handle agent message: {e}");
                             }
                         }
@@ -301,7 +401,21 @@ impl AcpSession {
 }
 
 /// Turn one line from the agent into feed events and protocol replies.
-async fn dispatch(peer: &Arc<Peer>, feed: &Arc<EventFeed>, line: &str) -> Result<()> {
+/// Tell the user when the agent reached outside the workspace.
+///
+/// Refusing quietly would leave a confusing failure on the agent's side and
+/// nothing at all on the user's. An agent asking for `~/.ssh` is either
+/// broken or being driven by something in the repository, and both are worth
+/// seeing.
+fn refused(feed: &Arc<EventFeed>, action: &str, asked: &str, why: &str) {
+    warn!(action, path = asked, "refused a filesystem request: {why}");
+    feed.push(StudioEvent::studio(
+        studio_kinds::FS_REFUSED,
+        json!({ "action": action, "path": asked, "reason": why }),
+    ));
+}
+
+async fn dispatch(peer: &Arc<Peer>, feed: &Arc<EventFeed>, root: &Path, line: &str) -> Result<()> {
     let message: Value = serde_json::from_str(line)
         .with_context(|| format!("agent sent invalid JSON: {}", truncate(line, 200)))?;
 
@@ -344,19 +458,31 @@ async fn dispatch(peer: &Arc<Peer>, feed: &Arc<EventFeed>, line: &str) -> Result
                 ));
             }
             "fs/read_text_file" => {
-                let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let result = match tokio::fs::read_to_string(path).await {
-                    Ok(content) => json!({ "content": content }),
-                    Err(e) => json!({ "content": "", "error": e.to_string() }),
+                let asked = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let result = match confine(root, asked) {
+                    Err(refusal) => {
+                        refused(feed, "read", asked, &refusal);
+                        json!({ "content": "", "error": refusal })
+                    }
+                    Ok(path) => match tokio::fs::read_to_string(&path).await {
+                        Ok(content) => json!({ "content": content }),
+                        Err(e) => json!({ "content": "", "error": e.to_string() }),
+                    },
                 };
                 peer.respond(id, result).await?;
             }
             "fs/write_text_file" => {
-                let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let asked = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let result = match tokio::fs::write(path, content).await {
-                    Ok(()) => json!({}),
-                    Err(e) => json!({ "error": e.to_string() }),
+                let result = match confine(root, asked) {
+                    Err(refusal) => {
+                        refused(feed, "write", asked, &refusal);
+                        json!({ "error": refusal })
+                    }
+                    Ok(path) => match tokio::fs::write(&path, content).await {
+                        Ok(()) => json!({}),
+                        Err(e) => json!({ "error": e.to_string() }),
+                    },
                 };
                 peer.respond(id, result).await?;
             }
@@ -694,6 +820,57 @@ fn first_text(blocks: &[PromptBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_cannot_read_outside_the_workspace() {
+        // Studio advertises the filesystem capability and used to service it
+        // with the requested string handed straight to `tokio::fs`, so any
+        // absolute path on the machine was reachable.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ok.txt"), "fine").unwrap();
+
+        assert!(confine(root.path(), "ok.txt").is_ok());
+        assert!(confine(root.path(), "./nested/new.txt").is_ok());
+        assert!(confine(root.path(), root.path().join("ok.txt").to_str().unwrap()).is_ok());
+
+        // `~` is not expanded by the filesystem, so a literal one stays
+        // inside the workspace and is not an escape.
+        assert!(confine(root.path(), "~/.ssh/id_ed25519").is_ok());
+
+        for hostile in ["/etc/passwd", "../../../etc/passwd", ""] {
+            assert!(
+                confine(root.path(), hostile).is_err(),
+                "'{hostile}' was allowed"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_out_of_the_workspace_is_not_a_way_round_the_check() {
+        // A prefix comparison on the requested string is not a boundary: a
+        // link inside the workspace is the obvious way past it.
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "sk-live").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+
+        let err = confine(root.path(), "escape/secret").unwrap_err();
+        assert!(err.contains("outside this session's workspace"), "{err}");
+
+        // And a link to a file that does not exist yet, for the write path.
+        std::os::unix::fs::symlink(outside.path().join("planted"), root.path().join("plant"))
+            .unwrap();
+        assert!(confine(root.path(), "plant").is_err());
+    }
+
+    #[test]
+    fn a_climbing_component_in_a_path_that_does_not_exist_is_refused() {
+        // The filesystem cannot resolve `..` through a directory that is not
+        // there, so it is refused rather than guessed at.
+        let root = tempfile::tempdir().unwrap();
+        assert!(confine(root.path(), "nope/../../escaped.txt").is_err());
+    }
 
     #[test]
     fn message_chunks_become_assistant_deltas() {

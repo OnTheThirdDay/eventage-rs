@@ -459,6 +459,17 @@ pub struct Task {
     pub bus: EventBus,
     /// The subagents of this session, kept alive between calls.
     pub registry: Arc<SubagentRegistry>,
+    /// The session's shell containment, handed down unchanged.
+    ///
+    /// It used to be hardcoded to `Confined` here, which quietly undid the
+    /// operator's choice: a session started `--shell strict` — reads narrowed
+    /// and the network refused, because the repository is not trusted — got
+    /// subagents whose shell had neither. A subagent is less supervised than
+    /// the session that spawned it, so the one thing its containment must
+    /// never be is weaker.
+    pub containment: crate::tools::ShellContainment,
+    /// Image for [`ShellContainment::Container`](crate::tools::ShellContainment).
+    pub container_image: String,
     /// Registered as `task_explore` rather than `task`: read-only kinds only,
     /// never a worktree.
     ///
@@ -714,13 +725,14 @@ impl Tool for Task {
                 // listening to.
                 .tool(tools::Verify {
                     ws: ws.clone(),
-                    containment: tools::ShellContainment::Confined,
+                    containment: self.containment,
+                    container_image: self.container_image.clone(),
                 })
                 .tool(tools::Bash {
                     ws: ws.clone(),
                     jobs: Arc::new(tools::BackgroundJobs::default()),
-                    containment: tools::ShellContainment::Confined,
-                    container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
+                    containment: self.containment,
+                    container_image: self.container_image.clone(),
                 })
                 .tool(intel::LspDiagnostics {
                     ws: ws.clone(),
@@ -871,6 +883,8 @@ mod tests {
             bus: EventBus::new(),
             registry: Arc::new(SubagentRegistry::new()),
             read_only: false,
+            containment: crate::tools::ShellContainment::Confined,
+            container_image: crate::tools::DEFAULT_CONTAINER_IMAGE.into(),
         };
         (dir, tool)
     }

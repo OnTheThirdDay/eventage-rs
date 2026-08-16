@@ -753,6 +753,13 @@ impl AcpServer {
         let peer = Arc::clone(&self.peer);
         let session_id = req.session_id.clone();
 
+        // Checked before the bridge is spawned, so a refusal answers at once
+        // rather than after the drain timeout. `prompt_turn` re-checks under
+        // the gate and is the one that decides.
+        if session.is_busy() {
+            anyhow::bail!("this session is already working on something; cancel it first");
+        }
+
         // Subscribe before publishing so no event is missed.
         let mut rx = session.bus.subscribe();
         let bridge = {
@@ -767,8 +774,10 @@ impl AcpServer {
             })
         };
 
-        session.submit_prompt(&req.prompt).await?;
-        let outcome = session.run_cycle().await;
+        // Submit and run under one gate: the two apart left a window where a
+        // pipelined prompt could join the running conversation and clear its
+        // cancellation flag.
+        let outcome = session.prompt_turn(&req.prompt).await;
 
         // Let the bridge drain rather than killing it. Aborting dropped
         // whatever was still queued — the final assistant chunk, a tool

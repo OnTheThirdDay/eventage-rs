@@ -230,8 +230,12 @@ export function PermissionCard({
           <button className="btn primary" onClick={() => onAnswer(true, false)}>
             Allow once
           </button>
-          <button className="btn" onClick={() => onAnswer(true, true)}>
-            Always allow {item.tool}
+          <button
+            className="btn"
+            onClick={() => onAnswer(true, true)}
+            title="Approves this exact call for the rest of the session. A different command asks again."
+          >
+            Always allow this call
           </button>
           <button className="btn danger" onClick={() => onAnswer(false, false)}>
             Reject
@@ -240,7 +244,7 @@ export function PermissionCard({
       ) : (
         <div className="verdict">
           {item.status === "approved" ? "Allowed" : "Rejected"}
-          {item.auto === "always_allow" && " automatically (you allowed this tool)"}
+          {item.auto === "always_allow" && " automatically (you allowed this call)"}
           {item.reason && ` — ${item.reason}`}
         </div>
       )}

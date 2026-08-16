@@ -42,8 +42,9 @@ pub use session::{Session, SessionBuilder};
 pub use skills::{Skill, SkillTool, SkillsLibrary};
 pub use strategy::{
     run_react_step, truncate_middle, AgentContext, ExecutionStrategy, ReactStrategy,
-    SingleShotStrategy, StepOutcome, ToolExecOptions, DEFAULT_MAX_CONCURRENT_TOOLS,
-    DEFAULT_MAX_REACT_STEPS, DEFAULT_MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT_SECS,
+    SingleShotStrategy, StepOutcome, ToolExecOptions, ToolExecOutcome,
+    DEFAULT_MAX_CONCURRENT_TOOLS, DEFAULT_MAX_REACT_STEPS, DEFAULT_MAX_TOOL_RESULT_CHARS,
+    DEFAULT_TOOL_TIMEOUT_SECS,
 };
 pub use stuck::{detect_stuck, StuckAnalysis, StuckKind};
 pub use summarizing::SummarizingContextAssembler;

@@ -22,7 +22,18 @@ use eventage::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// A point a session can be rewound to.
+#[derive(Debug, Clone)]
+struct Checkpoint {
+    /// The event the conversation rolls back to.
+    id: eventage::EventId,
+    /// The working tree as the turn found it, if the workspace is a git
+    /// repository. `None` means a rewind can restore the conversation and
+    /// nothing else.
+    tree: Option<String>,
+}
 
 /// How much of the context window the repository map may occupy.
 ///
@@ -36,6 +47,21 @@ use tracing::{info, warn};
 /// files and led an agent to report a capability missing because the file
 /// defining it had been dropped.
 const REPO_MAP_TOKENS: usize = 8_000;
+
+/// Published when a rewind leaves edited files on disk.
+///
+/// Rewinding undoes the *conversation*. Where the workspace is a git
+/// repository the working tree is put back too ([`WORKING_TREE_RESTORED`]);
+/// where it is not, there is nothing to put it back from, and saying so is
+/// the difference between a limitation and a trap.
+pub const WORKING_TREE_UNCHANGED: &str = "session.working_tree_unchanged";
+
+/// Published when a rewind put the working tree back as well.
+///
+/// Carries `undo`, the commit id of a snapshot taken immediately before the
+/// restore, so anything written since the checkpoint can be recovered with
+/// `git checkout <undo> -- .`.
+pub const WORKING_TREE_RESTORED: &str = "session.working_tree_restored";
 
 /// Connect one MCP server and load its tools.
 ///
@@ -79,8 +105,9 @@ pub struct CodingSession {
     config: SessionConfig,
     /// The mode in force, readable by tools and subagents at call time.
     mode: Arc<crate::config::SharedMode>,
-    /// One checkpoint per turn, newest last — the anchors for `rewind`.
-    checkpoints: tokio::sync::Mutex<Vec<eventage::EventId>>,
+    /// One checkpoint per turn, newest last — the anchors for `rewind`,
+    /// each paired with a snapshot of the working tree as the turn found it.
+    checkpoints: tokio::sync::Mutex<Vec<Checkpoint>>,
     /// The subagents this session started, kept alive between calls so the
     /// agent can go back to one instead of briefing a fresh copy. Dropping
     /// the session drops them, along with any worktrees they hold.
@@ -364,6 +391,7 @@ impl CodingSession {
             .tool(tools::Verify {
                 ws: ws.clone(),
                 containment: config.shell,
+                container_image: config.container_image.clone(),
             })
             .tool(intel::LspDiagnostics {
                 ws: ws.clone(),
@@ -404,7 +432,10 @@ impl CodingSession {
             // returns nothing is worse than no search tool, because the model
             // reads the empty result as "nothing exists".
             .tool(eventage::agent::web::WebFetchTool::new())
-            .tool(tools::git::Git { ws: ws.clone() })
+            .tool(tools::git::Git {
+                ws: ws.clone(),
+                containment: config.shell,
+            })
             .tool(tools::git::CreatePullRequest { ws: ws.clone() })
             // Two names for two capabilities. Exploring costs nothing and is
             // allowed everywhere; delegating work that may edit — and that
@@ -420,6 +451,8 @@ impl CodingSession {
                 bus: bus.clone(),
                 registry: subagents.clone(),
                 read_only: true,
+                containment: config.shell,
+                container_image: config.container_image.clone(),
             })
             .tool(tools::task::Task {
                 ws: ws.clone(),
@@ -432,6 +465,8 @@ impl CodingSession {
                 // it — which is what makes keeping them alive safe.
                 registry: subagents.clone(),
                 read_only: false,
+                containment: config.shell,
+                container_image: config.container_image.clone(),
             });
 
         if !skills.is_empty() {
@@ -457,14 +492,23 @@ impl CodingSession {
         // Rewind anchors live in the log, so rebuild them when reopening —
         // otherwise a resumed session reports no turns to undo even though
         // its history is right there.
-        let mut checkpoints: Vec<eventage::EventId> = Vec::new();
+        let mut checkpoints: Vec<Checkpoint> = Vec::new();
         if restore {
             checkpoints = bus
                 .log()
                 .await
                 .iter()
                 .filter(|e| e.kind == kinds::CHECKPOINT)
-                .map(|e| e.id)
+                // No tree: the snapshot commits from the previous process
+                // are unreferenced and `git gc` may already have collected
+                // them, so a resumed session rewinds the conversation and
+                // says plainly that the files stayed. Claiming a restore
+                // against a commit id that no longer resolves would be worse
+                // than not offering one.
+                .map(|e| Checkpoint {
+                    id: e.id,
+                    tree: None,
+                })
                 .collect();
             info!(anchors = checkpoints.len(), "restored rewind anchors");
         }
@@ -527,11 +571,34 @@ impl CodingSession {
     /// Each turn opens with a DAG checkpoint, which is what makes
     /// [`rewind`](Self::rewind) possible: undoing a turn is a graph operation,
     /// not a hand-rolled message-array edit.
+    ///
+    /// **Not gated.** It publishes a message and clears the cancellation
+    /// flag; the gate is taken by [`run_cycle`](Self::run_cycle). A caller
+    /// that submits and then runs, without holding something of its own in
+    /// between, has a window where a second prompt can publish a second user
+    /// message and reset the cancellation of the turn already in flight.
+    /// Prefer [`prompt_turn`](Self::prompt_turn), which holds the gate across
+    /// both. This stays public for callers that genuinely drive the two
+    /// halves apart, such as a CLI with one turn and no concurrency.
     pub async fn submit_prompt(&self, blocks: &[ContentBlock]) -> Result<()> {
         self.cancelled.store(false, Ordering::SeqCst);
         let _ = self.cancel_tx.send(false);
         let checkpoint = self.bus.checkpoint().await?;
-        self.checkpoints.lock().await.push(checkpoint);
+        // Recorded with the checkpoint so a rewind can put the files back as
+        // well as the conversation. Best-effort: a workspace that is not a
+        // git repository simply has no snapshot, and `rewind` says so rather
+        // than pretending.
+        let tree = match crate::snapshot::capture(std::path::Path::new(&self.config.cwd)).await {
+            Ok(commit) => Some(commit),
+            Err(e) => {
+                debug!("no working-tree snapshot for this turn: {e:#}");
+                None
+            }
+        };
+        self.checkpoints.lock().await.push(Checkpoint {
+            id: checkpoint,
+            tree,
+        });
         self.bus
             .publish(Event::new(kinds::USER_MESSAGE, prompt_to_payload(blocks)))
             .await?;
@@ -543,6 +610,15 @@ impl CodingSession {
     /// The discarded trajectory is sealed as a rejected branch rather than
     /// deleted, so the agent can still be told "you tried that and it did not
     /// work" on the next attempt.
+    ///
+    /// **The working tree is not restored.** Rewinding is a graph operation
+    /// on the conversation; the files the rewound turns wrote are still on
+    /// disk exactly as the agent left them. Undoing those too would mean
+    /// snapshotting the tree at every checkpoint, which is a feature and not
+    /// a line of code. What this does instead is refuse to be quiet about it:
+    /// [`WORKING_TREE_UNCHANGED`] is published naming every file the
+    /// discarded turns modified, so the user is told what to revert rather
+    /// than left believing the undo covered it.
     pub async fn rewind(&self, turns: usize) -> Result<usize> {
         let turns = turns.max(1);
         let mut checkpoints = self.checkpoints.lock().await;
@@ -550,11 +626,98 @@ impl CodingSession {
             anyhow::bail!("nothing to rewind: this session has no completed turns");
         }
         let keep = checkpoints.len().saturating_sub(turns);
-        let target = checkpoints[keep];
-        self.bus.rollback(target).await?;
+        let target = checkpoints[keep].clone();
+        let touched = self.files_touched_since(target.id).await;
+        self.bus.rollback(target.id).await?;
         checkpoints.truncate(keep);
+        self.restore_working_tree(&target, touched).await;
         info!(turns, "rewound session");
         Ok(checkpoints.len())
+    }
+
+    /// Paths written by the events that a rollback to `target` will discard.
+    ///
+    /// Read off the tool results themselves rather than a separate ledger:
+    /// every editing tool reports `_diff.path`, which is what the editor
+    /// already uses to draw a diff card, so anything that writes a file is
+    /// necessarily here.
+    async fn files_touched_since(&self, target: eventage::EventId) -> Vec<String> {
+        let log = self.bus.log().await;
+        let from = log
+            .iter()
+            .position(|e| e.id == target)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut paths: Vec<String> = log[from..]
+            .iter()
+            .filter(|e| e.kind == kinds::TOOL_RESULT)
+            .filter_map(|e| {
+                e.payload
+                    .get("result")
+                    .and_then(|r| r.get("_diff"))
+                    .and_then(|d| d.get("path"))
+                    .and_then(|p| p.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Put the working tree back, or say why it could not be.
+    ///
+    /// Both outcomes are announced, because the failure mode this closes was
+    /// silence: a turn vanished from the transcript and the files it wrote
+    /// stayed, which reads as an undo that half worked.
+    ///
+    /// Ephemeral either way — a note to the person watching, not a fact the
+    /// model should carry into the next turn's context.
+    async fn restore_working_tree(&self, target: &Checkpoint, touched: Vec<String>) {
+        let Some(tree) = &target.tree else {
+            if touched.is_empty() {
+                return;
+            }
+            self.bus.broadcast(Event::new(
+                WORKING_TREE_UNCHANGED,
+                serde_json::json!({
+                    "paths": touched,
+                    "detail": "the conversation was rewound, but this workspace is not a \
+                               git repository, so there was no snapshot to put the files \
+                               back from — they are still as the agent left them",
+                }),
+            ));
+            return;
+        };
+
+        match crate::snapshot::restore(std::path::Path::new(&self.config.cwd), tree).await {
+            Ok(restored) if restored.paths.is_empty() => {}
+            Ok(restored) => {
+                info!(files = restored.paths.len(), "restored the working tree");
+                self.bus.broadcast(Event::new(
+                    WORKING_TREE_RESTORED,
+                    serde_json::json!({
+                        "paths": restored.paths,
+                        "undo": restored.undo,
+                        "detail": "the working tree was put back as it was before these \
+                                   turns; `git checkout <undo> -- .` recovers what they wrote",
+                    }),
+                ));
+            }
+            Err(e) => {
+                warn!("could not restore the working tree: {e:#}");
+                self.bus.broadcast(Event::new(
+                    WORKING_TREE_UNCHANGED,
+                    serde_json::json!({
+                        "paths": touched,
+                        "detail": format!(
+                            "the conversation was rewound, but the working tree could not \
+                             be restored ({e:#}) — these files are still as the agent left them"
+                        ),
+                    }),
+                ));
+            }
+        }
     }
 
     /// Roll back to a specific checkpoint.
@@ -566,17 +729,20 @@ impl CodingSession {
         let mut checkpoints = self.checkpoints.lock().await;
         let position = checkpoints
             .iter()
-            .position(|&id| id == checkpoint)
+            .position(|c| c.id == checkpoint)
             .ok_or_else(|| anyhow::anyhow!("that checkpoint is not part of this session"))?;
+        let target = checkpoints[position].clone();
+        let touched = self.files_touched_since(checkpoint).await;
         self.bus.rollback(checkpoint).await?;
         checkpoints.truncate(position);
+        self.restore_working_tree(&target, touched).await;
         info!(remaining = checkpoints.len(), "rewound to checkpoint");
         Ok(checkpoints.len())
     }
 
     /// The checkpoints this session can rewind to, oldest first.
     pub async fn checkpoints(&self) -> Vec<eventage::EventId> {
-        self.checkpoints.lock().await.clone()
+        self.checkpoints.lock().await.iter().map(|c| c.id).collect()
     }
 
     /// How many events failed to reach the log.
@@ -651,6 +817,38 @@ impl CodingSession {
     /// and "cancelled" was only the label on the outcome.
     pub async fn run_cycle(&self) -> Result<()> {
         let _turn = self.turn_gate.lock().await;
+        self.cycle_locked().await
+    }
+
+    /// Submit a prompt and run the turn it opens, as one indivisible step.
+    ///
+    /// The gate is held across both halves. Taken only by `run_cycle`, a
+    /// second `session/prompt` arriving mid-turn could publish its user
+    /// message into the running conversation and clear the in-flight turn's
+    /// cancellation flag before ever reaching the gate. The Studio backend
+    /// happens to be safe because it holds a mutex of its own around the
+    /// pair; the ACP server had no such thing, and an editor that pipelines
+    /// requests is not doing anything unusual.
+    ///
+    /// Refuses rather than queues when a turn is already running, so the
+    /// caller is told what happened instead of watching a request sit.
+    pub async fn prompt_turn(&self, blocks: &[ContentBlock]) -> Result<()> {
+        let Ok(_turn) = self.turn_gate.try_lock() else {
+            anyhow::bail!(
+                "this session is already working on something; cancel the current turn first"
+            );
+        };
+        self.submit_prompt(blocks).await?;
+        self.cycle_locked().await
+    }
+
+    /// Is a turn running right now?
+    pub fn is_busy(&self) -> bool {
+        self.turn_gate.try_lock().is_err()
+    }
+
+    /// The body of a turn, with the gate already held by the caller.
+    async fn cycle_locked(&self) -> Result<()> {
         let mut cancelled = self.cancel_rx.clone();
         // Mark the current value seen, so only a *new* cancellation fires.
         cancelled.borrow_and_update();
