@@ -383,6 +383,13 @@ describe("setup problems", () => {
     // a banner that stays rather than a toast that fades.
     await waitFor(() => expect(document.querySelector(".setup-banner")).toBeTruthy());
     expect(document.querySelector(".setup-banner")!.textContent).toContain(hint);
+
+    // And in exactly one place. The empty state used to print the same
+    // sentence, so the running app said it twice on one screen — which reads as
+    // two problems, only one of which has the button that fixes it.
+    const said = screen.queryAllByText((_, node) => node?.textContent === hint);
+    const innermost = said.filter((n) => !said.some((o) => o !== n && n.contains(o)));
+    expect(innermost).toHaveLength(1);
   });
 });
 

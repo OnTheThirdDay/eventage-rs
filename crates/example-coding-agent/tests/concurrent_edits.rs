@@ -17,7 +17,7 @@ fn editor(ws: &Arc<Workspace>) -> tools::EditFile {
     tools::EditFile {
         ws: Arc::clone(ws),
         client: None,
-        lsp: Arc::new(LspPool::new(ws.root())),
+        lsp: Arc::new(LspPool::disabled(ws.root())),
     }
 }
 
@@ -62,7 +62,7 @@ async fn a_write_cannot_land_in_the_middle_of_an_edit() {
         let write = tools::WriteFile {
             ws: Arc::clone(&ws),
             client: None,
-            lsp: Arc::new(LspPool::new(ws.root())),
+            lsp: Arc::new(LspPool::disabled(ws.root())),
         };
         let edit = editor(&ws);
         let (_, _) = tokio::join!(
@@ -146,7 +146,7 @@ fn writer(ws: &Arc<Workspace>) -> tools::WriteFile {
     tools::WriteFile {
         ws: Arc::clone(ws),
         client: None,
-        lsp: Arc::new(LspPool::new(ws.root())),
+        lsp: Arc::new(LspPool::disabled(ws.root())),
     }
 }
 

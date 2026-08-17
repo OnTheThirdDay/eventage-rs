@@ -179,3 +179,13 @@ crates/example-eventage-claw/whatsapp-bridge/auth
 # crates/eventage-studio/ui/build.sh, not source.
 crates/eventage-studio/ui/node_modules/
 crates/eventage-studio/ui/dist/
+
+# The desktop shell is its own workspace (see the root manifest), so it has its
+# own lock file. That lock file is *not* ignored: the release workflow builds
+# installers from this crate, and an artifact people download should be built
+# from resolved versions rather than whatever the registry offered that morning.
+crates/eventage-studio-desktop/target/
+# Written by `tauri-build` on every build, and named after the platform that
+# ran it — `linux-schema.json` here, `macos-schema.json` on a Mac — so tracking
+# it means three platforms taking turns overwriting each other's file.
+crates/eventage-studio-desktop/gen/schemas/

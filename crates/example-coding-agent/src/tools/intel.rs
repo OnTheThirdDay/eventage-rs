@@ -818,7 +818,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = Arc::new(Workspace::open(dir.path()).unwrap());
         let tool = LspRename {
-            lsp: Arc::new(LspPool::new(dir.path())),
+            lsp: Arc::new(LspPool::disabled(dir.path())),
             ws,
             client: None,
         };

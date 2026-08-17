@@ -1347,7 +1347,7 @@ mod tests {
         let tool = MultiEdit {
             ws: ws.clone(),
             client: None,
-            lsp: Arc::new(LspPool::new(dir.path())),
+            lsp: Arc::new(LspPool::disabled(dir.path())),
         };
         // Second edit cannot match — the whole call must fail and leave the
         // file untouched.

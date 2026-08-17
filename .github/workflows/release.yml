@@ -139,9 +139,133 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Studio in a native window, as an installable package rather than a bare
+  # executable. Separate from `build` because it is a different kind of
+  # artifact: it needs the system webview, a bundler, and per-platform
+  # packaging, and none of that should be able to hold up the plain binaries.
+  # `fail-fast: false` is what keeps one platform's packaging trouble from
+  # cancelling the other two.
+  desktop:
+    name: desktop ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          # One Universal dmg rather than one per architecture: it is what Mac
+          # applications ship as, and the alternative is two downloads plus a
+          # user deciding which of them they are.
+          - label: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+            bundles: dmg
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # A Universal binary is two builds stitched together, so both halves
+          # have to be installed.
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.target }}
+          # The shell is its own workspace — see the root manifest for why it
+          # is excluded — so the cache has to be pointed at it.
+          workspaces: crates/eventage-studio-desktop
+
+      # Linux is the only platform where the webview is not part of the OS.
+      # WebKitGTK is the webview itself; patchelf and the rest are what the
+      # AppImage bundler shells out to.
+      - name: System webview and packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libdbus-1-dev libssl-dev libxdo-dev build-essential pkg-config \
+            patchelf file desktop-file-utils
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/eventage-studio/ui/package-lock.json
+      - name: Build the Studio front-end
+        working-directory: crates/eventage-studio/ui
+        run: npm ci && npm run build
+
+      # From npm rather than `cargo install`: it is the same official CLI as a
+      # prebuilt binary, and compiling it from source on every run costs more
+      # than the build it is there to drive.
+      - name: Install the Tauri CLI
+        run: npm install -g @tauri-apps/cli@^2
+
+      - name: Bundle
+        working-directory: crates/eventage-studio-desktop
+        run: tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      # Bundle filenames carry the product name and version ("Eventage
+      # Studio_0.2.0_amd64.deb"), which is right for a package manager and
+      # wrong for a downloads folder holding three platforms at once. Renamed
+      # by platform, keeping each format's extension because that is what
+      # tells the OS how to open it.
+      - name: Stage bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          found=0
+          root="crates/eventage-studio-desktop/target/${{ matrix.target }}/release/bundle"
+          while IFS= read -r -d '' src; do
+            case "$src" in
+              *.deb|*.AppImage|*.dmg|*.msi|*-setup.exe) ;;
+              *) continue ;;
+            esac
+            ext="${src##*.}"
+            [[ "$src" == *-setup.exe ]] && ext="setup.exe"
+            cp "$src" "dist/eventage-studio-desktop-${{ matrix.label }}.$ext"
+            found=$((found + 1))
+          done < <(find "$root" -type f -print0)
+          if [[ "$found" -eq 0 ]]; then
+            echo "the bundler produced nothing under $root" >&2
+            find "crates/eventage-studio-desktop/target" -maxdepth 4 -type d >&2 || true
+            exit 1
+          fi
+          ls -l dist
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum * > "SHA256SUMS-desktop-${{ matrix.label }}.txt"
+          else
+            shasum -a 256 * > "SHA256SUMS-desktop-${{ matrix.label }}.txt"
+          fi
+          cat "SHA256SUMS-desktop-${{ matrix.label }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
   publish:
     name: publish
-    needs: build
+    needs: [build, desktop]
     runs-on: ubuntu-latest
     # Only a tag produces a release; a manual run stops at the artefacts
     # unless it was given a tag on purpose.
@@ -177,6 +301,24 @@ jobs:
             ```
 
             Verify with `SHA256SUMS-<platform>.txt`.
+
+            ### Studio as a desktop app
+
+            `eventage-studio-desktop-*` is the same Studio in a native window
+            instead of a browser tab — `.dmg` for macOS (Universal), `.msi` or
+            `.setup.exe` for Windows, `.deb` or `.AppImage` for Linux. It renders
+            through the system webview, so on Linux it needs WebKitGTK
+            (`libwebkit2gtk-4.1-0`); the plain `eventage-studio` binary needs
+            nothing and opens your browser instead.
+
+            Started from an icon it opens your home directory, since there is no
+            working directory to inherit — use the workspace picker, or pass
+            `--cwd <dir>` from a shortcut or `.desktop` entry.
+
+            The packages are **not code-signed**. macOS will refuse the first
+            launch: right-click the app and choose Open, or
+            `xattr -d com.apple.quarantine "/Applications/Eventage Studio.app"`.
+            Windows SmartScreen will warn; choose More info → Run anyway.
 
             Shell containment uses Landlock and seccomp, which are Linux only.
             On macOS and Windows commands run with credentials scrubbed, their

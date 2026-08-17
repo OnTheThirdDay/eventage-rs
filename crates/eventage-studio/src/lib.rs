@@ -8,6 +8,7 @@ pub mod assets;
 pub mod backend;
 pub mod feed;
 pub mod index;
+pub mod launch;
 pub mod model_settings;
 pub mod protocol;
 pub mod server;

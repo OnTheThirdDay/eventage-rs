@@ -1051,6 +1051,16 @@ button.loc:hover {
 .composer-hint {
   font-size: 11px;
   color: var(--text-faint);
+  /* The bar is a flex row and this is the only part of it that is merely
+     advice, so it is the part that gives way. Without this it refuses to
+     shrink: with the trace pane open in a ~1000px window the keyboard hint
+     wrapped and spilled out past the composer's edge, where the trace pane
+     clipped it. Send buttons and mode selectors keep their size; hints
+     truncate. */
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .attachments {
   display: flex;

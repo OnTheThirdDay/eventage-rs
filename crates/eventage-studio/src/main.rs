@@ -102,34 +102,10 @@ fn prologue() -> Result<(Cli, String, ModelConfig)> {
     .display()
     .to_string();
 
-    // A workspace configured for an Anthropic-compatible gateway keeps its
-    // endpoint, credential and routing headers in `.claude/settings.json`.
-    // Read before the model is resolved. The block is only applied to this
-    // process if the operator has said the repository is trusted — see the
-    // `settings` module for what an untrusted one can otherwise do with it.
-    let settings = eventage_code::settings::ClaudeSettings::load(&cwd);
-    let env = settings.apply_env();
-    if !env.applied.is_empty() {
-        // Names only. Several of these are credentials.
-        tracing::info!(vars = ?env.applied, "applied .claude/settings.json");
-    }
-    let model_choice = cli.model.clone().or(settings.model);
-
-    // Resolved before the credentials are taken out of the environment;
-    // everything downstream reads them from the config, not from `getenv`.
-    let model = ModelConfig::from_env(model_choice);
-
-    // A process's environment is a file any process of the same user can
-    // read, so a confined command denied the key in its own environment
-    // could open `/proc/<our pid>/environ` and have it anyway. Held in
-    // memory from here on.
-    let held = eventage_code::secrets::capture_and_scrub();
-    if !held.is_empty() {
-        tracing::debug!(
-            count = held.len(),
-            "moved credentials out of the environment"
-        );
-    }
+    // Settings, model and credential scrubbing, shared with the desktop shell
+    // so the same workspace resolves to the same model in a window as in a
+    // terminal.
+    let model = eventage_studio::launch::resolve_model(&cwd, cli.model.clone());
 
     Ok((cli, cwd, model))
 }
@@ -228,18 +204,61 @@ fn open_window(url: &str) {
     #[cfg(target_os = "windows")]
     let candidates: [(&str, &[&str]); 2] = [("chrome", &[]), ("cmd", &["/C", "start", ""])];
     #[cfg(all(unix, not(target_os = "macos")))]
-    let candidates: [(&str, &[&str]); 5] = [
-        ("google-chrome", &[]),
-        ("chromium", &[]),
-        ("microsoft-edge", &[]),
-        ("brave-browser", &[]),
-        ("xdg-open", &[]),
-    ];
+    let candidates: Vec<(&str, &[&str])> = {
+        let mut found: Vec<(&str, &[&str])> = vec![
+            ("google-chrome", &[]),
+            ("chromium", &[]),
+            ("chromium-browser", &[]),
+            ("microsoft-edge", &[]),
+            ("brave-browser", &[]),
+        ];
+
+        // Under WSL there is usually no Linux browser at all, and the useful
+        // one is on the Windows side. It understands `--app` like any other
+        // Chromium, and `127.0.0.1` reaches back into WSL because WSL2
+        // forwards localhost — so this gives a real chromeless window rather
+        // than the "could not open anything" fallback.
+        //
+        // Tried before `xdg-open`, which on a browserless WSL install
+        // succeeds at doing nothing and would otherwise win.
+        if std::fs::read_to_string("/proc/version")
+            .map(|v| v.to_ascii_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+        {
+            found.extend([
+                (
+                    "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
+                    &[] as &[&str],
+                ),
+                (
+                    "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+                    &[] as &[&str],
+                ),
+                (
+                    "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+                    &[] as &[&str],
+                ),
+                (
+                    "/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe",
+                    &[] as &[&str],
+                ),
+                // The idiomatic WSL opener, if wslu is installed. No app mode.
+                ("wslview", &[]),
+            ]);
+        }
+        found.push(("xdg-open", &[]));
+        found
+    };
 
     for (program, prefix) in candidates {
-        // Only the Chromium family understands --app; anything else gets the
-        // bare URL.
-        let app_mode = !program.contains("open") && program != "cmd";
+        // Only the Chromium family understands `--app`; anything else gets
+        // the bare URL and opens a tab.
+        let app_mode = !program.contains("open") && program != "cmd" && program != "wslview";
+        // A path that is not there is not worth a spawn attempt, and skipping
+        // it keeps the Windows candidates from masking `xdg-open`.
+        if program.starts_with('/') && !std::path::Path::new(program).is_file() {
+            continue;
+        }
         let mut command = std::process::Command::new(program);
         command.args(prefix);
         if app_mode {

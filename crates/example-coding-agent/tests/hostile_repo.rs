@@ -140,7 +140,7 @@ async fn writing_through_a_link_cannot_land_outside() {
     let write = (tools::WriteFile {
         ws: ws.clone(),
         client: None,
-        lsp: Arc::new(eventage_code::lsp::LspPool::new(ws.root())),
+        lsp: Arc::new(eventage_code::lsp::LspPool::disabled(ws.root())),
     })
     .execute(json!({ "path": "vendor/planted.rs", "content": "pwned" }))
     .await;
@@ -154,7 +154,7 @@ async fn writing_through_a_link_cannot_land_outside() {
     let overwrite = (tools::EditFile {
         ws: ws.clone(),
         client: None,
-        lsp: Arc::new(eventage_code::lsp::LspPool::new(ws.root())),
+        lsp: Arc::new(eventage_code::lsp::LspPool::disabled(ws.root())),
     })
     .execute(json!({
         "path": "config.rs",
@@ -180,7 +180,7 @@ async fn a_patch_cannot_write_outside_the_repository() {
     let result = (tools::patch::ApplyPatch {
         ws: ws.clone(),
         client: None,
-        lsp: Arc::new(eventage_code::lsp::LspPool::new(ws.root())),
+        lsp: Arc::new(eventage_code::lsp::LspPool::disabled(ws.root())),
     })
     .execute(json!({ "patch": patch }))
     .await;

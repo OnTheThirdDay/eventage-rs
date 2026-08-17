@@ -7,6 +7,11 @@ members = [
     "crates/example-clang-agent",
     "crates/example-cowork",
 ]
+# `crates/eventage-studio-desktop` is deliberately absent. Tauri renders
+# through the system webview, which on Linux means WebKitGTK must be
+# installed — including it would make `cargo build --workspace` and CI fail on
+# any machine without it, to gain a window frame. See that crate's `main.rs`.
+exclude = ["crates/eventage-studio-desktop"]
 resolver = "2"
 
 [workspace.dependencies]

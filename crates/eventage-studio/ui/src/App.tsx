@@ -419,12 +419,13 @@ export default function App() {
   const emptyState = (
     <div className="empty">
       <h2>{active ? "What should we work on?" : "No session open"}</h2>
+      {/* Deliberately not the credentials hint: the setup banner above already
+          states it, and it is the copy with the button that fixes it. Saying the
+          same sentence twice on one screen reads as two problems. */}
       <p>
-        {app.credentials_hint
-          ? app.credentials_hint
-          : app.backend === "local"
-            ? `${app.model} · ${workspaceName}`
-            : `Connected to ${app.backend_detail}`}
+        {app.backend === "local"
+          ? `${app.model} · ${workspaceName}`
+          : `Connected to ${app.backend_detail}`}
       </p>
       {active && !app.credentials_hint && (
         <div className="suggestions">

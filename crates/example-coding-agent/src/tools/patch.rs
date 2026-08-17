@@ -779,7 +779,7 @@ mod tool_tests {
     fn agent() -> (tempfile::TempDir, ApplyPatch) {
         let dir = tempfile::tempdir().unwrap();
         let ws = Arc::new(Workspace::open(dir.path().to_str().unwrap()).unwrap());
-        let lsp = Arc::new(LspPool::new(dir.path()));
+        let lsp = Arc::new(LspPool::disabled(dir.path()));
         (
             dir,
             ApplyPatch {

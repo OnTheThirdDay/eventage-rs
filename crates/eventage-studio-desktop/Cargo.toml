@@ -1,0 +1,27 @@
+# Not a member of the parent workspace — see the root manifest and src/main.rs.
+[package]
+name    = "eventage-studio-desktop"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Eventage Studio in a native window"
+
+# Excluded from the parent workspace, so it needs its own root.
+[workspace]
+
+[[bin]]
+name = "eventage-studio-desktop"
+path = "src/main.rs"
+
+[dependencies]
+eventage-studio    = { path = "../eventage-studio" }
+eventage_code      = { package = "example-coding-agent", path = "../example-coding-agent" }
+tauri              = { version = "2", features = [] }
+tokio              = { version = "1", features = ["full"] }
+anyhow             = "1"
+dirs               = "5"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

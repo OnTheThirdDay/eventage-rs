@@ -352,6 +352,8 @@ async fn read_loop(mut reader: BufReader<ChildStdout>, pending: Pending, diagnos
 pub struct LspPool {
     root: PathBuf,
     clients: Mutex<HashMap<String, Option<Arc<LspClient>>>>,
+    /// Whether this pool may start servers at all. See [`LspPool::disabled`].
+    servers: bool,
 }
 
 impl LspPool {
@@ -359,6 +361,34 @@ impl LspPool {
         Self {
             root: root.into(),
             clients: Mutex::new(HashMap::new()),
+            servers: true,
+        }
+    }
+
+    /// A pool that never starts anything, for callers that only need a pool to
+    /// exist.
+    ///
+    /// The editing tools each hold a pool and notify it after a write. A test
+    /// that builds a tool per operation therefore builds a pool per operation,
+    /// and every one of them spawned a real `rust-analyzer` and waited on its
+    /// `initialize` — up to this module's 20-second request timeout. On a developer
+    /// machine each answers in milliseconds and this is invisible. On a
+    /// two-core CI runner it did not answer at all: a test doing three writes
+    /// took just over sixty seconds — three timeouts, one per pool — and one
+    /// doing twenty iterations of three concurrent edits was still running
+    /// when the job hit its step limit and was cancelled.
+    ///
+    /// `rename_live.rs` is `#[ignore]`d for exactly this reason. That covers a
+    /// test whose *subject* is the language server; it could not cover a
+    /// server started as a side effect of writing a file.
+    ///
+    /// So a test whose subject is not the language server says so, and gets a
+    /// pool that cannot start one. Tests that *are* about the LSP keep
+    /// [`LspPool::new`].
+    pub fn disabled(root: impl Into<PathBuf>) -> Self {
+        Self {
+            servers: false,
+            ..Self::new(root)
         }
     }
 
@@ -367,6 +397,9 @@ impl LspPool {
     /// Returns `None` when the language is unsupported or its server is not
     /// installed — callers should degrade to text search.
     pub async fn for_path(&self, path: &Path) -> Option<Arc<LspClient>> {
+        if !self.servers {
+            return None;
+        }
         let spec = server_for(path)?;
         let mut clients = self.clients.lock().await;
         if let Some(entry) = clients.get(spec.language_id) {
@@ -515,5 +548,21 @@ mod tests {
         let pool = LspPool::new("/tmp");
         // .md has no configured server at all.
         assert!(pool.for_path(Path::new("/tmp/x.md")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_pool_starts_nothing_even_where_a_server_exists() {
+        // `.rs` is the case that matters: a configured server, which on a
+        // machine that has rust-analyzer installed would really be spawned and
+        // really be waited on. Asserting against `.md` would pass whether the
+        // switch worked or not.
+        assert!(server_for(Path::new("/tmp/x.rs")).is_some(), "premise");
+
+        let pool = LspPool::disabled("/tmp");
+        assert!(pool.for_path(Path::new("/tmp/x.rs")).await.is_none());
+        assert!(
+            pool.clients.lock().await.is_empty(),
+            "a disabled pool must not even record an attempt"
+        );
     }
 }
