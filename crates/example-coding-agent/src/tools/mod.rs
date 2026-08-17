@@ -683,40 +683,95 @@ pub struct BackgroundJob {
     pub log: PathBuf,
     pub command: String,
     pub started: std::time::Instant,
+    /// Kept so the process can be *waited on*, not merely signalled.
+    ///
+    /// The tool used to drop this and keep only the number. See
+    /// [`BackgroundJobs::running`] for what that cost.
+    child: Option<tokio::process::Child>,
 }
 
 impl BackgroundJobs {
-    /// Is the process still running?
-    #[cfg(unix)]
-    fn alive(pid: i32) -> bool {
-        // Signal 0 checks for existence without delivering anything.
-        unsafe { libc::kill(pid, 0) == 0 }
-    }
-
-    #[cfg(not(unix))]
-    fn alive(_pid: i32) -> bool {
-        true
+    /// Is the process still running? Reaps it if it is not.
+    ///
+    /// `kill(pid, 0)` cannot answer this. A process that has exited but has
+    /// not been waited on is a zombie, and a zombie still has a pid that
+    /// accepts signal 0 — so with only a number to work from, a job reported
+    /// itself as running until something else happened to reap it. That
+    /// something was tokio's orphan queue, which collects a dropped `Child` on
+    /// the next `SIGCHLD`: within 100ms on a developer machine, and *not*
+    /// within the two seconds `stop` waits, on CI. The test that caught it
+    /// stopped a `sleep 60` and was told it was still running.
+    ///
+    /// `try_wait` is the same question asked of `waitpid`, which both answers
+    /// it and clears the zombie. It needs the handle, which is why the job
+    /// keeps one.
+    fn running(job: &mut BackgroundJob) -> bool {
+        let Some(child) = job.child.as_mut() else {
+            return false; // already reaped, and remembered as such
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                job.child = None;
+                false
+            }
+            // Nothing more can be learned from this handle. Reporting it
+            // finished is the safer error: the alternative is a job that
+            // claims to be running for the rest of the session.
+            Err(_) => {
+                job.child = None;
+                false
+            }
+        }
     }
 
     /// Stop a job and everything it started.
     ///
-    /// Staged: `SIGTERM` to the group first so a dev server can close its
-    /// sockets and a test runner can print what it was doing, then `SIGKILL`
-    /// for whatever ignored it.
+    /// Staged: `SIGTERM` first so a dev server can close its sockets and a
+    /// test runner can print what it was doing, then `SIGKILL` for whatever
+    /// ignored it. Signalled to the process *group*, so a job's children go
+    /// with it, and to the process as well in case it never became a group
+    /// leader — `setsid` is called in the child, and a `stop` that quietly did
+    /// nothing because it failed would be worse than a redundant signal.
+    ///
+    /// Returns only once the process has actually been collected, or the wait
+    /// timed out. `stop` returning while `running` still says yes is the bug
+    /// this replaced.
     #[cfg(unix)]
-    pub async fn stop(pid: i32) {
-        unsafe { libc::killpg(pid, libc::SIGTERM) };
+    async fn stop(job: &mut BackgroundJob) {
+        unsafe {
+            libc::killpg(job.pid, libc::SIGTERM);
+            libc::kill(job.pid, libc::SIGTERM);
+        }
         for _ in 0..20 {
-            if !Self::alive(pid) {
+            if !Self::running(job) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
+
+        unsafe {
+            libc::killpg(job.pid, libc::SIGKILL);
+            libc::kill(job.pid, libc::SIGKILL);
+        }
+        if let Some(child) = job.child.as_mut() {
+            // Bounded: an unkillable process is a worse thing to wait forever
+            // for than to report honestly as still running.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+        }
+        let _ = Self::running(job);
     }
 
+    /// As above, where there are no signals: the handle can still kill it,
+    /// which is more than the previous version of this did — it was empty, so
+    /// asking to stop a job on Windows silently did nothing at all.
     #[cfg(not(unix))]
-    pub async fn stop(_pid: i32) {}
+    async fn stop(job: &mut BackgroundJob) {
+        if let Some(child) = job.child.as_mut() {
+            let _ = child.kill().await;
+        }
+        let _ = Self::running(job);
+    }
 
     pub async fn record(&self, job: BackgroundJob) {
         self.jobs.lock().await.push(job);
@@ -727,12 +782,12 @@ impl BackgroundJobs {
         self.jobs
             .lock()
             .await
-            .iter()
+            .iter_mut()
             .map(|job| {
                 json!({
                     "pid": job.pid,
                     "command": job.command,
-                    "running": Self::alive(job.pid),
+                    "running": Self::running(job),
                     "seconds": job.started.elapsed().as_secs(),
                     "log_file": job.log.display().to_string(),
                 })
@@ -741,11 +796,16 @@ impl BackgroundJobs {
     }
 
     pub async fn stop_one(&self, pid: i32) -> bool {
-        let known = self.jobs.lock().await.iter().any(|j| j.pid == pid);
-        if known {
-            Self::stop(pid).await;
+        // The lock is held across the stop so a `jobs` listing cannot observe
+        // the job half-stopped, and so two stops cannot race on one handle.
+        let mut jobs = self.jobs.lock().await;
+        match jobs.iter_mut().find(|job| job.pid == pid) {
+            Some(job) => {
+                Self::stop(job).await;
+                true
+            }
+            None => false,
         }
-        known
     }
 }
 
@@ -760,12 +820,23 @@ impl Drop for BackgroundJobs {
     /// `get_mut` needs no lock at all: `Drop` has `&mut self`, so by
     /// definition nobody else holds a reference.
     fn drop(&mut self) {
-        #[cfg(unix)]
-        for job in self.jobs.get_mut().iter() {
-            if Self::alive(job.pid) {
-                // The group, not the process: a dev server's children would
-                // otherwise survive the shell that started them.
-                unsafe { libc::killpg(job.pid, libc::SIGKILL) };
+        for job in self.jobs.get_mut().iter_mut() {
+            // `try_wait`, not `kill(pid, 0)`: it tells the truth about a
+            // process that has already exited, and skipping those is what
+            // keeps this from signalling a pid the OS has since handed to
+            // somebody else.
+            if !Self::running(job) {
+                continue;
+            }
+            // The group, not just the process: a dev server's children would
+            // otherwise survive the shell that started them.
+            #[cfg(unix)]
+            unsafe {
+                libc::killpg(job.pid, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            if let Some(child) = job.child.as_mut() {
+                let _ = child.start_kill();
             }
         }
     }
@@ -1271,6 +1342,10 @@ impl Tool for Bash {
                     log: log.clone(),
                     command: command.clone(),
                     started: std::time::Instant::now(),
+                    // Handed over rather than dropped: it is the only thing
+                    // that can wait on the process, and without it "is this
+                    // job running?" has no honest answer once the process dies.
+                    child: Some(child),
                 })
                 .await;
             return Ok(json!({

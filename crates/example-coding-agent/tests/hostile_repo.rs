@@ -324,12 +324,51 @@ async fn a_background_job_can_be_listed_and_stopped() {
     assert_eq!(listed["jobs"][0]["running"], true, "{listed}");
     assert_eq!(listed["jobs"][0]["command"], "sleep 60");
 
+    // `stop` waits for the process, so this is a fact by the time it returns
+    // and not a race the caller has to sleep through. It used to be one: the
+    // liveness check was `kill(pid, 0)`, which a zombie answers, so whether
+    // this line passed depended on whether tokio's orphan reaper had got there
+    // first — it does within 100ms locally, and had not within two seconds on
+    // CI, which is where it failed.
     tool.execute(json!({ "stop": pid })).await.unwrap();
     let after = tool.execute(json!({})).await.unwrap();
     assert_eq!(after["jobs"][0]["running"], false, "{after}");
 
     // And an unknown pid says so rather than silently doing nothing.
     assert!(tool.execute(json!({ "stop": 999_999 })).await.is_err());
+}
+
+#[tokio::test]
+async fn a_job_that_finishes_on_its_own_stops_saying_it_is_running() {
+    // The same lie, without a stop: nobody waits on a background job, so a
+    // command that simply ends leaves a zombie, and a zombie satisfies
+    // `kill(pid, 0)`. An agent asking `jobs` would be told its build was still
+    // going long after it had finished.
+    let repo = tempfile::tempdir().unwrap();
+    let ws = Arc::new(Workspace::open(repo.path()).unwrap());
+    let jobs = Arc::new(tools::BackgroundJobs::default());
+
+    (tools::Bash {
+        ws,
+        jobs: Arc::clone(&jobs),
+        containment: tools::ShellContainment::Confined,
+        container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
+    })
+    .execute(json!({ "command": "true", "background": true }))
+    .await
+    .unwrap();
+
+    let tool = tools::Jobs {
+        jobs: Arc::clone(&jobs),
+    };
+    for attempt in 0..50 {
+        let listed = tool.execute(json!({})).await.unwrap();
+        if listed["jobs"][0]["running"] == false {
+            return;
+        }
+        assert!(attempt < 49, "still reported as running: {listed}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]
