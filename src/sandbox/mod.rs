@@ -3,12 +3,17 @@
 //! Provides the [`SandboxExecutor`] trait and implementations with varying
 //! security and portability:
 //!
+//! Two of these are not links, and that is deliberate: `LandlockExecutor`
+//! exists only on Linux and `WasmExecutor` only with the `sandbox-wasm`
+//! feature, so linking them made this module's own documentation fail to build
+//! anywhere else — which is how a macOS CI job came to fail on a table.
+//!
 //! | Executor | Isolation | Platform |
 //! |---|---|---|
 //! | [`UnsandboxedExecutor`] | None | All |
-//! | [`LandlockExecutor`] | Filesystem (Landlock) | Linux 5.13+ |
+//! | `landlock::LandlockExecutor` | Filesystem (Landlock) | Linux 5.13+ |
 //! | [`DockerExecutor`] | Full container | Docker installed |
-//! | [`WasmExecutor`] | WASM / WASI | All (feature `sandbox-wasm`) |
+//! | `wasm::WasmExecutor` | WASM / WASI | All (feature `sandbox-wasm`) |
 
 pub mod docker;
 pub mod unsandboxed;

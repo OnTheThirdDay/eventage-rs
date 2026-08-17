@@ -77,6 +77,18 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # And again with the features off, because a doc link to a gated item
+      # only resolves in the configuration that includes it. Six links into
+      # feature-gated modules were broken in every configuration except the
+      # `--all-features` one above, and nothing here ran that configuration —
+      # a reader building the crate's docs the ordinary way would have hit
+      # them. The equivalent hazard for *platform*-gated items is what the
+      # macOS leg of this matrix catches.
+      - name: Docs with no features
+        run: cargo doc -p eventage --no-default-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   ui:
     name: studio ui
     runs-on: ubuntu-latest

@@ -14,15 +14,21 @@
 //!
 //! # Feature Flags
 //!
+//! The modules named here appear in the sidebar when their feature is on.
+//! Deliberately not intra-doc links: a link to `observability` is only
+//! resolvable when that feature is enabled, so linking them made `cargo doc`
+//! fail in every configuration except the one CI happened to run
+//! (`--all-features`).
+//!
 //! | Feature | Description |
 //! |---|---|
-//! | `observability` | [`observability`] module — event exporters and bus observer |
-//! | `scheduler` | [`scheduler`] module — heartbeat/tick scheduler |
-//! | `sqlite` | [`sqlite`] module — SQLite event store and exporter |
+//! | `observability` | `observability` module — event exporters and bus observer |
+//! | `scheduler` | `scheduler` module — heartbeat/tick scheduler |
+//! | `sqlite` | `sqlite` module — SQLite event store and exporter |
 //! | `sqlite-bundled` | Implies `sqlite`, bundles SQLite |
-//! | `replay` | [`replay`] module — live replay HTTP server |
-//! | `mcp` | [`mcp`] module — Model Context Protocol client |
-//! | `sandbox` | [`sandbox`] module — sandboxed execution (Docker, Landlock, Unsandboxed) |
+//! | `replay` | `replay` module — live replay HTTP server |
+//! | `mcp` | `mcp` module — Model Context Protocol client |
+//! | `sandbox` | `sandbox` module — sandboxed execution (Docker, Landlock, Unsandboxed) |
 //! | `sandbox-wasm` | Implies `sandbox`, adds WASM executor |
 //! | `opentelemetry` | OpenTelemetry exporter (requires `observability`) |
 //! | `full` | Enables all of the above |
