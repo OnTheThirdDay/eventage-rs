@@ -273,9 +273,22 @@ async fn the_result_states_how_the_command_was_contained() {
 }
 
 #[tokio::test]
-async fn a_runaway_command_is_stopped_by_the_kernel_not_by_the_machine_dying() {
-    // A wall-clock timeout catches a command that hangs. It does nothing
-    // about one that allocates until the machine swaps.
+async fn the_resource_limits_a_command_gets_are_the_ones_it_is_told_about() {
+    // A wall-clock timeout catches a command that hangs. It does nothing about
+    // one that allocates until the machine swaps, which is what the limits are
+    // for.
+    //
+    // This used to assert an address-space limit on every platform and failed
+    // on macOS, where `ulimit -v` says `unlimited`: Darwin defines `RLIMIT_AS`
+    // as `RLIMIT_RSS` and declines to enforce it, without an error from
+    // `setrlimit`. The failure was the test's, but it was pointing at a real
+    // defect — the tool result promised "memory/cpu/file-size limits" there
+    // too, so a model was told it had a memory cap it did not have.
+    //
+    // So the subject is now the agreement rather than the promise: for each
+    // limit, what the description claims must match what the shell reports. A
+    // platform that cannot enforce one has to stop claiming it, and a platform
+    // that claims one has to really have it.
     let repo = tempfile::tempdir().unwrap();
     let ws = Arc::new(Workspace::open(repo.path()).unwrap());
 
@@ -285,17 +298,42 @@ async fn a_runaway_command_is_stopped_by_the_kernel_not_by_the_machine_dying() {
         containment: tools::ShellContainment::Confined,
         container_image: tools::DEFAULT_CONTAINER_IMAGE.into(),
     })
-    // Far past the address-space limit, and fast.
-    .execute(json!({ "command": "ulimit -v" }))
+    .execute(json!({ "command": "ulimit -v; ulimit -f; ulimit -t" }))
     .await
     .unwrap();
 
-    let limit: u64 = out["stdout"].as_str().unwrap().trim().parse().unwrap_or(0);
-    assert!(limit > 0, "no address-space limit was applied: {out}");
-    assert!(
-        limit < 16 * 1024 * 1024,
-        "the limit is not a limit: {limit} KB"
-    );
+    let claim = out["containment"].as_str().unwrap();
+    let reported: Vec<&str> = out["stdout"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .collect();
+    assert_eq!(reported.len(), 3, "expected three ulimit lines: {out}");
+
+    for (limit, claimed, value) in [
+        ("memory", claim.contains("memory"), reported[0]),
+        ("file-size", claim.contains("file-size"), reported[1]),
+        ("cpu", claim.contains("cpu"), reported[2]),
+    ] {
+        let enforced = value != "unlimited";
+        assert_eq!(
+            claimed,
+            enforced,
+            "the containment description {} a {limit} limit, but the shell reports \
+             {value:?}. Whichever is wrong, they cannot both stand: {claim}",
+            if claimed { "promises" } else { "omits" }
+        );
+    }
+
+    // Where a memory cap is promised it is a guarantee, not an accident of the
+    // platform, so it is worth checking it is a bound and not a token value.
+    #[cfg(target_os = "linux")]
+    {
+        let kb: u64 = reported[0].parse().unwrap_or(0);
+        assert!(kb > 0, "no address-space limit was applied: {out}");
+        assert!(kb < 16 * 1024 * 1024, "the limit is not a limit: {kb} KB");
+    }
 }
 
 #[tokio::test]

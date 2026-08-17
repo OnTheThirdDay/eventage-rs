@@ -1034,18 +1034,20 @@ impl ShellContainment {
                  capabilities dropped"
                     .into()
             }
-            _ if !confined => "credentials scrubbed, own process group, memory/cpu/file-size \
-                 limits — the kernel offers no Landlock, so the filesystem is NOT \
-                 confined and there is no network isolation"
-                .into(),
-            ShellContainment::Confined => "credentials scrubbed, own process group, \
-                 memory/cpu/file-size limits, writes confined to the workspace. Reads are \
-                 NOT confined and the network is open."
-                .into(),
-            ShellContainment::Strict => "credentials scrubbed, own process group, \
-                 memory/cpu/file-size limits, writes confined to the workspace, reads \
-                 confined to the workspace and the system toolchain, network refused."
-                .into(),
+            _ if !confined => format!(
+                "credentials scrubbed, {ENFORCED_LIMITS} — the kernel \
+                 offers no Landlock, so the filesystem is NOT confined and there is no \
+                 network isolation"
+            ),
+            ShellContainment::Confined => format!(
+                "credentials scrubbed, {ENFORCED_LIMITS}, writes \
+                 confined to the workspace. Reads are NOT confined and the network is open."
+            ),
+            ShellContainment::Strict => format!(
+                "credentials scrubbed, {ENFORCED_LIMITS}, writes \
+                 confined to the workspace, reads confined to the workspace and the \
+                 system toolchain, network refused."
+            ),
         }
     }
 }
@@ -1229,6 +1231,10 @@ impl Bash {
 /// and no accounting across the process tree.
 #[cfg(unix)]
 pub fn apply_resource_limits() {
+    // Whatever this function actually manages to enforce is described by
+    // `ENFORCED_LIMITS`, which is what a tool result promises. Keep them
+    // together: the two drifting apart is how a model came to be told it had a
+    // memory cap on macOS that the kernel had quietly declined to apply.
     /// Address space. A large Rust build links with a lot of memory.
     const MAX_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
     /// A single file. Enough for any artifact, not enough to fill a disk.
@@ -1265,6 +1271,29 @@ pub fn apply_resource_limits() {
 
 #[cfg(not(unix))]
 pub fn apply_resource_limits() {}
+
+/// What the host OS really gives a command, as a tool result should describe it.
+///
+/// Not one sentence for every platform, because it was not true on every
+/// platform. `RLIMIT_AS` is a Linux guarantee; Darwin defines it as
+/// `RLIMIT_RSS` and does not enforce it — `setrlimit` reports no error and
+/// `ulimit -v` in the command afterwards says `unlimited`. Promising a memory
+/// cap there told the model it had a seatbelt that was not fitted, which is
+/// exactly the misdescription [`ShellContainment::describe`] exists to avoid.
+/// The process group belongs here for the same reason: `setsid` is `#[cfg(unix)]`,
+/// so on Windows that was a second thing being promised and not done.
+///
+/// `the_resource_limits_a_command_gets_are_the_ones_it_is_told_about` checks
+/// the limits against what the shell reports, so a wrong claim fails a test
+/// rather than misleading a model.
+#[cfg(target_os = "linux")]
+const ENFORCED_LIMITS: &str = "own process group, memory/cpu/file-size limits";
+#[cfg(all(unix, not(target_os = "linux")))]
+const ENFORCED_LIMITS: &str = "own process group, cpu/file-size limits";
+// `setsid` and `setrlimit` are both `#[cfg(unix)]`, and nothing asks Windows
+// for a process group, so there is nothing here to promise.
+#[cfg(not(unix))]
+const ENFORCED_LIMITS: &str = "no process group and no resource limits";
 
 // Filesystem confinement of the shell is **not** applied here, and the reason
 // is worth recording so nobody puts it back the same way.
