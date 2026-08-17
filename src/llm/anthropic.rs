@@ -54,6 +54,11 @@ pub struct AnthropicProvider {
     stop_sequences: Vec<String>,
     /// Thinking budget in tokens; `None` disables extended thinking.
     thinking_budget: Option<u32>,
+    /// Reasoning effort for the *adaptive* thinking shape, when set.
+    ///
+    /// Takes precedence over `thinking_budget`, because the two shapes are
+    /// mutually exclusive and the newer models reject the older one.
+    thinking_effort: Option<String>,
     /// Automatic `cache_control` breakpoints (default on).
     prompt_caching: bool,
     tool_choice: Option<Value>,
@@ -92,6 +97,7 @@ impl AnthropicProvider {
             top_k: None,
             stop_sequences: Vec::new(),
             thinking_budget: None,
+            thinking_effort: None,
             prompt_caching: true,
             tool_choice: None,
             beta_headers: Vec::new(),
@@ -162,6 +168,26 @@ impl AnthropicProvider {
     /// `provider_extra` as the API requires. Note: the API rejects
     /// `temperature`/`top_p`/`top_k` alongside thinking, so those are
     /// omitted from requests while thinking is enabled.
+    /// Enable *adaptive* thinking at the given effort.
+    ///
+    /// The 4.6-and-later generation replaced the budgeted shape with
+    /// `thinking: {type: "adaptive"}` plus `output_config: {effort}`, and
+    /// rejects `{type: "enabled", budget_tokens}` outright:
+    ///
+    /// ```text
+    /// "thinking.type.enabled" is not supported for this model.
+    /// Use "thinking.type.adaptive" and "output_config.effort".
+    /// ```
+    ///
+    /// Older models require the budgeted shape just as firmly, and one gateway
+    /// can front both — a settings file that maps `opus` to 4.8 and `sonnet`
+    /// to 4.5 needs a different body per model. The caller picks; this only
+    /// records the choice.
+    pub fn with_adaptive_thinking(mut self, effort: impl Into<String>) -> Self {
+        self.thinking_effort = Some(effort.into());
+        self
+    }
+
     pub fn with_thinking(mut self, budget_tokens: u32) -> Self {
         self.thinking_budget = Some(budget_tokens);
         self
@@ -228,7 +254,19 @@ impl AnthropicProvider {
                 obj.insert("tool_choice".into(), choice.clone());
             }
         }
-        if let Some(budget) = self.thinking_budget {
+        if let Some(effort) = &self.thinking_effort {
+            // `display: "summarized"` matters for more than tidiness. These
+            // models default it to `"omitted"`, which streams thinking blocks
+            // with no text in them — so the reasoning panel sits blank for the
+            // whole think and the answer lands all at once, several seconds
+            // later, looking like a stall. Asking for the summary gives
+            // `complete_stream` something to emit as it goes.
+            obj.insert(
+                "thinking".into(),
+                json!({ "type": "adaptive", "display": "summarized" }),
+            );
+            obj.insert("output_config".into(), json!({ "effort": effort }));
+        } else if let Some(budget) = self.thinking_budget {
             obj.insert(
                 "thinking".into(),
                 json!({ "type": "enabled", "budget_tokens": budget }),

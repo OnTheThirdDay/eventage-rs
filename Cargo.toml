@@ -62,7 +62,12 @@ async-trait  = "0.1"
 thiserror    = "2"
 tracing      = "0.1"
 arc-swap     = "1"
-reqwest      = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# `rustls-tls-native-roots`, not `rustls-tls`: the bundled Mozilla root store
+# does not contain a company's internal CA, so a gateway fronted by one fails
+# the handshake and reqwest reports only "error sending request" — a transport
+# error with no HTTP response to explain it. Native roots means the OS trust
+# store, which is where such a CA is actually installed.
+reqwest      = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 futures-util = "0.3"
 toml         = "0.8"
 

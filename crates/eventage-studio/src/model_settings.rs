@@ -29,10 +29,11 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 /// Where the model configuration comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelSource {
     /// Typed into this screen.
+    #[default]
     Manual,
     /// Read from `~/.claude/settings.json`, the file Claude Code uses.
     ///
@@ -40,12 +41,6 @@ pub enum ModelSource {
     /// takes effect without restarting Studio — and so the credential is not
     /// duplicated into a second place on disk.
     ClaudeSettings,
-}
-
-impl Default for ModelSource {
-    fn default() -> Self {
-        Self::Manual
-    }
 }
 
 /// What a settings screen is shown. Deliberately without the credential.

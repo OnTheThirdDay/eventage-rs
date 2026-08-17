@@ -182,3 +182,56 @@ async fn a_rewind_is_refused_while_a_turn_is_running() {
     // And it works again once the turn is over.
     assert!(session.rewind(1).await.is_ok());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_users_message_is_published_before_the_snapshot() {
+    // `snapshot::capture` runs `git add -A` over the working tree — seconds on
+    // a large repository. Studio has no optimistic echo, so publishing the
+    // message afterwards left the user's own typing invisible for the length
+    // of a git walk, which reads as a dropped keystroke.
+    //
+    // The checkpoint must still come first, or a rewind to it would land after
+    // the message it is meant to precede.
+    use eventage::event::kinds;
+
+    let state = tempfile::tempdir().unwrap();
+    let (session, ws) = stalled_session(&state).await;
+
+    // A real repository, so the snapshot actually does work.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if !git(&["init", "-q"]) {
+        return; // no git on this machine
+    }
+    git(&["config", "user.email", "t@example.invalid"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(ws.path().join("a.txt"), "hello\n").unwrap();
+
+    session
+        .submit_prompt(&[ContentBlock::text("my message")])
+        .await
+        .unwrap();
+
+    let log = session.bus.log().await;
+    let checkpoint = log
+        .iter()
+        .position(|e| e.kind == kinds::CHECKPOINT)
+        .expect("a checkpoint opened the turn");
+    let message = log
+        .iter()
+        .position(|e| e.kind == kinds::USER_MESSAGE)
+        .expect("the message was published");
+    assert!(
+        checkpoint < message,
+        "the checkpoint must precede the message it anchors"
+    );
+
+    // And the snapshot still happened, so a rewind can restore files.
+    assert_eq!(session.checkpoints().await.len(), 1);
+}

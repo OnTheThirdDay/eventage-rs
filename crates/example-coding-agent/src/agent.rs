@@ -184,6 +184,31 @@ async fn connect_mcp(
     )
 }
 
+/// Does this model want the adaptive thinking shape rather than a budget?
+///
+/// A deny-list of the older families rather than an allow-list of the newer
+/// ones, so a model released next month gets the current shape by default
+/// instead of the legacy one. Gateway-prefixed ids
+/// (`@bedrock-au/au.anthropic.claude-opus-4-8`) match on the family substring
+/// like any other.
+fn uses_adaptive_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    /// Families that require `{type: "enabled", budget_tokens}` and reject
+    /// `adaptive`. One gateway can front both generations, so the choice is
+    /// per model and not per session.
+    const LEGACY_BUDGET_FAMILIES: &[&str] = &[
+        "sonnet-4-5",
+        "haiku-4-5",
+        "opus-4-5",
+        "opus-4-1",
+        "opus-4-0",
+        "sonnet-4-0",
+        "claude-3",
+        "claude-2",
+    ];
+    !LEGACY_BUDGET_FAMILIES.iter().any(|fam| m.contains(fam))
+}
+
 /// Build the provider a [`ModelConfig`](crate::config::ModelConfig) describes.
 ///
 /// Free-standing because it is not the coding agent's: cowork resolves a model
@@ -205,8 +230,16 @@ pub fn provider_for(model: &crate::config::ModelConfig) -> Arc<dyn LlmProvider> 
             if let Some(url) = &model.base_url {
                 p = p.with_base_url(url.trim_end_matches('/'));
             }
+            // The `[1m]` marker and anything else the model string asked for
+            // travel as headers, never as part of the model id.
+            for beta in &model.betas {
+                p = p.with_beta(beta.clone());
+            }
             if let Some(budget) = model.thinking_tokens {
-                p = p.with_thinking(budget);
+                match uses_adaptive_thinking(&model.model) {
+                    true => p = p.with_adaptive_thinking("high"),
+                    false => p = p.with_thinking(budget),
+                }
             }
             Arc::new(eventage::RetryProvider::new(p))
         }
@@ -754,6 +787,25 @@ impl CodingSession {
         self.cancelled.store(false, Ordering::SeqCst);
         let _ = self.cancel_tx.send(false);
         let checkpoint = self.bus.checkpoint().await?;
+
+        // Published before the snapshot, and the order is the whole point.
+        //
+        // `snapshot::capture` runs `git add -A` over the working tree, which
+        // on a large or untracked-heavy repository takes seconds. Studio has
+        // no optimistic echo — the message appears when its event reaches the
+        // SSE feed — so publishing afterwards meant *your own typing* sat
+        // invisible for the length of a git walk, which reads as the app
+        // having missed the keystroke.
+        //
+        // The checkpoint still comes first, so a rewind to it still lands
+        // before the message and rewind semantics are unchanged. And the
+        // snapshot is identical either way: nothing mutates the tree between
+        // these two lines, because the reasoning cycle is started by the
+        // caller only after this returns.
+        self.bus
+            .publish(Event::new(kinds::USER_MESSAGE, prompt_to_payload(blocks)))
+            .await?;
+
         // Recorded with the checkpoint so a rewind can put the files back as
         // well as the conversation. Best-effort: a workspace that is not a
         // git repository simply has no snapshot, and `rewind` says so rather
@@ -769,9 +821,6 @@ impl CodingSession {
             id: checkpoint,
             tree,
         });
-        self.bus
-            .publish(Event::new(kinds::USER_MESSAGE, prompt_to_payload(blocks)))
-            .await?;
         Ok(())
     }
 
@@ -1098,6 +1147,41 @@ impl CodingSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_shape_is_chosen_by_model_family() {
+        // One gateway can front both generations — a settings file mapping
+        // `opus` to 4.8 and `sonnet` to 4.5 needs a different request body per
+        // model, so this cannot be a per-session setting.
+        for legacy in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5-20251001",
+            "au.anthropic.claude-sonnet-4-5-v1",
+            "claude-opus-4-5",
+            "claude-3-7-sonnet",
+        ] {
+            assert!(
+                !uses_adaptive_thinking(legacy),
+                "{legacy} rejects adaptive and needs budget_tokens"
+            );
+        }
+
+        // Newer families, including gateway-prefixed ids — and anything
+        // unrecognised, because the deny-list is of the *old* shapes so a
+        // model released next month gets the current one.
+        for adaptive in [
+            "claude-opus-4-8",
+            "@bedrock-au/au.anthropic.claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "some-model-nobody-has-heard-of",
+        ] {
+            assert!(
+                uses_adaptive_thinking(adaptive),
+                "{adaptive} should use the adaptive shape"
+            );
+        }
+    }
 
     #[test]
     fn old_failures_are_a_line_and_recent_ones_are_the_events() {

@@ -225,6 +225,75 @@ impl ClaudeSettings {
     }
 }
 
+/// The `anthropic-beta` value that selects the 1M-token context window.
+pub const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+
+/// A `model` value from a settings file, turned into what the API needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub model: String,
+    pub betas: Vec<String>,
+}
+
+/// Resolve Claude Code's `model` value into a concrete id and any betas.
+///
+/// Two things are packed into that one string, and both have to come apart
+/// before a request is built.
+///
+/// **An alias.** `opus`, `sonnet`, `haiku` and `opusplan` are not model ids —
+/// they name whichever id the operator put in the matching
+/// `ANTHROPIC_DEFAULT_*_MODEL` variable. Behind a gateway that maps a family
+/// to a Bedrock id, sending the alias verbatim gets a `model_not_allowed_error`
+/// for a model nobody has.
+///
+/// **A `[1m]` suffix.** That is a request for the 1M-token context window,
+/// which travels as an `anthropic-beta` header. Left on the name it becomes
+/// part of the model id, and the gateway is asked for `…-opus-4-8[1m]` — which
+/// does not exist. This is the failure that produced
+/// `412 model_not_allowed_error`.
+///
+/// `lookup` reads the `ANTHROPIC_DEFAULT_*_MODEL` variables; taking it as a
+/// closure is what lets the same resolution run against a settings file's
+/// `env` block and against the process environment.
+pub fn resolve_model_alias(name: &str, lookup: impl Fn(&str) -> Option<String>) -> ResolvedModel {
+    let (base, betas) = match name.split_once('[') {
+        Some((base, rest)) => {
+            let marker = rest.trim_end_matches(']').trim();
+            let betas = match marker {
+                "1m" => vec![CONTEXT_1M_BETA.to_string()],
+                // An unrecognised marker is dropped rather than guessed at: a
+                // beta header we invented would be rejected, and a model name
+                // with a bracket in it certainly would be.
+                _ => Vec::new(),
+            };
+            (base.trim(), betas)
+        }
+        None => (name.trim(), Vec::new()),
+    };
+
+    let default_var = match base {
+        // `opusplan` is Claude Code's "plan with Opus" setting; the model it
+        // resolves to is the Opus one.
+        "opus" | "opusplan" => "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "sonnet" => "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "haiku" => "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        // Already a concrete id. The marker is still stripped.
+        _ => {
+            return ResolvedModel {
+                model: base.to_string(),
+                betas,
+            }
+        }
+    };
+
+    ResolvedModel {
+        // An alias with no default configured falls back to itself, so the
+        // error names the alias the operator wrote rather than an empty model.
+        model: lookup(default_var).unwrap_or_else(|| base.to_string()),
+        betas,
+    }
+}
+
 /// Parse `ANTHROPIC_CUSTOM_HEADERS` into header pairs.
 ///
 /// Claude Code's format, which gateways document against: `Name: value`, one
@@ -359,7 +428,11 @@ mod tests {
                }}"#,
         );
 
-        let settings = ClaudeSettings::load(dir.path());
+        let mut settings = ClaudeSettings::load(dir.path());
+        // The user layer comes from the real `~/.claude/settings.json`, which
+        // is whatever this machine happens to have. Cleared so the assertion
+        // below is about the project layer and nothing else.
+        settings.user_env.clear();
         // Read, so the operator can be told what the file wanted.
         assert_eq!(settings.env.len(), 2);
 
@@ -437,6 +510,70 @@ mod tests {
             ClaudeSettings::load(dir.path()).model.as_deref(),
             Some("claude-sonnet-4-5")
         );
+    }
+
+    #[test]
+    fn a_model_alias_resolves_to_the_gateways_concrete_id() {
+        // `opus[1m]` is an alias plus a context marker. Sent verbatim the
+        // gateway is asked for a model called `opus[1m]`, which nobody has.
+        let vars = |var: &str| match var {
+            "ANTHROPIC_DEFAULT_OPUS_MODEL" => {
+                Some("@bedrock-au/au.anthropic.claude-opus-4-8".to_string())
+            }
+            _ => None,
+        };
+        let resolved = resolve_model_alias("opus[1m]", vars);
+        assert_eq!(resolved.model, "@bedrock-au/au.anthropic.claude-opus-4-8");
+        assert_eq!(resolved.betas, vec![CONTEXT_1M_BETA.to_string()]);
+        assert!(!resolved.model.contains('['), "the marker stayed on the id");
+    }
+
+    #[test]
+    fn a_full_model_id_is_left_alone() {
+        let resolved = resolve_model_alias("claude-sonnet-4-5", |_| None);
+        assert_eq!(resolved.model, "claude-sonnet-4-5");
+        assert!(resolved.betas.is_empty());
+    }
+
+    #[test]
+    fn a_full_id_with_the_1m_marker_keeps_the_id_and_gains_the_beta() {
+        let resolved = resolve_model_alias("au.anthropic.claude-opus-4-8[1m]", |_| None);
+        assert_eq!(resolved.model, "au.anthropic.claude-opus-4-8");
+        assert_eq!(resolved.betas, vec![CONTEXT_1M_BETA.to_string()]);
+    }
+
+    #[test]
+    fn an_unmapped_alias_falls_back_to_the_alias_without_its_marker() {
+        // Better than an empty model name: the error then names what the
+        // operator actually wrote.
+        let resolved = resolve_model_alias("sonnet[1m]", |_| None);
+        assert_eq!(resolved.model, "sonnet");
+        assert_eq!(resolved.betas, vec![CONTEXT_1M_BETA.to_string()]);
+    }
+
+    #[test]
+    fn an_unrecognised_marker_is_dropped_and_adds_no_beta() {
+        // Inventing a beta header would be rejected; leaving the bracket on
+        // the model name certainly would be.
+        let resolved = resolve_model_alias("sonnet[7q]", |_| Some("concrete".into()));
+        assert_eq!(resolved.model, "concrete");
+        assert!(resolved.betas.is_empty());
+    }
+
+    #[test]
+    fn each_family_reads_its_own_default() {
+        let vars = |var: &str| Some(format!("id-for-{var}"));
+        for (alias, var) in [
+            ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            ("opusplan", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+        ] {
+            assert_eq!(
+                resolve_model_alias(alias, vars).model,
+                format!("id-for-{var}")
+            );
+        }
     }
 
     #[test]

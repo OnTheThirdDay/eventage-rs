@@ -220,14 +220,31 @@ impl Studio {
     }
 
     /// Read the opening frames of an SSE stream, which never ends on its own.
+    ///
+    /// Bounded twice, and the second bound is the one that matters. A per-chunk
+    /// timeout only limits how long a *quiet* stream is waited on; a stream
+    /// that keeps sending — keep-alive comments, or a read that returns
+    /// repeatedly without the frame being looked for — satisfies it on every
+    /// iteration and loops forever. That is a test which hangs rather than
+    /// fails, and a hang tells you nothing: no name, no assertion, just a job
+    /// that runs to its wall-clock limit.
+    ///
+    /// So there is an overall deadline as well. Reaching it returns whatever
+    /// arrived, and the caller's assertion fails with the body in the message.
     async fn stream_text(&self, path: &str) -> String {
+        const OVERALL: std::time::Duration = std::time::Duration::from_secs(10);
+        const PER_CHUNK: std::time::Duration = std::time::Duration::from_millis(500);
+
         let mut response = self.get(path).await;
         let mut body = String::new();
-        while let Ok(Some(chunk)) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), response.chunk())
-                .await
-                .unwrap_or(Ok(None))
-        {
+        let deadline = tokio::time::Instant::now() + OVERALL;
+
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(Some(chunk))) = tokio::time::timeout(PER_CHUNK, response.chunk()).await
+            else {
+                // Quiet or finished: nothing more is coming.
+                break;
+            };
             body.push_str(&String::from_utf8_lossy(&chunk));
             if body.contains("studio.stream.hello") {
                 break;

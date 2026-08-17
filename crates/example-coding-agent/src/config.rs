@@ -230,6 +230,12 @@ pub struct ModelConfig {
     pub base_url: Option<String>,
     /// Headers a gateway routes on, e.g. `x-portkey-provider`.
     pub headers: Vec<(String, String)>,
+    /// `anthropic-beta` values this model needs, e.g. the 1M-context marker.
+    ///
+    /// Resolved from the `model` string rather than configured separately:
+    /// Claude Code writes `opus[1m]`, and the `[1m]` is a header, not part of
+    /// the model id. See [`resolve_model_alias`](crate::settings::resolve_model_alias).
+    pub betas: Vec<String>,
     /// Whether a real credential was found when this profile was resolved.
     ///
     /// Recorded here rather than re-checked later. Startup takes
@@ -323,11 +329,19 @@ impl ModelConfig {
         let bearer = get("ANTHROPIC_AUTH_TOKEN");
         let key = bearer.clone().or_else(|| get("ANTHROPIC_API_KEY"))?;
 
-        Some(Self {
-            provider: Provider::Anthropic,
-            model: model_override
+        // `opus[1m]` is an alias plus a context marker, and neither belongs in
+        // a model id. The lookup reads the same `env` block.
+        let resolved = crate::settings::resolve_model_alias(
+            &model_override
                 .or_else(|| get("ANTHROPIC_MODEL"))
                 .unwrap_or_else(|| "claude-sonnet-4-5".into()),
+            get,
+        );
+
+        Some(Self {
+            provider: Provider::Anthropic,
+            model: resolved.model,
+            betas: resolved.betas,
             api_key: key,
             thinking_tokens: Some(8_000),
             max_tokens: 32_000,
@@ -355,11 +369,16 @@ impl ModelConfig {
             .clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
         {
-            return Self {
-                provider: Provider::Anthropic,
-                model: model_override
+            let resolved = crate::settings::resolve_model_alias(
+                &model_override
                     .or_else(|| std::env::var("ANTHROPIC_MODEL").ok())
                     .unwrap_or_else(|| "claude-sonnet-4-5".into()),
+                |var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()),
+            );
+            return Self {
+                provider: Provider::Anthropic,
+                model: resolved.model,
+                betas: resolved.betas,
                 api_key: key,
                 thinking_tokens: Some(8_000),
                 max_tokens: 32_000,
@@ -423,6 +442,7 @@ impl ModelConfig {
             bearer_auth: false,
             base_url: None,
             headers: Vec::new(),
+            betas: Vec::new(),
             credentialed: false,
         }
     }
@@ -556,6 +576,43 @@ impl SessionConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bedrock_gateway_settings_block_resolves_the_model_alias() {
+        // The `~/.claude/settings.json` shape a Portkey→Bedrock gateway uses.
+        // Sent verbatim this produced `412 model_not_allowed_error` for a
+        // model named `…-opus-4-8[1m]`, which no gateway has.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("ANTHROPIC_BASE_URL".into(), "https://gw.example".into());
+        env.insert("ANTHROPIC_AUTH_TOKEN".into(), "dummy".into());
+        env.insert(
+            "ANTHROPIC_DEFAULT_OPUS_MODEL".into(),
+            "@bedrock-au/au.anthropic.claude-opus-4-8".into(),
+        );
+        env.insert(
+            "ANTHROPIC_CUSTOM_HEADERS".into(),
+            "x-portkey-provider: @bedrock-au\nx-portkey-api-key: pk-test".into(),
+        );
+
+        let config = ModelConfig::from_claude_env(&env, Some("opus[1m]".into()))
+            .expect("the block names a credential");
+
+        assert_eq!(config.provider, Provider::Anthropic);
+        assert_eq!(config.model, "@bedrock-au/au.anthropic.claude-opus-4-8");
+        assert!(
+            !config.model.contains('['),
+            "the marker rode along on the id"
+        );
+        assert_eq!(
+            config.betas,
+            vec![crate::settings::CONTEXT_1M_BETA.to_string()]
+        );
+
+        // The rest of the gateway wiring survives too.
+        assert!(config.bearer_auth, "an auth token travels as a bearer");
+        assert_eq!(config.base_url.as_deref(), Some("https://gw.example"));
+        assert_eq!(config.headers.len(), 2);
+    }
+
     use super::*;
     use eventage::agent::PermissionVerdict;
 
