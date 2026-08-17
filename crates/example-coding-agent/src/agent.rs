@@ -362,6 +362,25 @@ impl CodingSession {
         // full of one model's reasoning handed to another is worth knowing
         // about even though it is not an error.
         let manifest_path = state_dir.join(format!("{id}.session.json"));
+
+        // Resuming something that is not there produced an empty session that
+        // looked resumed: `SqliteEventStore::new` creates the file it cannot
+        // find, the manifest check below reads nothing and says nothing, and
+        // the caller gets a blank history with no indication that the thing it
+        // asked for does not exist. That is how a state directory landing
+        // somewhere unexpected showed up as a *workspace identity* failure
+        // rather than as "there is no session here".
+        //
+        // The manifest alone would be too strict: sessions recorded before it
+        // existed have a database and no manifest, and they still deserve to
+        // open. Either is enough to say the session is real.
+        if restore && !db.exists() && !manifest_path.exists() {
+            anyhow::bail!(
+                "no session {id} in {} — nothing to resume",
+                state_dir.display()
+            );
+        }
+
         let identity = serde_json::json!({
             "workspace": std::fs::canonicalize(&config.cwd)
                 .unwrap_or_else(|_| std::path::PathBuf::from(&config.cwd))

@@ -12,7 +12,7 @@
 //! a reopened session came back with an empty trace and, in particular, an
 //! empty context panel.
 //!
-//! Its own test binary because it points `XDG_DATA_HOME` at a temp directory,
+//! Its own test binary because it redirects the state directory,
 //! which is process-wide.
 
 use eventage::event::{kinds, meta_keys};
@@ -27,7 +27,7 @@ async fn a_reopened_session_still_knows_what_it_sent_the_model() {
     let state = tempfile::tempdir().unwrap();
     // SAFETY: this binary holds exactly one test, so nothing else is reading
     // the environment concurrently.
-    unsafe { std::env::set_var("XDG_DATA_HOME", state.path()) };
+    unsafe { std::env::set_var("EVENTAGE_STATE_DIR", state.path()) };
 
     let workspace = tempfile::tempdir().unwrap();
     let config = SessionConfig::new(

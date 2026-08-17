@@ -28,7 +28,7 @@ async fn stalled_session(state: &tempfile::TempDir) -> (Arc<CodingSession>, temp
     // SAFETY: set before the session is built; these tests are in their own
     // binary and run one at a time against the environment.
     unsafe {
-        std::env::set_var("XDG_DATA_HOME", state.path());
+        std::env::set_var("EVENTAGE_STATE_DIR", state.path());
         std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}/v1"));
         std::env::set_var("OPENAI_API_KEY", "test");
     }

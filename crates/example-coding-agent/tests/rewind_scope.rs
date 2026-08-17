@@ -16,7 +16,7 @@ async fn session(state: &tempfile::TempDir, workspace: &tempfile::TempDir) -> Co
     // SAFETY: set before the session is built; this test binary runs alone
     // against the environment.
     unsafe {
-        std::env::set_var("XDG_DATA_HOME", state.path());
+        std::env::set_var("EVENTAGE_STATE_DIR", state.path());
         std::env::set_var("OPENAI_API_KEY", "test");
     }
     let mut config = SessionConfig::new(

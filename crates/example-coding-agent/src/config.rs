@@ -553,10 +553,28 @@ impl SessionConfig {
     ///
     /// A directory left by the older, name-only scheme is still used if it
     /// exists, so nobody's history disappears on upgrade.
+    ///
+    /// `EVENTAGE_STATE_DIR` overrides the base outright, on every platform.
+    /// `dirs::data_dir` follows each platform's own convention, which means
+    /// `XDG_DATA_HOME` moves it on Linux and is *ignored* on macOS, where the
+    /// answer is always `~/Library/Application Support`. A test that set
+    /// `XDG_DATA_HOME` to a temp directory was therefore hermetic on Linux and,
+    /// on macOS, both wrote into the real home directory and failed — because
+    /// the state it had carefully arranged there was never consulted.
+    ///
+    /// Named `STATE` and not `SESSION`: [`crate::tools::is_credential`] treats
+    /// `SESSION` as a credential marker, so `EVENTAGE_SESSION_DIR` would be
+    /// scrubbed out of the environment at startup and the override would
+    /// vanish from under us.
     pub fn state_dir(&self) -> std::path::PathBuf {
-        let base = dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("eventage-code");
+        let base = match std::env::var_os("EVENTAGE_STATE_DIR") {
+            // Taken as given: an explicit path is an answer, not a hint to
+            // append a product name to.
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => dirs::data_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("eventage-code"),
+        };
 
         let name: String = Path::new(&self.cwd)
             .file_name()
