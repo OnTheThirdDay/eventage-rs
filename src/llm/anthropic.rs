@@ -162,12 +162,6 @@ impl AnthropicProvider {
         self
     }
 
-    /// Enable extended thinking with the given token budget.
-    ///
-    /// Thinking blocks are preserved across tool-loop steps via
-    /// `provider_extra` as the API requires. Note: the API rejects
-    /// `temperature`/`top_p`/`top_k` alongside thinking, so those are
-    /// omitted from requests while thinking is enabled.
     /// Enable *adaptive* thinking at the given effort.
     ///
     /// The 4.6-and-later generation replaced the budgeted shape with
@@ -188,6 +182,15 @@ impl AnthropicProvider {
         self
     }
 
+    /// Enable extended thinking with the given token budget.
+    ///
+    /// The shape older models require. Thinking blocks are preserved across
+    /// tool-loop steps via `provider_extra` as the API requires. Note: the API
+    /// rejects `temperature`/`top_p`/`top_k` alongside thinking, so those are
+    /// omitted from requests while thinking is enabled.
+    ///
+    /// Superseded by [`with_adaptive_thinking`](Self::with_adaptive_thinking)
+    /// on the 4.6-and-later generation, which rejects this shape outright.
     pub fn with_thinking(mut self, budget_tokens: u32) -> Self {
         self.thinking_budget = Some(budget_tokens);
         self

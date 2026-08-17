@@ -193,9 +193,9 @@ async fn connect_mcp(
 /// like any other.
 fn uses_adaptive_thinking(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    /// Families that require `{type: "enabled", budget_tokens}` and reject
-    /// `adaptive`. One gateway can front both generations, so the choice is
-    /// per model and not per session.
+    // Families that require `{type: "enabled", budget_tokens}` and reject
+    // `adaptive`. One gateway can front both generations, so the choice is
+    // per model and not per session.
     const LEGACY_BUDGET_FAMILIES: &[&str] = &[
         "sonnet-4-5",
         "haiku-4-5",

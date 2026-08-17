@@ -576,6 +576,9 @@ impl SessionConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use eventage::agent::PermissionVerdict;
+
     #[test]
     fn a_bedrock_gateway_settings_block_resolves_the_model_alias() {
         // The `~/.claude/settings.json` shape a Portkey→Bedrock gateway uses.
@@ -612,9 +615,6 @@ mod tests {
         assert_eq!(config.base_url.as_deref(), Some("https://gw.example"));
         assert_eq!(config.headers.len(), 2);
     }
-
-    use super::*;
-    use eventage::agent::PermissionVerdict;
 
     #[test]
     fn mode_ids_round_trip() {
