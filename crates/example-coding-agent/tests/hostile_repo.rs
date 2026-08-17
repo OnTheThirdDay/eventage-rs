@@ -333,10 +333,19 @@ async fn a_background_job_can_be_listed_and_stopped() {
 }
 
 #[tokio::test]
-async fn a_shell_command_cannot_read_outside_the_workspace() {
-    // The file tools have been confined for a while; the shell was the hole
-    // left in that, and a repository only has to talk the model into one
-    // `cat` to walk straight through it.
+async fn confined_mode_says_plainly_that_reads_are_not_confined() {
+    // This test used to assert the opposite — that `Confined` blocked a read
+    // outside the workspace — and it was right when it was written. The read
+    // policies were later collapsed to two, and `Confined` became
+    // writes-confined/reads-open, which is the trade Codex's Linux sandbox
+    // makes and is documented as such. The assertion was not updated, so it
+    // failed on CI and passed here, because this kernel has no Landlock and
+    // the whole path is skipped.
+    //
+    // What is worth testing is not the old guarantee but the *agreement*
+    // between what happens and what the tool tells the model. A containment
+    // string that claims more than it delivers is the failure mode that
+    // matters, and it is the one a reader of the result cannot detect.
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("id_rsa"), SECRET).unwrap();
 
@@ -355,17 +364,39 @@ async fn a_shell_command_cannot_read_outside_the_workspace() {
     .await
     .unwrap();
 
-    if !eventage_code::shell_sandbox::available() {
-        // Say so rather than passing quietly: a green test on a kernel that
-        // enforces nothing is worse than no test.
-        eprintln!("skipped: this kernel has no Landlock");
-        return;
+    let stated = out["containment"].as_str().unwrap_or_default();
+    let read_it = format!("{out}").contains(SECRET);
+
+    // Two truthful strings can describe an unconfined read: the deliberate
+    // "reads are open" of this mode, and the "this kernel has no Landlock"
+    // fallback. Either is honest; claiming confinement is not. Written this
+    // way the test runs on both kinds of kernel rather than skipping on one —
+    // which is how the stale assertion survived: it only ever ran on CI.
+    if read_it {
+        assert!(
+            stated.contains("NOT confined"),
+            "the read succeeded while the result claimed the filesystem was confined: {out}"
+        );
+    } else {
+        // If a future change does narrow reads in this mode, the string has to
+        // stop disclaiming it — otherwise the model is told it has less
+        // authority than it does, which is the same defect pointing the other
+        // way.
+        assert!(
+            !stated.contains("Reads are NOT confined"),
+            "the read was blocked while the result still disclaimed confinement: {out}"
+        );
     }
-    assert!(
-        !format!("{out}").contains(SECRET),
-        "the shell read a file outside the workspace: {out}"
-    );
-    assert_ne!(out["exit_code"], 0, "the read should have failed: {out}");
+
+    // Whatever the read policy, writes outside the workspace are the actual
+    // guarantee of this mode, and `Strict` is what narrows reads — covered by
+    // `shell_sandbox`'s own tests, which can check the path set directly
+    // instead of needing a kernel that enforces it.
+    //
+    // Note for anyone tempted to test read confinement this way: it cannot be
+    // done with a `tempfile::tempdir`. `writable_paths` grants
+    // `std::env::temp_dir()` so that builds work, so `/tmp` is readable under
+    // *both* modes and a secret placed there proves nothing.
 }
 
 #[tokio::test]

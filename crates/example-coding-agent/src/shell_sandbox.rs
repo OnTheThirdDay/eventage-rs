@@ -59,7 +59,11 @@
 //! `/proc` for *other* processes of the same user, which no filesystem
 //! sandbox can fix — that needs a PID namespace, which means a container.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// Only the Linux path sets and the helper lookup build owned paths; elsewhere
+// `confined_argv` returns before any of them exist.
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 /// Whether *this* program handles [`HELPER_ARG`].
 ///
