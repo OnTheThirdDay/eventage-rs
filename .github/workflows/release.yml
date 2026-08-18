@@ -212,9 +212,70 @@ jobs:
       - name: Install the Tauri CLI
         run: npm install -g @tauri-apps/cli@^2
 
+      # linuxdeploy and its plugins are fetched by the AppImage bundler at
+      # build time. Kept across runs because every one of those downloads is
+      # guarded by `if !path.exists()`, so a populated cache means the bundler
+      # makes no network calls at all.
+      - name: Cache the AppImage bundler's tools
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tauri
+          key: tauri-appimage-tools-x86_64
+
+      # And fetch them here rather than letting the bundler do it, because it
+      # downloads without retrying and raw.githubusercontent.com rate-limits
+      # shared CI egress: a release build died on `http status: 429` reaching
+      # for linuxdeploy-plugin-gtk.sh. curl retries; the bundler does not.
+      #
+      # The names are the ones the bundler looks for, which are not always the
+      # names in the URLs — the AppImage plugin is fetched as
+      # `…-plugin-appimage-x86_64.AppImage` and looked for as
+      # `…-plugin-appimage.AppImage`, and a mismatch here would leave a file
+      # nobody reads and the download still happening at build time.
+      - name: Prefetch the AppImage bundler's tools
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          tools="$HOME/.cache/tauri"
+          mkdir -p "$tools"
+          fetch() {
+            local name="$1" url="$2" required="$3"
+            if [[ -f "$tools/$name" ]]; then
+              echo "cached:  $name"
+              return
+            fi
+            if curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors -o "$tools/$name" "$url"; then
+              chmod +x "$tools/$name"
+              echo "fetched: $name"
+            elif [[ "$required" == required ]]; then
+              echo "could not fetch $name from $url" >&2
+              exit 1
+            else
+              # The bundler treats this one as optional and falls back to its
+              # own built-in copy, so a failure here must not stop the build.
+              rm -f "$tools/$name"
+              echo "skipped: $name (optional)"
+            fi
+          }
+          releases=https://github.com/tauri-apps/binary-releases/releases/download
+          raw=https://raw.githubusercontent.com/tauri-apps
+          fetch AppRun-x86_64 "$releases/apprun-old/AppRun-x86_64" required
+          fetch linuxdeploy-x86_64.AppImage "$releases/linuxdeploy/linuxdeploy-x86_64.AppImage" required
+          fetch linuxdeploy-plugin-gtk.sh "$raw/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh" required
+          fetch linuxdeploy-plugin-gstreamer.sh "$raw/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh" required
+          fetch linuxdeploy-plugin-appimage.AppImage \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage" \
+            optional
+          ls -l "$tools"
+
+      # The bundle list is quoted because this step runs under PowerShell on
+      # Windows, where a bare `msi,nsis` is an *array* and reaches the CLI as
+      # the single value "msi nsis" — which it rightly rejected. Quoting makes
+      # it one literal argument in every shell.
       - name: Bundle
         working-directory: crates/eventage-studio-desktop
-        run: tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+        run: tauri build --target ${{ matrix.target }} --bundles "${{ matrix.bundles }}"
 
       # Bundle filenames carry the product name and version ("Eventage
       # Studio_0.2.0_amd64.deb"), which is right for a package manager and
