@@ -147,7 +147,12 @@ export default function App() {
   // Follow the active session: history first, then live.
   useEffect(() => {
     if (!activeId) {
-      setEvents([]);
+      // Not just the events: leaving the handle behind meant the status strip
+      // still claimed "connected" with nothing open, and its Retry button
+      // reconnected to a session the server had already closed.
+      reset([]);
+      streamRef.current = null;
+      setStatus("closed");
       return;
     }
     let cancelled = false;
@@ -350,21 +355,59 @@ export default function App() {
   const resume = useCallback(
     (session: StoredSession) =>
       guard(async () => {
+        // A reopened session keeps its own id, so reopening one that is
+        // already open would hand the backend a second handle on the same
+        // history. The sidebar hides those rows, but the listing it draws
+        // from can be a moment stale.
+        if (open.some((s) => s.id === session.id)) {
+          setActiveId(session.id);
+          return;
+        }
         const opened = await api.open({ cwd: session.cwd, resume: session.id });
         await refreshSessions();
         setActiveId(opened.id);
       }),
-    [guard, refreshSessions],
+    [guard, refreshSessions, open],
+  );
+
+  /// Pick what to show after `closed` stopped being available.
+  ///
+  /// Landing on the empty state whenever the active session goes away reads
+  /// as "everything is gone" even with three others still open, so fall
+  /// through to the next one and only show nothing when there is nothing.
+  const selectAfterRemoving = useCallback(
+    (closed: string, remaining: SessionInfo[]) => {
+      setActiveId((current) => {
+        if (current !== closed) return current;
+        return remaining.find((s) => s.id !== closed)?.id ?? null;
+      });
+    },
+    [],
+  );
+
+  /// Close a session without touching its history.
+  ///
+  /// It leaves the Open list and reappears under Earlier, where reopening it
+  /// resumes the same conversation — which is the difference between this and
+  /// `forget`, and why both exist on rows that look alike.
+  const closeSession = useCallback(
+    (id: string) =>
+      guard(async () => {
+        await api.close(id);
+        const listing = await refreshSessions();
+        selectAfterRemoving(id, listing.open);
+      }),
+    [guard, refreshSessions, selectAfterRemoving],
   );
 
   const forget = useCallback(
     (id: string) =>
       guard(async () => {
         await api.forget(id);
-        await refreshSessions();
-        if (activeId === id) setActiveId(null);
+        const listing = await refreshSessions();
+        selectAfterRemoving(id, listing.open);
       }),
-    [guard, refreshSessions, activeId],
+    [guard, refreshSessions, selectAfterRemoving],
   );
 
   const doRewind = useCallback(
@@ -574,6 +617,7 @@ export default function App() {
               onResume={(s) => void resume(s)}
               onNew={() => void newSession()}
               onPickWorkspace={() => setPicking(true)}
+              onClose={(id) => void closeSession(id)}
               onForget={(id) => void forget(id)}
             />
             <Resizer

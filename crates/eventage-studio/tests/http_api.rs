@@ -27,6 +27,9 @@ struct FakeSession {
     mode: Mutex<String>,
     decisions: Mutex<Vec<(String, bool)>>,
     summaries: Mutex<Vec<String>>,
+    /// How many times the session was told to release what it holds. A real
+    /// one has a child process and a log to flush, so closing has to reach it.
+    shutdowns: Mutex<usize>,
 }
 
 impl FakeSession {
@@ -38,6 +41,7 @@ impl FakeSession {
             mode: Mutex::new("ask".into()),
             decisions: Mutex::new(Vec::new()),
             summaries: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(0),
         }
     }
 }
@@ -155,7 +159,9 @@ impl Session for FakeSession {
         Ok(())
     }
 
-    async fn shutdown(&self) {}
+    async fn shutdown(&self) {
+        *self.shutdowns.lock().await += 1;
+    }
 }
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -217,6 +223,10 @@ impl Studio {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn delete(&self, path: &str) -> reqwest::Response {
+        self.client.delete(self.url(path)).send().await.unwrap()
     }
 
     /// Read the opening frames of an SSE stream, which never ends on its own.
@@ -776,4 +786,56 @@ async fn a_nonsense_provider_is_refused_rather_than_stored() {
         .await
         .unwrap();
     assert!(!response.status().is_success(), "got {}", response.status());
+}
+
+#[tokio::test]
+async fn a_session_can_be_closed() {
+    let studio = Studio::start().await;
+    let id = studio.open_session().await;
+
+    let listed: Value = studio.get("/api/sessions").await.json().await.unwrap();
+    assert_eq!(listed["open"].as_array().unwrap().len(), 1);
+
+    let closed = studio.delete(&format!("/api/sessions/{id}")).await;
+    assert_eq!(closed.status(), 204);
+    assert_eq!(
+        *studio.session.shutdowns.lock().await,
+        1,
+        "closing has to reach the session, not just drop it from the map"
+    );
+
+    let listed: Value = studio.get("/api/sessions").await.json().await.unwrap();
+    assert!(listed["open"].as_array().unwrap().is_empty());
+
+    // Closing what is already closed says so rather than pretending.
+    let again = studio.delete(&format!("/api/sessions/{id}")).await;
+    assert_eq!(again.status(), 404);
+}
+
+#[tokio::test]
+async fn reopening_an_open_session_returns_the_one_already_open() {
+    let studio = Studio::start().await;
+    let id = studio.open_session().await;
+
+    // A resumed session keeps its own id, so this is the same key.
+    let again: Value = studio
+        .post("/api/sessions", json!({ "resume": id }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["id"].as_str(), Some(id.as_str()));
+
+    // One handle rather than two: the first close empties the list and the
+    // second finds nothing. A duplicate would have displaced the original in
+    // the map, leaving an agent running that nothing could ever shut down.
+    assert_eq!(
+        studio.delete(&format!("/api/sessions/{id}")).await.status(),
+        204
+    );
+    assert_eq!(
+        studio.delete(&format!("/api/sessions/{id}")).await.status(),
+        404
+    );
+    assert_eq!(*studio.session.shutdowns.lock().await, 1);
 }

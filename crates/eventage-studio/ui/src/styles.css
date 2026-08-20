@@ -378,7 +378,7 @@ a {
 .session-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   width: 100%;
   padding: 7px 8px;
   border-radius: var(--radius-sm);
@@ -390,6 +390,20 @@ a {
 }
 .session-row.active {
   background: var(--bg-active);
+}
+/* The row is a container, not a control: it holds the button that selects the
+   session and the one that closes or deletes it. Nesting the second inside the
+   first — which is what a `<span role="button">` in a `<button>` amounted to —
+   left the close action unreachable from the keyboard. */
+.session-open {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+  color: inherit;
 }
 .session-row .title {
   flex: 1;
@@ -407,16 +421,30 @@ a {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-row .forget {
+.session-row .row-action {
   opacity: 0;
+  flex: none;
+  font-size: 11px;
   color: var(--text-faint);
   padding: 2px 4px;
   border-radius: 4px;
 }
-.session-row:hover .forget {
+/* Kept visible while focused, so the action exists for the keyboard too, and
+   while a delete is waiting to be confirmed — a confirmation that vanished
+   when the pointer left the row would be a trap. */
+.session-row:hover .row-action,
+.session-row .row-action:focus-visible,
+.session-row .row-action.shown {
   opacity: 1;
 }
-.session-row .forget:hover {
+.session-row .row-action:hover {
+  color: var(--text);
+  background: var(--bg-active);
+}
+.session-row .row-action.danger {
+  color: var(--danger);
+}
+.session-row .row-action.danger:hover {
   color: var(--danger);
   background: var(--danger-soft);
 }

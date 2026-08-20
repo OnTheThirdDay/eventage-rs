@@ -237,13 +237,18 @@ struct SessionList {
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<SessionList> {
-    let open: Vec<SessionInfo> = state
+    let mut open: Vec<SessionInfo> = state
         .sessions
         .read()
         .await
         .values()
         .map(|s| s.info())
         .collect();
+    // Sessions live in a `HashMap`, whose iteration order is deliberately not
+    // stable — so without this the sidebar reshuffled on every refresh, and
+    // the client's "open the first one" on startup landed somewhere different
+    // each launch. Oldest first, which is the order they were opened in.
+    open.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     let open_ids: Vec<&str> = open.iter().map(|s| s.id.as_str()).collect();
     let stored = state
         .backend
@@ -259,6 +264,17 @@ async fn open_session(
     State(state): State<AppState>,
     Json(req): Json<NewSessionRequest>,
 ) -> Result<Json<SessionInfo>, ApiError> {
+    // A resumed session keeps its own id, so opening one that is already open
+    // would insert a second handle under the same key — dropping the first
+    // from the map with nothing left to shut it down, and leaving two agents
+    // writing the same log. The one already open is what the caller wants.
+    if let Some(id) = req.resume.as_deref() {
+        let existing = state.sessions.read().await.get(id).cloned();
+        if let Some(session) = existing {
+            return Ok(Json(session.info()));
+        }
+    }
+
     let session = state.backend.open(req).await?;
     let info = session.info();
     state

@@ -13,7 +13,12 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { AppInfo, SessionInfo, StudioEvent } from "./lib/types";
+import type {
+  AppInfo,
+  SessionInfo,
+  StoredSession,
+  StudioEvent,
+} from "./lib/types";
 
 const APP_INFO: AppInfo = {
   backend: "local",
@@ -38,6 +43,24 @@ const SESSION: SessionInfo = {
   running: false,
   turns: 1,
 };
+
+/** A session on disk, offered under "Earlier". */
+const OLD: StoredSession = {
+  id: "s0",
+  cwd: "/repo",
+  title: "the earlier one",
+  updated_at: "2026-08-14T00:00:00Z",
+  size_bytes: 4096,
+};
+
+/**
+ * What `GET /sessions` answers with.
+ *
+ * Mutable, because the interesting sidebar behaviour is what happens *after*
+ * a session moves between the two lists — closing one puts it under Earlier,
+ * reopening it puts it back under Open — and a fixed listing cannot show that.
+ */
+let listing: { open: SessionInfo[]; stored: StoredSession[] };
 
 let seq = 0;
 const ev = (kind: string, payload: Record<string, unknown> = {}): StudioEvent => ({
@@ -73,6 +96,7 @@ beforeEach(() => {
   seq = 0;
   calls = [];
   events = [];
+  listing = { open: [SESSION], stored: [] };
   StubEventSource.latest = null;
   vi.stubGlobal("EventSource", StubEventSource);
   vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
@@ -104,8 +128,13 @@ beforeEach(() => {
         ],
       });
     if (url.startsWith("/api/sessions?") || url === "/api/sessions") {
-      if (method === "POST") return json(SESSION);
-      return json({ open: [SESSION], stored: [] });
+      if (method === "POST") {
+        // A reopened session keeps its own id — that is exactly why it lands
+        // in the Open list and stops being offered under Earlier.
+        const resume = (body as { resume?: string } | undefined)?.resume;
+        return json(resume ? { ...SESSION, id: resume, title: OLD.title } : SESSION);
+      }
+      return json(listing);
     }
     if (url.includes("/events")) return json(events);
     // Mirror the real server: a prompt is accepted asynchronously and answers
@@ -360,6 +389,96 @@ describe("sending a message", () => {
   });
 });
 
+describe("the session sidebar", () => {
+  const row = (title: string) =>
+    within(screen.getByRole("navigation"))
+      .getByText(title)
+      .closest(".session-row") as HTMLElement;
+
+  const click = async (el: HTMLElement) => {
+    await act(async () => {
+      el.click();
+    });
+  };
+
+  it("closes an open session and falls through to the next one", async () => {
+    const other: SessionInfo = { ...SESSION, id: "s2", title: "read the docs" };
+    listing = { open: [SESSION, other], stored: [] };
+    await mount();
+
+    // Closing keeps the history, so the session reappears under Earlier.
+    listing = { open: [other], stored: [{ ...OLD, id: "s1", title: SESSION.title }] };
+    await click(within(row(SESSION.title)).getByLabelText(/^Close /));
+
+    expect(
+      calls.some((c) => c.url === "/api/sessions/s1" && c.method === "DELETE"),
+    ).toBe(true);
+    // The empty state would be a lie with another session still open.
+    await waitFor(() =>
+      expect(StubEventSource.latest!.url).toContain("/api/sessions/s2/stream"),
+    );
+  });
+
+  it("closes a session that was reopened from Earlier", async () => {
+    // The bug this covers: reopening moved the row from Earlier to Open,
+    // where nothing could act on it, so a session became unclosable simply
+    // by having been opened again.
+    listing = { open: [SESSION], stored: [OLD] };
+    await mount();
+
+    listing = {
+      open: [SESSION, { ...SESSION, id: OLD.id, title: OLD.title }],
+      stored: [],
+    };
+    await click(within(row(OLD.title)).getByText(OLD.title));
+    await waitFor(() =>
+      expect(
+        calls.some((c) => c.method === "POST" && (c.body as { resume?: string })?.resume === OLD.id),
+      ).toBe(true),
+    );
+
+    listing = { open: [SESSION], stored: [OLD] };
+    await click(within(row(OLD.title)).getByLabelText(/^Close /));
+    expect(
+      calls.some((c) => c.url === `/api/sessions/${OLD.id}` && c.method === "DELETE"),
+    ).toBe(true);
+  });
+
+  it("asks before deleting a stored session's history", async () => {
+    listing = { open: [SESSION], stored: [OLD] };
+    await mount();
+
+    const deleted = () =>
+      calls.some((c) => c.url === `/api/stored/${OLD.id}` && c.method === "DELETE");
+
+    await click(within(row(OLD.title)).getByLabelText(/^Delete /));
+    // The close button one list up sits in the same spot, and this one cannot
+    // be undone — so the first click only arms it.
+    expect(deleted()).toBe(false);
+
+    await click(within(row(OLD.title)).getByText("Cancel"));
+    expect(deleted()).toBe(false);
+
+    listing = { open: [SESSION], stored: [] };
+    await click(within(row(OLD.title)).getByLabelText(/^Delete /));
+    await click(within(row(OLD.title)).getByText("Delete"));
+    expect(deleted()).toBe(true);
+  });
+
+  it("stops streaming when the last session is closed", async () => {
+    await mount();
+    listing = { open: [], stored: [{ ...OLD, id: "s1", title: SESSION.title }] };
+    await click(within(row(SESSION.title)).getByLabelText(/^Close /));
+
+    await waitFor(() => expect(screen.getByText("No session open")).toBeTruthy());
+    // Not "connected" with nothing open — the strip reports the stream, and
+    // there is no longer one.
+    expect(document.querySelector(".status-strip")!.textContent).toContain(
+      "not streaming",
+    );
+  });
+});
+
 describe("setup problems", () => {
   it("says up front when no API key was found", async () => {
     const hint = "No API key found, so Studio is pointed at http://localhost:11434/v1.";
@@ -373,7 +492,7 @@ describe("setup problems", () => {
       if (url.startsWith("/api/app"))
         return json({ ...APP_INFO, credentials_hint: hint });
       if (url.startsWith("/api/sessions?") || url === "/api/sessions")
-        return method === "POST" ? json(SESSION) : json({ open: [SESSION], stored: [] });
+        return method === "POST" ? json(SESSION) : json(listing);
       if (url.includes("/events")) return json([]);
       return new Response(null, { status: 204 });
     });

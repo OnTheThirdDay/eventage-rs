@@ -197,7 +197,7 @@ impl Backend for LocalBackend {
         // branch is a real session from birth, with a history it can replay,
         // rather than a live copy that would vanish on restart.
         let store =
-            eventage::sqlite::SqliteEventStore::new(self.state_dir.join(format!("{id}.db")))
+            eventage::sqlite::SqliteEventStore::new(config.state_dir().join(format!("{id}.db")))
                 .await?;
         for event in &kept {
             store.append(&to_event(event)?).await?;
