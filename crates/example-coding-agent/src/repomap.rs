@@ -130,12 +130,67 @@ fn reincluded_roots(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The folders an operating system guards, which a walk must not wander into.
+///
+/// macOS puts `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Music`, `~/Movies`
+/// and `~/Pictures` behind TCC: the first read of one raises a system consent
+/// dialog naming the program that asked. The walk meets them only when the
+/// workspace *contains* them, which in practice means the workspace is the
+/// home directory — the desktop app falls back to `$HOME` when Finder starts
+/// it with no project to open, and the first session then mapped the lot. That
+/// is one dialog per folder, from an app the user had just opened and never
+/// asked to look through their music.
+///
+/// A map of `~/Music` was worth nothing even where it is free, so the walk
+/// stops at the door on every platform rather than only where the prompt
+/// appears. `dirs` is asked for the real locations, because on a localised
+/// desktop they are not these English names. `~/Library` joins them on macOS:
+/// partly guarded, wholly uninteresting, and enormous.
+///
+/// Opening one of these *as* the workspace is a different act — the user named
+/// it, and a prompt they can attribute to their own click is a fair trade for
+/// the map they asked for — so this prunes only what the walk descends into,
+/// never the root it was handed. See [`is_guarded`].
+fn guarded_dirs() -> Vec<PathBuf> {
+    let mut guarded: Vec<PathBuf> = [
+        dirs::desktop_dir(),
+        dirs::document_dir(),
+        dirs::download_dir(),
+        dirs::audio_dir(),
+        dirs::video_dir(),
+        dirs::picture_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if cfg!(target_os = "macos") {
+        guarded.extend(dirs::home_dir().map(|home| home.join("Library")));
+    }
+    guarded
+}
+
+/// Whether the walk should stop at `path` rather than descend into it.
+///
+/// The root is exempt on purpose: pruning it would map nothing at all, and a
+/// workspace someone chose is not a folder we wandered into. A project *inside*
+/// a guarded folder is likewise untouched, because the walk starts below the
+/// door and never meets it.
+fn is_guarded(root: &Path, path: &Path, guarded: &[PathBuf]) -> bool {
+    path != root && guarded.iter().any(|dir| dir == path)
+}
+
 fn collect(root: &Path) -> Vec<FileEntry> {
+    collect_within(root, guarded_dirs())
+}
+
+/// `collect`, with the guarded set passed in so a test can name one.
+fn collect_within(root: &Path, guarded: Vec<PathBuf>) -> Vec<FileEntry> {
     let mut entries = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     // `ignore` honours .gitignore, so generated output and vendored
     // dependencies stay out without a hand-maintained deny list.
+    let walk_root = root.to_path_buf();
     let walker = WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
@@ -148,6 +203,7 @@ fn collect(root: &Path) -> Vec<FileEntry> {
         // Read after .gitignore and therefore able to override it, in both
         // directions.
         .add_custom_ignore_filename(AGENT_IGNORE)
+        .filter_entry(move |entry| !is_guarded(&walk_root, entry.path(), &guarded))
         .build();
 
     // The main pass, then one per re-included root.
@@ -654,6 +710,41 @@ mod tests {
         let map = build(dir.path(), 4000);
         assert!(map.contains("written_by_a_person"));
         assert!(!map.contains("Wire"), "generated files are noise: {map}");
+    }
+
+    #[test]
+    fn a_guarded_folder_inside_the_workspace_is_never_opened() {
+        // The macOS report this exists for: the desktop app, started from
+        // Finder with no project, falls back to $HOME, and the session's map
+        // walked into Music, Desktop and Downloads — one system consent
+        // dialog each, from an app the user had only just opened.
+        let dir = workspace(&[
+            ("src/main.rs", "pub fn main() {}\n"),
+            ("Music/library.rs", "pub fn now_playing() {}\n"),
+        ]);
+        let entries = collect_within(dir.path(), vec![dir.path().join("Music")]);
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["src/main.rs"], "the guarded folder was read");
+    }
+
+    #[test]
+    fn a_guarded_folder_chosen_as_the_workspace_is_still_mapped() {
+        // Pruning the root would map nothing at all. Someone who opens
+        // ~/Documents means it, and the one prompt is answerable because they
+        // can see what they just clicked.
+        let dir = workspace(&[("notes/plan.rs", "pub fn plan() {}\n")]);
+        let entries = collect_within(dir.path(), vec![dir.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1, "the chosen workspace was pruned");
+    }
+
+    #[test]
+    fn a_project_inside_a_guarded_folder_is_left_alone() {
+        // The walk starts below the door and never meets it, so the guard has
+        // nothing to say about ~/Documents/project.
+        let home = Path::new("/Users/you");
+        let guarded = vec![home.join("Documents")];
+        let project = home.join("Documents/project");
+        assert!(!is_guarded(&project, &project.join("src"), &guarded));
     }
 
     #[test]

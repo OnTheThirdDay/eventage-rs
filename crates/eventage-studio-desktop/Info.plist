@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the bundle's generated Info.plist. Tauri looks for this file
+  beside `tauri.conf.json`, and the keys here are added to the ones it writes
+  itself, so nothing below repeats one of those.
+
+  These are the sentences macOS puts in its consent dialog when the app first
+  reads one of the folders it guards. They are *not* what stops the dialogs
+  people were seeing: those came from mapping the workspace, and a map no
+  longer walks into a guarded folder it was not pointed at — see
+  `repomap::guarded_dirs`. What is left is the case where the guarded folder
+  *is* the work: a project in `~/Documents`, a repository on an external disk.
+  That prompt is correct and has to be answered, and answering it is easier
+  when the dialog says which of the two things the app is doing.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Eventage Studio needs access to open a project on your Desktop.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Eventage Studio needs access to open a project in your Documents folder.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Eventage Studio needs access to open a project in your Downloads folder.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Eventage Studio needs access to open a project on a connected disk.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Eventage Studio needs access to open a project on a network share.</string>
+</dict>
+</plist>
