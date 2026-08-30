@@ -96,6 +96,17 @@ pub trait Session: Send + Sync + 'static {
     /// appended to the log, so the original stays visible in the trace.
     async fn override_summary(&self, replacement: SummaryOverride) -> Result<()>;
 
+    /// Ask for the compacted history to be reviewed for detail the summary
+    /// lost.
+    ///
+    /// Publishes the request and returns; the answer arrives on the event
+    /// stream as `agent.context.audit.result`. Nothing in Studio produces it —
+    /// a plugin does — so a session with no reviewer installed simply never
+    /// sees a result, which the UI reports rather than waiting forever.
+    async fn request_context_audit(&self) -> Result<()> {
+        anyhow::bail!("this backend cannot review compacted context")
+    }
+
     /// Answer a pending permission request.
     async fn permission(&self, response: PermissionResponse) -> Result<()>;
 

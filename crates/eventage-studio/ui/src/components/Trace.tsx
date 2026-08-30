@@ -129,6 +129,7 @@ export function Trace({
   onClose,
   onRewindTo,
   onOverrideSummary,
+  onReviewContext,
   tab,
   onTab,
 }: {
@@ -148,6 +149,7 @@ export function Trace({
   onClose: () => void;
   onRewindTo: (checkpoint: Checkpoint) => void;
   onOverrideSummary: (summary: string, covers: number) => void;
+  onReviewContext: () => void;
   tab: Tab;
   onTab: (tab: Tab) => void;
 }) {
@@ -312,6 +314,7 @@ export function Trace({
                 onClearFocus={onClearContextFocus}
                 canEdit={fullTrace}
                 onOverride={onOverrideSummary}
+                onReview={onReviewContext}
               />
             </div>
           )}

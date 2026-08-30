@@ -564,6 +564,17 @@ impl Session for LocalSession {
         Ok(())
     }
 
+    async fn request_context_audit(&self) -> Result<()> {
+        self.session
+            .bus
+            .publish(Event::new(
+                kinds::CONTEXT_AUDIT_REQUESTED,
+                json!({ "request_id": uuid::Uuid::new_v4().to_string() }),
+            ))
+            .await?;
+        Ok(())
+    }
+
     async fn permission(&self, response: PermissionResponse) -> Result<()> {
         if response.always && response.approve {
             if let Some((tool, args)) = request_subject(&self.feed, &response.request_id) {

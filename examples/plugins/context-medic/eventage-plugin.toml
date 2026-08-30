@@ -1,0 +1,32 @@
+[plugin]
+name = "context-medic"
+description = "Finds the details compaction dropped, when you ask for them."
+
+[[observer]]
+name    = "medic"
+command = "node"
+args    = ["observer.mjs"]
+
+watch = [
+  # Carries the per-message manifest: what the model could see, including tool
+  # output the clearing pass had already blanked.
+  "agent.context.assembled",
+  # Compaction happened. Recorded locally; nothing is spent here.
+  "agent.context.summarized",
+  # Somebody pressed Review in Studio.
+  "agent.context.audit.requested",
+  # The host's answer to a completion this plugin asked for. The bridge only
+  # delivers the ones addressed to this plugin.
+  "llm.response",
+]
+
+emit = [
+  # Graded: spends the operator's tokens against the operator's budget, so it
+  # needs `llm = true` below, a user-level install, and a trusted project.
+  "llm.request",
+  # The candidate list Studio renders as checkboxes.
+  "agent.context.audit.result",
+]
+
+# Uses the model configured in Studio. No API key of its own.
+llm = true

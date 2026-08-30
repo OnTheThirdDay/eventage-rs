@@ -44,6 +44,20 @@ interface ManifestEntry {
   truncated_from?: number | null;
 }
 
+/** One thing a reviewer says the summary lost. */
+interface AuditItem {
+  id: string;
+  fact: string;
+  why?: string;
+}
+
+interface Audit {
+  seq: number;
+  requestId: string;
+  items: AuditItem[];
+  error?: string;
+}
+
 interface Summary {
   seq: number;
   ts: string;
@@ -75,6 +89,45 @@ function readAssemblies(events: StudioEvent[]): Assembly[] {
     }));
 }
 
+/** The newest review request, and the answer to it if one has arrived. */
+function readAudit(events: StudioEvent[]): {
+  asked: number | null;
+  result: Audit | null;
+} {
+  let asked: number | null = null;
+  let askedId = "";
+  let result: Audit | null = null;
+
+  for (const e of events) {
+    if (e.kind === "agent.context.audit.requested") {
+      asked = e.seq;
+      askedId = str(e.payload?.request_id);
+      result = null; // a new question invalidates the previous answer
+    }
+    if (e.kind === "agent.context.audit.result") {
+      const requestId = str(e.payload?.request_id);
+      if (requestId && requestId !== askedId) continue;
+      const raw = Array.isArray(e.payload?.items) ? e.payload.items : [];
+      result = {
+        seq: e.seq,
+        requestId,
+        error: str(e.payload?.error) || undefined,
+        items: raw
+          .map((item: unknown, i: number) => {
+            const o = (item ?? {}) as Record<string, unknown>;
+            return {
+              id: str(o.id) || `item-${i}`,
+              fact: str(o.fact),
+              why: str(o.why) || undefined,
+            };
+          })
+          .filter((item: AuditItem) => item.fact.length > 0),
+      };
+    }
+  }
+  return { asked, result };
+}
+
 function readSummaries(events: StudioEvent[]): Summary[] {
   return events
     .filter((e) => e.kind === "agent.context.summarized")
@@ -94,6 +147,7 @@ export function Context({
   onClearFocus,
   canEdit,
   onOverride,
+  onReview,
 }: {
   events: StudioEvent[];
   position: number;
@@ -102,11 +156,23 @@ export function Context({
   onClearFocus: () => void;
   canEdit: boolean;
   onOverride: (summary: string, covers: number) => void;
+  /** Ask an installed reviewer what compaction dropped. */
+  onReview: () => void;
 }) {
   const assemblies = useMemo(() => readAssemblies(events), [events]);
   const summaries = useMemo(() => readSummaries(events), [events]);
   const [draft, setDraft] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
+  const audit = useMemo(() => readAudit(events), [events]);
+  const [chosen, setChosen] = useState<Set<string>>(() => new Set());
+  // Cleared once the answer arrives, so a second review does not inherit the
+  // ticks from the first.
+  const answeredAt = audit.result?.seq ?? null;
+  const [seenAnswer, setSeenAnswer] = useState<number | null>(null);
+  if (answeredAt !== seenAnswer) {
+    setSeenAnswer(answeredAt);
+    if (chosen.size) setChosen(new Set());
+  }
 
   // Normally the request at or before the playhead, so scrubbing the timeline
   // shows what the model was working from at that moment. When a message is
@@ -116,6 +182,10 @@ export function Context({
     [...assemblies].reverse().find((a) => a.seq <= at) ??
     assemblies[assemblies.length - 1];
   const active = summaries[summaries.length - 1];
+  // A request with no answer yet. The reviewer is a plugin, so "no answer" may
+  // also mean none is installed — said plainly rather than spun forever.
+  const answered = audit.result !== null;
+  const reviewing = audit.asked !== null && !answered;
 
   if (!assemblies.length && !summaries.length) {
     return (
@@ -311,6 +381,16 @@ export function Context({
               title="Copy the summary"
             />
             {canEdit && draft === null && (
+              <button
+                className="btn sm"
+                onClick={onReview}
+                disabled={reviewing}
+                title="Ask an installed reviewer which details this summary lost. Costs one model call."
+              >
+                {reviewing ? "Reviewing…" : "Review"}
+              </button>
+            )}
+            {canEdit && draft === null && (
               <button className="btn sm" onClick={() => setDraft(active.text)}>
                 Edit
               </button>
@@ -348,6 +428,97 @@ export function Context({
                 </button>
               </div>
             </>
+          )}
+
+          {reviewing && (
+            <p className="ctx-note">
+              Asking the reviewer what this summary left out. If nothing answers,
+              no reviewer plugin is installed for this session.
+            </p>
+          )}
+
+          {audit.result?.error && (
+            <p className="ctx-note error">
+              The reviewer could not finish: {audit.result.error}
+            </p>
+          )}
+
+          {answered && audit.result && !audit.result.error && (
+            audit.result.items.length === 0 ? (
+              <p className="ctx-note">
+                The reviewer found nothing important missing from this summary.
+              </p>
+            ) : (
+              <div className="ctx-review">
+                <div className="ctx-head">
+                  <span>
+                    {audit.result.items.length} details this summary left out
+                  </span>
+                  <span className="spacer" />
+                  <span className="muted">
+                    Tick what should go back into the context
+                  </span>
+                </div>
+
+                <ul className="ctx-items">
+                  {audit.result.items.map((item) => (
+                    <li key={item.id}>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={chosen.has(item.id)}
+                          onChange={() =>
+                            setChosen((current) => {
+                              const next = new Set(current);
+                              if (next.has(item.id)) next.delete(item.id);
+                              else next.add(item.id);
+                              return next;
+                            })
+                          }
+                        />
+                        <span className="fact">{item.fact}</span>
+                        {item.why && <span className="why">{item.why}</span>}
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+
+                <div className="ctx-actions">
+                  <button
+                    className="btn sm ghost"
+                    onClick={() =>
+                      setChosen(
+                        chosen.size === audit.result!.items.length
+                          ? new Set()
+                          : new Set(audit.result!.items.map((i) => i.id)),
+                      )
+                    }
+                  >
+                    {chosen.size === audit.result.items.length
+                      ? "Select none"
+                      : "Select all"}
+                  </button>
+                  <span className="spacer" />
+                  <button
+                    className="btn sm primary"
+                    disabled={chosen.size === 0}
+                    onClick={() => {
+                      const picked = audit
+                        .result!.items.filter((i) => chosen.has(i.id))
+                        .map((i) => `- ${i.fact}`)
+                        .join("\n");
+                      onOverride(
+                        `${active.text}\n\nDetails restored from the compacted history:\n${picked}`,
+                        active.covers,
+                      );
+                      setChosen(new Set());
+                    }}
+                  >
+                    Add {chosen.size || ""} to context
+                  </button>
+                </div>
+              </div>
+            )
           )}
 
           {summaries.length > 1 && (

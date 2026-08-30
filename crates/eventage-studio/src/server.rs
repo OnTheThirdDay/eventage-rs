@@ -138,6 +138,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/adopt", post(adopt))
         .route("/sessions/:id/seal", post(seal))
         .route("/sessions/:id/summary", post(override_summary))
+        .route("/sessions/:id/context/audit", post(request_context_audit))
         .route("/sessions/:id/branch", post(branch))
         .route("/stored/:id", delete(forget_session))
         .route("/model", get(model_settings).post(set_model_settings))
@@ -533,6 +534,14 @@ async fn override_summary(
     }
     state.session(&id).await?.override_summary(req).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn request_context_audit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.session(&id).await?.request_context_audit().await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn permission(

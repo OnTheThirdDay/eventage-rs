@@ -91,15 +91,26 @@ pub async fn announce_plugins(bus: &EventBus, host: &eventage::PluginHost) {
 /// manifest that fails to load is reported, because that one was meant to
 /// work.
 pub fn load_plugins(cwd: &str) -> eventage::PluginHost {
+    use eventage::plugin::PluginOrigin;
+
     let mut host = eventage::PluginHost::new();
+    // Origin travels with the plugin because it decides what the plugin may
+    // do: a repository may contribute tools and prompts, but not a process
+    // that reads the conversation.
     let roots = [
-        std::path::PathBuf::from(cwd).join(".eventage/plugins"),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".eventage/plugins"),
+        (
+            std::path::PathBuf::from(cwd).join(".eventage/plugins"),
+            PluginOrigin::Workspace,
+        ),
+        (
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".eventage/plugins"),
+            PluginOrigin::User,
+        ),
     ];
 
-    for root in roots {
+    for (root, origin) in roots {
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
@@ -108,7 +119,7 @@ pub fn load_plugins(cwd: &str) -> eventage::PluginHost {
             if !dir.is_dir() || !dir.join(eventage::plugin::MANIFEST_NAME).is_file() {
                 continue;
             }
-            if let Err(e) = host.load(&dir) {
+            if let Err(e) = host.load_from(&dir, origin) {
                 warn!(path = %dir.display(), "could not load plugin: {e}");
             }
         }
@@ -277,6 +288,9 @@ pub struct CodingSession {
     config: SessionConfig,
     /// The mode in force, readable by tools and subagents at call time.
     mode: Arc<crate::config::SharedMode>,
+    /// Plugin components — observers today — held so unloading them, and
+    /// dropping the session, stops their child processes.
+    components: eventage::ComponentHost,
     /// One checkpoint per turn, newest last — the anchors for `rewind`,
     /// each paired with a snapshot of the working tree as the turn found it.
     checkpoints: tokio::sync::Mutex<Vec<Checkpoint>>,
@@ -303,6 +317,15 @@ impl CodingSession {
         client: Option<ClientFs>,
     ) -> Result<Self> {
         Self::build(id, config, false, client).await
+    }
+
+    /// The plugin components this session is running.
+    ///
+    /// Exposed so a surface can list what a plugin contributed, unload one, or
+    /// reload it after editing — the point of running a host rather than
+    /// installing once at startup.
+    pub fn components(&self) -> &eventage::ComponentHost {
+        &self.components
     }
 
     /// Reopen a persisted session, replaying its event log.
@@ -495,7 +518,18 @@ impl CodingSession {
         // not exist yet at this point. Its tools are handed to the builder
         // below.
         let plugin_tools = eventage::agent::ToolRegistry::new();
-        let plugin_prompt = match load_plugins(&config.cwd) {
+        let plugin_host = load_plugins(&config.cwd);
+        // Observers are collected here and started after the agent exists,
+        // because they need a `ComponentHost`, which needs the live tool
+        // registry the builder has not produced yet. Everything else a plugin
+        // contributes still goes through `install`.
+        let plugin_observers: Vec<(String, eventage::plugin::PluginOrigin, Vec<_>)> = plugin_host
+            .plugins()
+            .iter()
+            .filter(|p| !p.observers.is_empty())
+            .map(|p| (p.name.clone(), p.origin, p.observers.clone()))
+            .collect();
+        let plugin_prompt = match &plugin_host {
             host if host.plugins().is_empty() => String::new(),
             host => match host.install(&plugin_tools).await {
                 Ok(prompt) => {
@@ -504,7 +538,7 @@ impl CodingSession {
                     // tool list. Announcing it is the difference between the
                     // user being able to see that and having to infer it from
                     // behaviour they did not expect.
-                    announce_plugins(&bus, &host).await;
+                    announce_plugins(&bus, host).await;
                     prompt
                 }
                 Err(e) => {
@@ -745,12 +779,54 @@ impl CodingSession {
             reconcile_interrupted_tools(&bus, &policy, Some(&registry)).await?;
         }
 
+        // ── Plugin runtime ───────────────────────────────────────────────
+        //
+        // A `ComponentHost` is what makes a plugin's contribution removable:
+        // everything registered through it — an observer's child process
+        // included — is withdrawn again by `unload`. Standing one up here is
+        // also what gives the trace `component.loaded`/`component.unloaded`
+        // and makes a plugin reloadable without restarting the session.
+        let components = eventage::ComponentHost::new(bus.clone(), registry.clone(), hooks.clone());
+        if !plugin_observers.is_empty() {
+            // Lets a plugin run completions with the model the operator
+            // configured, so it needs no credentials of its own and its spend
+            // lands on the log where the token budget counts it.
+            if let Err(e) = components
+                .load(Arc::new(eventage::plugin::PluginLlmService::new(
+                    Arc::clone(&llm),
+                )))
+                .await
+            {
+                warn!("could not start the plugin LLM service: {e}");
+            }
+
+            // A repository's `env` block is only honoured for a project the
+            // operator has marked as theirs; an observer is a process reading
+            // the conversation, so it answers to the same switch.
+            let trusted = crate::settings::ClaudeSettings::trusted();
+            for (name, origin, specs) in plugin_observers {
+                let component = eventage::plugin::ObserverComponent::new(
+                    name.clone(),
+                    specs,
+                    origin,
+                    &config.cwd,
+                )
+                .with_trust(trusted);
+                if let Err(e) = components.load(Arc::new(component)).await {
+                    // Same rule as a broken MCP server: the session is still
+                    // usable, and refusing to start would be the worse answer.
+                    warn!(plugin = %name, "could not start plugin observer: {e}");
+                }
+            }
+        }
+
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         Ok(Self {
             id,
             bus,
             agent,
             hooks,
+            components,
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_tx,
             cancel_rx,

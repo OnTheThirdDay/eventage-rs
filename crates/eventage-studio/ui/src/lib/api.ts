@@ -96,6 +96,10 @@ export const api = {
   overrideSummary: (id: string, summary: string, summarized_count: number) =>
     post<void>(`/sessions/${id}/summary`, { summary, summarized_count }),
 
+  /** Ask an installed reviewer what compaction dropped. */
+  requestContextAudit: (id: string) =>
+    post<void>(`/sessions/${id}/context/audit`, {}),
+
   permission: (
     id: string,
     body: {

@@ -138,7 +138,12 @@ impl WorkerSet {
 
         for worker in self.workers {
             let bus = bus.clone();
-            set.spawn(run_worker_supervised(worker, bus));
+            // Subscribed here rather than inside the task: a subscription made
+            // after the spawn misses everything published before the task is
+            // first polled, and for a worker whose trigger is a single event
+            // that is a silent, permanent miss.
+            let rx = bus.subscribe();
+            set.spawn(run_worker_supervised(worker, bus, rx));
         }
 
         while set.join_next().await.is_some() {}
@@ -151,6 +156,8 @@ impl WorkerSet {
 /// Spawns [`EventWorker`]s as background tasks on a shared [`EventBus`].
 ///
 /// Each call to [`add_worker`](Self::add_worker) creates a new subscription and Tokio task.
+/// The subscription is made before the task is spawned, so nothing published
+/// after `add_worker` returns can be missed.
 /// The task runs until the bus closes (all `EventBus` clones dropped).
 ///
 /// `DynamicWorkerHandle` is `Clone` — all clones spawn tasks on the same bus.
@@ -173,7 +180,8 @@ impl DynamicWorkerHandle {
     ) -> tokio::task::JoinHandle<Result<(), WorkerError>> {
         let bus = self.bus.clone();
         let worker = Arc::new(worker);
-        tokio::spawn(run_worker(worker, bus))
+        let rx = bus.subscribe();
+        tokio::spawn(run_worker(worker, bus, rx))
     }
 
     /// Spawn a pre-boxed worker.
@@ -182,13 +190,17 @@ impl DynamicWorkerHandle {
         worker: Arc<dyn EventWorker>,
     ) -> tokio::task::JoinHandle<Result<(), WorkerError>> {
         let bus = self.bus.clone();
-        tokio::spawn(run_worker(worker, bus))
+        let rx = bus.subscribe();
+        tokio::spawn(run_worker(worker, bus, rx))
     }
 }
 
-async fn run_worker(worker: Arc<dyn EventWorker>, bus: EventBus) -> Result<(), WorkerError> {
+async fn run_worker(
+    worker: Arc<dyn EventWorker>,
+    bus: EventBus,
+    mut rx: crate::bus::BusReceiver,
+) -> Result<(), WorkerError> {
     let kinds = worker.subscribed_kinds();
-    let mut rx = bus.subscribe();
     while let Some(event) = rx.recv().await {
         let interested = kinds.is_empty() || kinds.iter().any(|k| k == &event.kind);
         if interested {
@@ -204,11 +216,14 @@ async fn run_worker(worker: Arc<dyn EventWorker>, bus: EventBus) -> Result<(), W
 /// life: a panic or transient error while handling one event is contained to
 /// that event (logged, then processing continues), so no events are dropped
 /// during recovery. Stops when the bus closes or a bus error is returned.
-async fn run_worker_supervised(worker: Arc<dyn EventWorker>, bus: EventBus) {
+async fn run_worker_supervised(
+    worker: Arc<dyn EventWorker>,
+    bus: EventBus,
+    mut rx: crate::bus::BusReceiver,
+) {
     use futures_util::FutureExt;
 
     let kinds = worker.subscribed_kinds();
-    let mut rx = bus.subscribe();
     while let Some(event) = rx.recv().await {
         let interested = kinds.is_empty() || kinds.iter().any(|k| k == &event.kind);
         if !interested {

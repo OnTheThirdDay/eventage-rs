@@ -231,9 +231,13 @@ impl ComponentContext {
     pub fn worker(&mut self, worker: impl EventWorker + 'static) {
         let bus = self.bus.clone();
         let worker = Arc::new(worker);
+        // Subscribed before the task is spawned. Subscribing inside it left a
+        // window between `start` returning — at which point the host reports
+        // the component active — and the task first being polled, and anything
+        // published in that window was lost.
+        let mut rx = bus.subscribe();
         self.spawn(async move {
             let kinds = worker.subscribed_kinds();
-            let mut rx = bus.subscribe();
             while let Some(event) = rx.recv().await {
                 let interested = kinds.is_empty() || kinds.iter().any(|k| k == &event.kind);
                 if interested {
@@ -526,6 +530,23 @@ impl ComponentHost {
         Ok(state)
     }
 
+    /// Undo everything, synchronously, without the bookkeeping `unload` does.
+    ///
+    /// The teardown path for when the host itself is going away and there is
+    /// no one left to tell. `stop` publishes an event and reconciles
+    /// dependants, neither of which can happen from `drop`.
+    fn dispose_all(&self) -> usize {
+        let mut components = self.components.lock().unwrap_or_else(|e| e.into_inner());
+        let mut undone = 0;
+        for entry in components.values_mut() {
+            if let Some(context) = entry.context.take() {
+                entry.state = ComponentState::Pending;
+                undone += context.dispose();
+            }
+        }
+        undone
+    }
+
     /// Undo one component's registrations. Idempotent.
     async fn stop(&self, name: &str, reason: &str) {
         let context = {
@@ -613,6 +634,23 @@ impl ComponentHost {
             if !progressed {
                 return;
             }
+        }
+    }
+}
+
+/// Dropping the host takes its components with it.
+///
+/// Without this the module's first rule — *nothing outlives its owner* — held
+/// only for an explicit `unload`. A host dropped with components still active
+/// dropped their `ComponentContext`s, and a `Vec<Box<dyn FnOnce()>>` of undo
+/// steps does nothing when it is dropped rather than run: background tasks
+/// kept running, and anything holding a child process kept it alive past the
+/// session that started it.
+impl Drop for ComponentHost {
+    fn drop(&mut self) {
+        let undone = self.dispose_all();
+        if undone > 0 {
+            debug!(effects = undone, "component host dropped; effects reverted");
         }
     }
 }

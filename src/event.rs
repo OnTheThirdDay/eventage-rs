@@ -128,6 +128,33 @@ pub mod kinds {
     /// real conversation" stays answerable afterwards.
     pub const CONTEXT_ASSEMBLED: &str = "agent.context.assembled";
 
+    /// A person asked for the compacted history to be reviewed for detail the
+    /// summary lost. Payload: `{ "request_id" }`.
+    ///
+    /// Nothing in the framework answers this — it is the signal a plugin
+    /// watches for. Published on a person's action rather than automatically,
+    /// because answering it costs an LLM call.
+    pub const CONTEXT_AUDIT_REQUESTED: &str = "agent.context.audit.requested";
+
+    /// Candidate facts a reviewer found missing from the summary, for a person
+    /// to choose from. Payload: `{ "request_id", "items": [{ "id", "fact",
+    /// "why" }], "error"? }`.
+    pub const CONTEXT_AUDIT_RESULT: &str = "agent.context.audit.result";
+
+    /// A plugin asking the host to run a completion with the session's own
+    /// provider. Payload: `{ "request_id", "messages", "schema"?,
+    /// "schema_name"? }`.
+    ///
+    /// Exists so a plugin needs no credentials of its own: it uses the model
+    /// the operator configured, through the same retry and rate-limit
+    /// wrappers, and its spend lands on the log where the token budget counts
+    /// it.
+    pub const LLM_REQUEST: &str = "llm.request";
+
+    /// The answer to an [`LLM_REQUEST`]. Payload: `{ "request_id", "plugin",
+    /// "content" | "structured", "error"? }`.
+    pub const LLM_RESPONSE: &str = "llm.response";
+
     // ── Streaming (ephemeral — broadcast only, never stored in the DAG) ──────
     /// Incremental completion text emitted while an LLM response streams.
     /// Payload: `{ "content": Option<str>, "reasoning_content": Option<str> }`.

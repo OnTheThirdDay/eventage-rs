@@ -20,7 +20,17 @@
 //! name = "search"
 //! transport = "http"
 //! url = "https://mcp.example.com"
+//!
+//! [[observer]]
+//! name = "audit"
+//! command = "node"
+//! args = ["audit.js"]
+//! watch = ["tool.result"]
 //! ```
+//!
+//! An `[[observer]]` is a process that watches the event bus and may publish
+//! back to it — see [`observer`] for what it may watch, what it may emit, and
+//! why where it was installed decides which.
 //!
 //! [`PluginHost`] loads any number of plugins and installs them into an
 //! agent in one call: MCP servers are connected and their tools registered
@@ -41,6 +51,13 @@
 //! # Ok(())
 //! # }
 //! ```
+
+pub mod llm_service;
+pub mod observer;
+pub mod transport;
+
+pub use llm_service::PluginLlmService;
+pub use observer::{ObserverComponent, ObserverSpec, PluginOrigin};
 
 use crate::agent::skills::{SkillTool, SkillsLibrary};
 use crate::agent::tool::ToolRegistry;
@@ -65,6 +82,8 @@ pub enum PluginError {
     Mcp { name: String, message: String },
     #[error("plugin declares MCP servers but eventage was built without the `mcp` feature")]
     McpFeatureDisabled,
+    #[error("plugin '{plugin}': {message}")]
+    Capability { plugin: String, message: String },
 }
 
 // ── Manifest schema ───────────────────────────────────────────────────────────
@@ -74,6 +93,8 @@ struct Manifest {
     plugin: ManifestPlugin,
     #[serde(default)]
     mcp: Vec<McpServerSpec>,
+    #[serde(default)]
+    observer: Vec<ObserverSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +147,11 @@ pub struct Plugin {
     pub skills: SkillsLibrary,
     /// MCP servers to connect at install time.
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Bus observers to spawn, subject to [`PluginOrigin`] and trust.
+    pub observers: Vec<ObserverSpec>,
+    /// Where this plugin was installed from, which decides what its observers
+    /// may do. Defaults to the least privileged answer.
+    pub origin: PluginOrigin,
 }
 
 impl Plugin {
@@ -152,13 +178,33 @@ impl Plugin {
             skills.add_dir(dir.join(rel))?;
         }
 
+        // Rejected here rather than at start: a manifest asking to forge a
+        // tool result is broken however it was installed, and its author
+        // should learn that at load instead of from a silent no-op.
+        for spec in &manifest.observer {
+            spec.validate().map_err(|message| PluginError::Capability {
+                plugin: manifest.plugin.name.clone(),
+                message,
+            })?;
+        }
+
         Ok(Self {
             name: manifest.plugin.name,
             description: manifest.plugin.description,
             prompt_fragment,
             skills,
             mcp_servers: manifest.mcp,
+            observers: manifest.observer,
+            // Least privilege by default; a caller that knows the plugin came
+            // from the user's own directory says so explicitly.
+            origin: PluginOrigin::Workspace,
         })
+    }
+
+    /// Record where this plugin was installed from.
+    pub fn with_origin(mut self, origin: PluginOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -175,9 +221,22 @@ impl PluginHost {
         Self::default()
     }
 
-    /// Load the plugin at `dir`.
+    /// Load the plugin at `dir`, treating it as [`PluginOrigin::Workspace`].
     pub fn load(&mut self, dir: impl AsRef<Path>) -> Result<&Plugin, PluginError> {
-        let plugin = Plugin::load(dir)?;
+        self.load_from(dir, PluginOrigin::Workspace)
+    }
+
+    /// Load the plugin at `dir`, recording where it came from.
+    ///
+    /// The origin is what decides whether the plugin's observers may run at
+    /// all, so a caller that walks several directories must say which is
+    /// which rather than letting them all inherit one answer.
+    pub fn load_from(
+        &mut self,
+        dir: impl AsRef<Path>,
+        origin: PluginOrigin,
+    ) -> Result<&Plugin, PluginError> {
+        let plugin = Plugin::load(dir)?.with_origin(origin);
         info!(
             plugin = %plugin.name,
             skills = plugin.skills.len(),
@@ -311,11 +370,30 @@ impl PluginHost {
 /// all of it and drops the MCP clients (killing their child processes).
 pub struct PluginComponent {
     plugin: Plugin,
+    trusted: bool,
+    cwd: PathBuf,
 }
 
 impl PluginComponent {
     pub fn new(plugin: Plugin) -> Self {
-        Self { plugin }
+        Self {
+            plugin,
+            trusted: false,
+            cwd: PathBuf::from("."),
+        }
+    }
+
+    /// Whether the operator has said this project is theirs. Graded observer
+    /// capabilities are withheld without it.
+    pub fn with_trust(mut self, trusted: bool) -> Self {
+        self.trusted = trusted;
+        self
+    }
+
+    /// Working directory for any observer this plugin spawns.
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = cwd.into();
+        self
     }
 
     /// The system-prompt fragment this plugin contributes.
@@ -369,6 +447,16 @@ impl Component for PluginComponent {
                 ctx.tool(tool);
             }
         }
+
+        observer::start_observers(
+            ctx,
+            &self.plugin.name,
+            &self.plugin.observers,
+            self.plugin.origin,
+            self.trusted,
+            &self.cwd,
+        )
+        .await?;
 
         Ok(())
     }

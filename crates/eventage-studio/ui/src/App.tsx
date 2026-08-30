@@ -757,6 +757,12 @@ export default function App() {
                   reset(await api.events(activeId, 0));
                 })
               }
+              onReviewContext={() =>
+                activeId &&
+                void guard(async () => {
+                  await api.requestContextAudit(activeId);
+                })
+              }
             />
           </div>
         )}
